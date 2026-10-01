@@ -1,0 +1,11 @@
+rq,name,verdict,rule_chain_rows,direct_rows,direct_stacks,current_supplement_rows,hypotheses,all_required_fields_complete,experiment_design_status,empirical_status
+L-RQ1,Cross-edge layout rank inversion,COMPLETE_STRONG,23,20,CUTLASS/CuTe;FlashInfer;IREE;MLIR;SGLang;TVM Relax;TensorRT-LLM;vLLM,2,H1.1;H1.2;H1.3;H1.4;H1.NEG,YES,COMPLETE_DESIGN,OPEN
+L-RQ2,Optimal layout-domain granularity,COMPLETE_STRONG,29,27,IREE;SGLang;TensorRT-LLM;vLLM,6,H2.1;H2.2;H2.3;H2.4;H2.5,YES,COMPLETE_DESIGN,OPEN
+L-RQ3,Layout adaptation amortization,COMPLETE_STRONG,17,17,CUTLASS/CuTe;FlashInfer;SGLang;TVM Relax;TensorRT-LLM;vLLM,2,H3.1;H3.2;H3.3;H3.4;H3.5,YES,COMPLETE_DESIGN,OPEN
+L-RQ4,Optimal-layout stability across workload/hardware,COMPLETE_STRONG,50,19,CUTLASS/CuTe;FlashInfer;IREE;SGLang;Triton;vLLM,5,H4.1;H4.2;H4.3;H4.4;H4.5,YES,COMPLETE_DESIGN,OPEN
+L-RQ5,Communication/placement-aware layout inversion,COMPLETE_STRONG,18,13,SGLang;TensorRT-LLM;vLLM,4,H5.1;H5.2;H5.3;H5.4;H5.5,YES,COMPLETE_DESIGN,OPEN
+L-RQ6,Persistent-layout reconfiguration threshold,COMPLETE_CONDITIONAL_ON_RQ4,13,13,FlashInfer;IREE;SGLang;TensorRT-LLM;vLLM,4,H6.1;H6.2;H6.3;H6.4;H6.5,YES,COMPLETE_DESIGN,OPEN
+L-RQ7,Layout equivalence and zero-copy transformability,COMPLETE_STRONG,17,16,CUTLASS/CuTe;FlashInfer;IREE;MLIR;SGLang;TVM Relax;TensorRT-LLM,7,H7.1;H7.2;H7.3;H7.4,YES,COMPLETE_DESIGN,OPEN
+L-RQ8,Coupled data–metadata co-layout,COMPLETE_STRONG,23,21,CUTLASS/CuTe;FlashInfer;SGLang;TensorRT-LLM;Triton;vLLM,7,H8.1;H8.2;H8.3;H8.4;H8.5,YES,COMPLETE_DESIGN,OPEN
+L-RQ9,Layout-space expressiveness and search-space truncation,COMPLETE_STRONG,52,34,CUTLASS/CuTe;FlashInfer;IREE;MLIR;SGLang;TVM Relax;TensorRT-LLM;Triton;vLLM,5,H9.1;H9.2;H9.3;H9.4;H9.5,YES,COMPLETE_DESIGN,OPEN
+L-RQ10,Paged/block layout granularity and allocator coupling,COMPLETE_STRONG,16,16,FlashInfer;SGLang;TensorRT-LLM;vLLM,7,H10.1;H10.2;H10.3;H10.4;H10.5,YES,COMPLETE_DESIGN,OPEN

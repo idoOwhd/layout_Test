@@ -1,0 +1,243 @@
+{
+  "schema_version": 1,
+  "status_definitions": {
+    "complete": "Requested implementation exists and is covered by an executable check.",
+    "partial": "Useful implementation exists, but requested framework/subgraph/tensor coverage is incomplete.",
+    "missing": "The requested implementation has not been added.",
+    "blocked": "Code may exist, but validation cannot be completed in the declared A10/current environment."
+  },
+  "requirements": [
+    {
+      "id": "R01",
+      "requirement": "Enumerate common high-share LLM subgraphs and their operator structure.",
+      "code_status": "complete",
+      "validation_status": "complete",
+      "evidence": ["../real_world_shapes/real_world_shape_manifest.json", "SCIENTIFIC_QUESTIONS.md"],
+      "gap": "The catalog is shape/config-derived rather than a measured operator-time share decomposition of full models."
+    },
+    {
+      "id": "R02",
+      "requirement": "Enumerate Diffusion subgraphs with real model shapes and full operator structure.",
+      "code_status": "partial",
+      "validation_status": "pending",
+      "evidence": ["layout_cases.json", "torch_layout_bench.py", "triton_kv_layout_bench.py", "../vision_shapes/vision_model_corpus.json", "../vision_shapes/vision_common_subgraph_manifest.json"],
+      "gap": "The 2025-2026 corpus and common motif shape grid now exist, but exact per-model tensor shapes still need to be joined from the user's ONNX files and complete model-specific denoise blocks remain absent."
+    },
+    {
+      "id": "R03",
+      "requirement": "Explain the layout decision owner and method in SGLang, vLLM, CUTLASS, Triton, TVM and Hexcute.",
+      "code_status": "complete",
+      "validation_status": "complete",
+      "evidence": ["framework_decisions.json", "source_evidence.py", "SCIENTIFIC_QUESTIONS.md"],
+      "gap": "The decision taxonomy has been checked against pinned current commits. Each future run resolves again because upstream behavior can change."
+    },
+    {
+      "id": "R04",
+      "requirement": "Record every relevant operator/tensor/load/store/KV-cache layout selected by every framework for every subgraph.",
+      "code_status": "partial",
+      "validation_status": "pending",
+      "evidence": ["framework_decisions.json", "source_evidence.py", "runtime_probe.py", "tensor_layout_trace.py", "analyze_layout_dumps.py"],
+      "gap": "Graph-boundary tensor layouts and compiler dump evidence are now normalized, but they do not reconstruct every shared/register layout or associate every load/store with a logical tensor. Serving systems also delegate many decisions to backends."
+    },
+    {
+      "id": "R05",
+      "requirement": "Provide GitHub source evidence for why each framework chooses a layout.",
+      "code_status": "complete",
+      "validation_status": "complete",
+      "evidence": ["framework_decisions.json", "source_evidence.py", "run_all_gpu1.sh"],
+      "gap": "All six remote repositories produced commit-pinned exact file/line hits on 2026-09-13. Moving repositories and unmatched future patterns are retained explicitly rather than replaced with guessed evidence."
+    },
+    {
+      "id": "R06",
+      "requirement": "Use controlled paired experiments where only layout policy changes.",
+      "code_status": "partial",
+      "validation_status": "gpu_pending",
+      "evidence": ["triton_kv_layout_bench.py", "shared_bank_bench.cu", "torch_layout_bench.py", "tvm_layout_bench.py", "../../../Ladder_LL/benchmarks/softmax_layout_boundary.cu"],
+      "gap": "Controlled kernels cover KV, shared-bank, reduction, SwiGLU packing and Conv; native paired layout kernels for MLA, MoE, sparse attention, linear attention and Mamba2 are not implemented."
+    },
+    {
+      "id": "R07",
+      "requirement": "Run SGLang-native per-subgraph layout experiments.",
+      "code_status": "partial",
+      "validation_status": "not_run",
+      "evidence": ["native_serving_layout_bench.py", "run_all_gpu1.sh"],
+      "gap": "The native server adapter now compares SGLang NHD/HND with backend/page/model/requests fixed and separately keeps FlashInfer/Triton/page-policy changes marked confounded. Native per-640-subgraph isolation remains absent."
+    },
+    {
+      "id": "R08",
+      "requirement": "Run vLLM-native per-subgraph layout experiments.",
+      "code_status": "partial",
+      "validation_status": "not_run",
+      "evidence": ["native_serving_layout_bench.py", "run_all_gpu1.sh"],
+      "gap": "A native server adapter now forces the current VLLM_KV_CACHE_LAYOUT candidates and captures the server's resolved layout, but unsupported layouts may be rejected and native per-640-subgraph kernel isolation remains absent."
+    },
+    {
+      "id": "R09",
+      "requirement": "Run CUTLASS layout variants for every target subgraph.",
+      "code_status": "partial",
+      "validation_status": "gpu_pending",
+      "evidence": ["../../../Ladder_LL/benchmarks/softmax_layout_boundary.cu", "run_all_gpu1.sh"],
+      "gap": "CUTLASS coverage is currently the reduction/softmax boundary only; GEMM/SwiGLU, grouped MoE, attention/MLA, scan and Diffusion block adapters are absent."
+    },
+    {
+      "id": "R10",
+      "requirement": "Run Triton layout variants and complete LLM subgraphs.",
+      "code_status": "partial",
+      "validation_status": "gpu_pending",
+      "evidence": ["triton_kv_layout_bench.py", "../benchmark_real_world.py"],
+      "gap": "Explicit layout control exists for QK/KV only. The 640-case path uses TorchInductor/Triton but does not enumerate or normalize all internal layout decisions."
+    },
+    {
+      "id": "R11",
+      "requirement": "Run TVM layout variants for every target subgraph.",
+      "code_status": "partial",
+      "validation_status": "gpu_pending",
+      "evidence": ["tvm_layout_bench.py"],
+      "gap": "Only an explicit row-major/tiled reduction exists; MetaSchedule/IndexMap adapters for attention, FFN, MoE, scan and Diffusion are absent."
+    },
+    {
+      "id": "R12",
+      "requirement": "Run Hexcute layout synthesis for every target subgraph on card 1.",
+      "code_status": "partial",
+      "validation_status": "blocked",
+      "evidence": ["run_all_gpu1.sh", "framework_decisions.json"],
+      "gap": "Only the upstream artifact wrapper/source audit exists. The public artifact targets A100/H100 and does not establish A10 support; no local per-case Hexcute adapter maps the 640-case contract."
+    },
+    {
+      "id": "R13",
+      "requirement": "Measure current performance of the 640 LLM cases with comparable correctness and result storage.",
+      "code_status": "complete",
+      "validation_status": "cleanroom_rerun_required",
+      "evidence": ["../benchmark_real_world.py", "../tilelang/benchmark_real_world.py", "../real_world_shapes/real_world_shape_manifest.json", "run_v10_v13_640_all_frameworks_gpu1.sh"],
+      "gap": "Historical result files are deliberately not source dependencies. A clean clone must generate a new timestamped result directory with the registered runner."
+    },
+    {
+      "id": "R14",
+      "requirement": "Measure complete Diffusion subgraph/end-to-end denoise-block performance.",
+      "code_status": "partial",
+      "validation_status": "not_run",
+      "evidence": ["torch_layout_bench.py", "vision_layout_bench.py", "../vision_shapes/vision_common_subgraph_manifest.json"],
+      "gap": "Reference runners now cover patch/3D patch, VAE boundary, attention, FFN, modulation, RoPE, QK-Norm and structured attention layouts; complete model-specific DiT blocks and cross-denoise-step persistence remain unsupported."
+    },
+    {
+      "id": "R15",
+      "requirement": "Capture and analyze load/store instructions, vector width, memory transactions and compiler layouts.",
+      "code_status": "partial",
+      "validation_status": "gpu_pending",
+      "evidence": ["run_all_gpu1.sh", "static_layout_analysis.py", "analyze_layout_dumps.py"],
+      "gap": "SASS/PTX/Triton-layout evidence is now normalized per dump file, but records are not yet joined to every operator/tensor identity and Hexcute/CuTe type layouts need framework-specific decoders."
+    },
+    {
+      "id": "R16",
+      "requirement": "Implement a better layout decision algorithm and demonstrate speedup over current framework policy.",
+      "code_status": "partial",
+      "validation_status": "not_run",
+      "evidence": ["SCIENTIFIC_QUESTIONS.md", "static_layout_analysis.py", "graph_layout_optimizer.py", "graph_layout_example.json", "test_graph_layout_optimizer.py"],
+      "gap": "An exact finite graph-level optimizer and greedy counterexample are implemented, but it does not yet rewrite any of the six frameworks and its costs have not been replaced with paired GPU measurements; therefore no framework speedup claim is yet possible."
+    },
+    {
+      "id": "R17",
+      "requirement": "Separate scientific questions from engineering work and define falsification criteria.",
+      "code_status": "complete",
+      "validation_status": "complete",
+      "evidence": ["SCIENTIFIC_QUESTIONS.md", "test_static_layout_analysis.py"],
+      "gap": "Empirical falsification awaits GPU execution."
+    },
+    {
+      "id": "R18",
+      "requirement": "Provide one Bash command fixed to physical GPU 1 and continue past unavailable frameworks.",
+      "code_status": "complete",
+      "validation_status": "smoke_checked_without_gpu",
+      "evidence": ["run_all_gpu1.sh", "README.md"],
+      "gap": "A CUDA-enabled card-1 run is still required; dependency environments are not installed by the script."
+    },
+    {
+      "id": "R19",
+      "requirement": "Store environment, raw results, failures, source revisions and reports in analysis-friendly files.",
+      "code_status": "complete",
+      "validation_status": "complete",
+      "evidence": ["run_all_gpu1.sh", "summarize.py"],
+      "gap": "A normalized single table joining source decisions, counters and latency is not yet implemented."
+    },
+    {
+      "id": "R20",
+      "requirement": "Use statistically defensible performance methodology.",
+      "code_status": "partial",
+      "validation_status": "gpu_pending",
+      "evidence": ["triton_kv_layout_bench.py", "torch_layout_bench.py", "../benchmark_real_world.py"],
+      "gap": "P20/P50/P80 and warmups exist, but there are no independent-process repetitions, confidence intervals, randomized candidate order or clock/thermal controls across all experiments."
+    },
+    {
+      "id": "R21",
+      "requirement": "Actually execute all enabled experiments on physical card 1.",
+      "code_status": "complete",
+      "validation_status": "blocked",
+      "evidence": ["run_all_gpu1.sh"],
+      "gap": "The current workspace cannot communicate with the NVIDIA driver. Execution must occur when card 1 and the intended Python environments are available."
+    },
+    {
+      "id": "R22",
+      "requirement": "Incorporate the supplied shared ChatGPT/Codex discussions.",
+      "code_status": "partial",
+      "validation_status": "partial",
+      "evidence": ["SCIENTIFIC_QUESTIONS.md", "shared_sources.json", "validate_shared_links.py", "../vision_shapes/vision_model_corpus.json"],
+      "gap": "All ten HTTPS share pages are now content-validated and the modern vision corpus uses their 12-family taxonomy. The codex:// thread is a separate local-client reference and has not been programmatically imported."
+    },
+    {
+      "id": "R23",
+      "requirement": "Define a 2025-2026 modern image/video generation corpus and compute >=50% motif incidence without counting variants twice.",
+      "code_status": "complete",
+      "validation_status": "complete",
+      "evidence": ["../vision_shapes/vision_model_corpus.json", "../vision_shapes/build_vision_manifest.py", "../vision_shapes/VISION_COMMON_SUBGRAPHS.md"],
+      "gap": "The corpus is a deliberately bounded 12-family sample, not an industry-wide census; adding a model changes the denominator and must regenerate the report."
+    },
+    {
+      "id": "R24",
+      "requirement": "Provide multiple image/video workload shape regimes for every >=50% visual motif.",
+      "code_status": "complete",
+      "validation_status": "complete",
+      "evidence": ["../vision_shapes/vision_common_subgraph_manifest.json", "../vision_shapes/vision_common_subgraph_manifest.csv", "../vision_shapes/vision_manifest_summary.json"],
+      "gap": "The 83 rows are explicit benchmark-policy regimes. They must not be described as exact per-model shapes until matched to ONNX evidence."
+    },
+    {
+      "id": "R25",
+      "requirement": "Extract exact tensor shapes and motif witnesses from the user's generated vision ONNX models.",
+      "code_status": "complete",
+      "validation_status": "input_pending",
+      "evidence": ["../vision_shapes/discover_vision_onnx.py", "run_all_gpu1.sh"],
+      "gap": "The extractor is implemented, but VISION_ONNX_ROOT and an optional ONNX-to-model map have not been supplied/run. Heuristic matches require review before incidence accounting."
+    },
+    {
+      "id": "R26",
+      "requirement": "Provide executable paired-layout reference workloads for every >=50% visual motif and preserve unsupported complete-block cases explicitly.",
+      "code_status": "partial",
+      "validation_status": "gpu_pending",
+      "evidence": ["vision_layout_bench.py", "run_all_gpu1.sh"],
+      "gap": "Reference kernels cover the primitive motif boundaries. Complete model-specific DiT and dual+single blocks are explicitly unsupported, and native SGLang/vLLM/CUTLASS/Triton/TVM/Hexcute visual adapters are still missing."
+    },
+    {
+      "id": "R27",
+      "requirement": "Compute framework-by-subgraph coverage and native-layout regret without inventing an unobserved native layout.",
+      "code_status": "complete",
+      "validation_status": "smoke_checked_without_gpu",
+      "evidence": ["analyze_layout_results.py", "run_all_gpu1.sh"],
+      "gap": "The 4,338-cell matrix and regret guardrails pass CPU smoke tests; meaningful empirical regret remains unavailable until native rows and at least one legal alternative are produced for the same case/framework."
+    },
+    {
+      "id": "R28",
+      "requirement": "Keep supplied ChatGPT and Codex references as correctly separated URLs and content-validate every HTTPS share.",
+      "code_status": "complete",
+      "validation_status": "complete",
+      "evidence": ["shared_sources.json", "validate_shared_links.py"],
+      "gap": "HTTP availability is time-dependent, so the one-command runner repeats the validation and stores the result with each experiment."
+    },
+    {
+      "id": "R29",
+      "requirement": "Resolve mutable official visual-model source links to immutable repository revisions for each run.",
+      "code_status": "complete",
+      "validation_status": "complete",
+      "evidence": ["../vision_shapes/pin_vision_sources.py", "../vision_shapes/vision_model_corpus.json", "run_all_gpu1.sh"],
+      "gap": "All twelve sources resolved successfully on 2026-09-13. Availability and branch heads are time-dependent, so every one-command run writes a fresh immutable snapshot and retains individual failures."
+    }
+  ]
+}

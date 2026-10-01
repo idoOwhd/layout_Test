@@ -1,0 +1,59 @@
+exp_id,stage,subgraph,producer_layout,consumer_layout,adaptation,dtype,Hq_over_Hkv,batch,q_len,kv_len,page_size,consumer_backend,purpose,expected_role
+C00,0-control,KV write → decode,NHD,NHD,none,BF16,1,1,1,512,64,FlashInfer auto/xqa,measurement baseline; MHA-equivalent ratio 1,negative-control
+C01,0-control,KV write → decode,HND,HND,none,BF16,1,1,1,512,64,FlashInfer auto/xqa,layout-only negative control,negative-control
+P-BF16-1,1-producer,QKV/KV writer,NHD,NA,none,BF16,1,8,1,2048,64,NA,measure producer-local NHD write cost,producer-ranking
+P2-BF16-1,1-producer,QKV/KV writer,HND,NA,none,BF16,1,8,1,2048,64,NA,measure producer-local HND direct-write cost,producer-ranking
+P-BF16-8,1-producer,QKV/KV writer,NHD,NA,none,BF16,8,8,1,2048,64,NA,measure producer-local NHD write cost,producer-ranking
+P2-BF16-8,1-producer,QKV/KV writer,HND,NA,none,BF16,8,8,1,2048,64,NA,measure producer-local HND direct-write cost,producer-ranking
+P-BF16-32,1-producer,QKV/KV writer,NHD,NA,none,BF16,32,8,1,2048,64,NA,measure producer-local NHD write cost,producer-ranking
+P2-BF16-32,1-producer,QKV/KV writer,HND,NA,none,BF16,32,8,1,2048,64,NA,measure producer-local HND direct-write cost,producer-ranking
+P-NVFP4-1,1-producer,QKV/KV writer,NHD,NA,none,NVFP4,1,8,1,2048,64,NA,measure producer-local NHD write cost,producer-ranking
+P2-NVFP4-1,1-producer,QKV/KV writer,HND,NA,none,NVFP4,1,8,1,2048,64,NA,measure producer-local HND direct-write cost,producer-ranking
+P-NVFP4-8,1-producer,QKV/KV writer,NHD,NA,none,NVFP4,8,8,1,2048,64,NA,measure producer-local NHD write cost,producer-ranking
+P2-NVFP4-8,1-producer,QKV/KV writer,HND,NA,none,NVFP4,8,8,1,2048,64,NA,measure producer-local HND direct-write cost,producer-ranking
+P-NVFP4-32,1-producer,QKV/KV writer,NHD,NA,none,NVFP4,32,8,1,2048,64,NA,measure producer-local NHD write cost,producer-ranking
+P2-NVFP4-32,1-producer,QKV/KV writer,HND,NA,none,NVFP4,32,8,1,2048,64,NA,measure producer-local HND direct-write cost,producer-ranking
+C-BF16-1-NHD,2-consumer,paged KV → decode,NA,NHD,none,BF16,1,8,1,2048,64,FlashInfer xqa/trtllm-gen as supported,measure consumer-native ranking with identical logical KV,consumer-ranking
+C-BF16-1-HND,2-consumer,paged KV → decode,NA,HND,none,BF16,1,8,1,2048,64,FlashInfer xqa/trtllm-gen as supported,measure consumer-native ranking with identical logical KV,consumer-ranking
+C-BF16-8-NHD,2-consumer,paged KV → decode,NA,NHD,none,BF16,8,8,1,2048,64,FlashInfer xqa/trtllm-gen as supported,measure consumer-native ranking with identical logical KV,consumer-ranking
+C-BF16-8-HND,2-consumer,paged KV → decode,NA,HND,none,BF16,8,8,1,2048,64,FlashInfer xqa/trtllm-gen as supported,measure consumer-native ranking with identical logical KV,consumer-ranking
+C-BF16-32-NHD,2-consumer,paged KV → decode,NA,NHD,none,BF16,32,8,1,2048,64,FlashInfer xqa/trtllm-gen as supported,measure consumer-native ranking with identical logical KV,consumer-ranking
+C-BF16-32-HND,2-consumer,paged KV → decode,NA,HND,none,BF16,32,8,1,2048,64,FlashInfer xqa/trtllm-gen as supported,measure consumer-native ranking with identical logical KV,consumer-ranking
+C-NVFP4-1-NHD,2-consumer,paged KV → decode,NA,NHD,none,NVFP4,1,8,1,2048,64,FlashInfer xqa/trtllm-gen as supported,measure consumer-native ranking with identical logical KV,consumer-ranking
+C-NVFP4-1-HND,2-consumer,paged KV → decode,NA,HND,none,NVFP4,1,8,1,2048,64,FlashInfer xqa/trtllm-gen as supported,measure consumer-native ranking with identical logical KV,consumer-ranking
+C-NVFP4-8-NHD,2-consumer,paged KV → decode,NA,NHD,none,NVFP4,8,8,1,2048,64,FlashInfer xqa/trtllm-gen as supported,measure consumer-native ranking with identical logical KV,consumer-ranking
+C-NVFP4-8-HND,2-consumer,paged KV → decode,NA,HND,none,NVFP4,8,8,1,2048,64,FlashInfer xqa/trtllm-gen as supported,measure consumer-native ranking with identical logical KV,consumer-ranking
+C-NVFP4-32-NHD,2-consumer,paged KV → decode,NA,NHD,none,NVFP4,32,8,1,2048,64,FlashInfer xqa/trtllm-gen as supported,measure consumer-native ranking with identical logical KV,consumer-ranking
+C-NVFP4-32-HND,2-consumer,paged KV → decode,NA,HND,none,NVFP4,32,8,1,2048,64,FlashInfer xqa/trtllm-gen as supported,measure consumer-native ranking with identical logical KV,consumer-ranking
+E-NN-BF16-1,3-edge,QKV/KV writer → paged KV → decode,NHD,NHD,none,BF16,1,8,1,2048,64,FlashInfer xqa/trtllm-gen as supported,directly test producer-local winner vs edge-global winner,primary-RQ1
+E-NH-COPY-BF16-1,3-edge,QKV/KV writer → paged KV → decode,NHD,HND,materialized transpose/repack,BF16,1,8,1,2048,64,FlashInfer xqa/trtllm-gen as supported,directly test producer-local winner vs edge-global winner,primary-RQ1
+E-HH-BF16-1,3-edge,QKV/KV writer → paged KV → decode,HND,HND,producer-native HND,BF16,1,8,1,2048,64,FlashInfer xqa/trtllm-gen as supported,directly test producer-local winner vs edge-global winner,primary-RQ1
+E-HN-COPY-BF16-1,3-edge,QKV/KV writer → paged KV → decode,HND,NHD,materialized transpose/repack,BF16,1,8,1,2048,64,FlashInfer xqa/trtllm-gen as supported,directly test producer-local winner vs edge-global winner,primary-RQ1
+E-NN-BF16-8,3-edge,QKV/KV writer → paged KV → decode,NHD,NHD,none,BF16,8,8,1,2048,64,FlashInfer xqa/trtllm-gen as supported,directly test producer-local winner vs edge-global winner,primary-RQ1
+E-NH-COPY-BF16-8,3-edge,QKV/KV writer → paged KV → decode,NHD,HND,materialized transpose/repack,BF16,8,8,1,2048,64,FlashInfer xqa/trtllm-gen as supported,directly test producer-local winner vs edge-global winner,primary-RQ1
+E-HH-BF16-8,3-edge,QKV/KV writer → paged KV → decode,HND,HND,producer-native HND,BF16,8,8,1,2048,64,FlashInfer xqa/trtllm-gen as supported,directly test producer-local winner vs edge-global winner,primary-RQ1
+E-HN-COPY-BF16-8,3-edge,QKV/KV writer → paged KV → decode,HND,NHD,materialized transpose/repack,BF16,8,8,1,2048,64,FlashInfer xqa/trtllm-gen as supported,directly test producer-local winner vs edge-global winner,primary-RQ1
+E-NN-BF16-32,3-edge,QKV/KV writer → paged KV → decode,NHD,NHD,none,BF16,32,8,1,2048,64,FlashInfer xqa/trtllm-gen as supported,directly test producer-local winner vs edge-global winner,primary-RQ1
+E-NH-COPY-BF16-32,3-edge,QKV/KV writer → paged KV → decode,NHD,HND,materialized transpose/repack,BF16,32,8,1,2048,64,FlashInfer xqa/trtllm-gen as supported,directly test producer-local winner vs edge-global winner,primary-RQ1
+E-HH-BF16-32,3-edge,QKV/KV writer → paged KV → decode,HND,HND,producer-native HND,BF16,32,8,1,2048,64,FlashInfer xqa/trtllm-gen as supported,directly test producer-local winner vs edge-global winner,primary-RQ1
+E-HN-COPY-BF16-32,3-edge,QKV/KV writer → paged KV → decode,HND,NHD,materialized transpose/repack,BF16,32,8,1,2048,64,FlashInfer xqa/trtllm-gen as supported,directly test producer-local winner vs edge-global winner,primary-RQ1
+E-NN-NVFP4-1,3-edge,QKV/KV writer → paged KV → decode,NHD,NHD,none,NVFP4,1,8,1,2048,64,FlashInfer xqa/trtllm-gen as supported,directly test producer-local winner vs edge-global winner,primary-RQ1
+E-NH-COPY-NVFP4-1,3-edge,QKV/KV writer → paged KV → decode,NHD,HND,materialized transpose/repack,NVFP4,1,8,1,2048,64,FlashInfer xqa/trtllm-gen as supported,directly test producer-local winner vs edge-global winner,primary-RQ1
+E-HH-NVFP4-1,3-edge,QKV/KV writer → paged KV → decode,HND,HND,producer-native HND,NVFP4,1,8,1,2048,64,FlashInfer xqa/trtllm-gen as supported,directly test producer-local winner vs edge-global winner,primary-RQ1
+E-HN-COPY-NVFP4-1,3-edge,QKV/KV writer → paged KV → decode,HND,NHD,materialized transpose/repack,NVFP4,1,8,1,2048,64,FlashInfer xqa/trtllm-gen as supported,directly test producer-local winner vs edge-global winner,primary-RQ1
+E-NN-NVFP4-8,3-edge,QKV/KV writer → paged KV → decode,NHD,NHD,none,NVFP4,8,8,1,2048,64,FlashInfer xqa/trtllm-gen as supported,directly test producer-local winner vs edge-global winner,primary-RQ1
+E-NH-COPY-NVFP4-8,3-edge,QKV/KV writer → paged KV → decode,NHD,HND,materialized transpose/repack,NVFP4,8,8,1,2048,64,FlashInfer xqa/trtllm-gen as supported,directly test producer-local winner vs edge-global winner,primary-RQ1
+E-HH-NVFP4-8,3-edge,QKV/KV writer → paged KV → decode,HND,HND,producer-native HND,NVFP4,8,8,1,2048,64,FlashInfer xqa/trtllm-gen as supported,directly test producer-local winner vs edge-global winner,primary-RQ1
+E-HN-COPY-NVFP4-8,3-edge,QKV/KV writer → paged KV → decode,HND,NHD,materialized transpose/repack,NVFP4,8,8,1,2048,64,FlashInfer xqa/trtllm-gen as supported,directly test producer-local winner vs edge-global winner,primary-RQ1
+E-NN-NVFP4-32,3-edge,QKV/KV writer → paged KV → decode,NHD,NHD,none,NVFP4,32,8,1,2048,64,FlashInfer xqa/trtllm-gen as supported,directly test producer-local winner vs edge-global winner,primary-RQ1
+E-NH-COPY-NVFP4-32,3-edge,QKV/KV writer → paged KV → decode,NHD,HND,materialized transpose/repack,NVFP4,32,8,1,2048,64,FlashInfer xqa/trtllm-gen as supported,directly test producer-local winner vs edge-global winner,primary-RQ1
+E-HH-NVFP4-32,3-edge,QKV/KV writer → paged KV → decode,HND,HND,producer-native HND,NVFP4,32,8,1,2048,64,FlashInfer xqa/trtllm-gen as supported,directly test producer-local winner vs edge-global winner,primary-RQ1
+E-HN-COPY-NVFP4-32,3-edge,QKV/KV writer → paged KV → decode,HND,NHD,materialized transpose/repack,NVFP4,32,8,1,2048,64,FlashInfer xqa/trtllm-gen as supported,directly test producer-local winner vs edge-global winner,primary-RQ1
+S-BATCH,4-sensitivity,best-2 edge strategies from Stage 3,conditional,conditional,conditional,BF16+NVFP4,conditional,conditional,conditional,conditional,conditional,same backend family,sweep batch over 1|8|32|64; keep other variables at Stage-3 center,crossover-surface
+S-KVLEN,4-sensitivity,best-2 edge strategies from Stage 3,conditional,conditional,conditional,BF16+NVFP4,conditional,conditional,conditional,conditional,conditional,same backend family,sweep kv_len over 128|512|2048|8192|32768; keep other variables at Stage-3 center,crossover-surface
+S-GQA,4-sensitivity,best-2 edge strategies from Stage 3,conditional,conditional,conditional,BF16+NVFP4,conditional,conditional,conditional,conditional,conditional,same backend family,sweep Hq/Hkv over 1|4|8|16|32; keep other variables at Stage-3 center,crossover-surface
+S-QLEN,4-sensitivity,best-2 edge strategies from Stage 3,conditional,conditional,conditional,BF16+NVFP4,conditional,conditional,conditional,conditional,conditional,same backend family,sweep q_len over 1|4|8; keep other variables at Stage-3 center,crossover-surface
+S-PAGE,4-sensitivity,best-2 edge strategies from Stage 3,conditional,conditional,conditional,BF16+NVFP4,conditional,conditional,conditional,conditional,conditional,same backend family,sweep page_size over 16|64|128; keep other variables at Stage-3 center,crossover-surface
+X-MLA,5-external-validity,MLA latent cache writer → MLA decode,MLA latent/native,MLA consumer-native,native vs conversion,FP8/BF16,NA,workload-specific,workload-specific,workload-specific,workload-specific,TensorRT-LLM/vLLM MLA-capable backend,test whether edge rank inversion generalizes to latent-cache representation,external-validity
+X-MOE,5-external-validity,MoE dispatch/scale prep → grouped GEMM,dispatcher-native,expert-kernel-native,scale interleave vs producer-native scale format,NVFP4/FP8,NA,workload-specific,workload-specific,workload-specific,workload-specific,SGLang + FlashInfer/CUTLASS,test rank inversion on data/scale producer-consumer boundary,external-validity
+X-ATTN-O,5-external-validity,attention output → quant → O-proj,attention-output native,GEMM/quant native,materialized quant/layout vs fused/native,FP8/BF16,NA,workload-specific,workload-specific,workload-specific,workload-specific,vLLM/TRT-LLM,test rank inversion outside persistent KV,external-validity

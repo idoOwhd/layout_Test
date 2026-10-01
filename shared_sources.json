@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "sources": [
+    {"id": "llm_subgraph_share", "url": "https://chatgpt.com/share/6aa544d5-e610-83e9-a854-f8496c835725", "required_markers": ["Diffusion", "Qwen-Image", "FLUX.2"]},
+    {"id": "prefill_decode_share", "url": "https://chatgpt.com/share/6aa54a83-ec44-83e9-9115-425ca979b0f7", "required_markers": ["prefill", "Decode"]},
+    {"id": "tilelang_share", "url": "https://chatgpt.com/share/6aa55b6f-e6c4-83ea-90b3-a7d229fec0de", "required_markers": ["TileLang", "layout"]},
+    {"id": "triton_share", "url": "https://chatgpt.com/share/6aa55ba4-497c-83ea-b309-76b28bf2dd1f", "required_markers": ["Triton", "layout"]},
+    {"id": "sglang_share", "url": "https://chatgpt.com/share/6aa55c5f-f6dc-83ea-b2f3-626aeff6dbf3", "required_markers": ["SGLang", "layout"]},
+    {"id": "vllm_share_a", "url": "https://chatgpt.com/share/6aa55c95-c204-83ea-96fe-85352528dd5a", "required_markers": ["vLLM", "layout"]},
+    {"id": "vllm_share_b", "url": "https://chatgpt.com/share/6aa55ca9-4db0-83ea-9e04-f4c9c8d3982f", "required_markers": ["vLLM", "layout"]},
+    {"id": "tvm_share", "url": "https://chatgpt.com/share/6aa55d76-995c-83ea-b44a-49fa65cfb947", "required_markers": ["TVM", "layout"]},
+    {"id": "layout_constraints_share", "url": "https://chatgpt.com/share/6a9f6b96-6044-83ec-97a2-43f439587390", "required_markers": ["layout"]},
+    {"id": "research_questions_share", "url": "https://chatgpt.com/share/6aa56213-0038-83ea-bf5a-a335f2cdb231", "required_markers": ["layout"]}
+  ],
+  "local_references": [
+    {
+      "id": "prefill_decode_codex_thread",
+      "url": "codex://threads/01a01e1a-016c-70b0-8407-9e2afdc05360",
+      "validation": "Must be opened by a Codex client; it is not an HTTP URL and is intentionally excluded from validate_shared_links.py."
+    }
+  ]
+}

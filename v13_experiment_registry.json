@@ -1,0 +1,191 @@
+{
+  "schema_version": 1,
+  "canonical_spec": "ref_talks/layout_summary_v13_complete_problem_trial_audit_RQ1_RQ10.md",
+  "principles": {
+    "practical_threshold": "A performance claim needs a correct paired comparison and >=3% median improvement unless the experiment specifies a stronger test.",
+    "source_scope": "Source prevalence establishes that a mechanism/omitted variable occurs across applicable stacks; it is not performance evidence.",
+    "single_gpu_scope": "Distributed and cross-hardware hypotheses are blocked, not proxied or silently omitted.",
+    "negative_controls": "A negative control supports the proposed boundary only when the predicted effect disappears."
+  },
+  "framework_adapters": {
+    "vLLM": {
+      "artifact": "vllm_native_serving.jsonl",
+      "runtime_rqs": ["L-RQ4", "L-RQ9", "L-RQ10"],
+      "source_only_rqs": ["L-RQ1", "L-RQ2", "L-RQ3", "L-RQ6", "L-RQ7", "L-RQ8"],
+      "blocked_rqs": ["L-RQ5"],
+      "limitations": "No public safe live-KV conversion, arbitrary layout-domain split, or online persistent-cache migration adapter in this harness."
+    },
+    "SGLang": {
+      "artifact": "sglang_native_serving.jsonl",
+      "runtime_rqs": ["L-RQ4", "L-RQ9", "L-RQ10"],
+      "source_only_rqs": ["L-RQ1", "L-RQ2", "L-RQ3", "L-RQ6", "L-RQ7", "L-RQ8"],
+      "blocked_rqs": ["L-RQ5"],
+      "limitations": "NHD/HND is compared at fixed engine settings; page=1/page=16 is compared with the same FlashInfer backend. The harness does not claim live-KV migration or per-request layout switching."
+    },
+    "CUTLASS/CuTe": {
+      "artifact": "cutlass_softmax_boundary.csv",
+      "runtime_rqs": ["L-RQ4", "L-RQ9"],
+      "source_only_rqs": ["L-RQ1", "L-RQ3", "L-RQ7", "L-RQ8"],
+      "not_applicable_rqs": ["L-RQ2", "L-RQ6", "L-RQ10"],
+      "blocked_rqs": ["L-RQ5"],
+      "limitations": "CUTLASS owns kernel/thread/value layouts, not the serving KV allocator or epoch controller."
+    },
+    "Triton": {
+      "artifact": "triton_kv_layout.csv",
+      "runtime_rqs": ["L-RQ1", "L-RQ4", "L-RQ7", "L-RQ9"],
+      "source_only_rqs": ["L-RQ8"],
+      "not_applicable_rqs": ["L-RQ2", "L-RQ3", "L-RQ6", "L-RQ10"],
+      "blocked_rqs": ["L-RQ5"],
+      "limitations": "The Triton adapter measures explicit layouts; it does not own serving persistence/domain/migration policy."
+    },
+    "TVM": {
+      "artifact": "tvm_rq_observations.csv",
+      "runtime_rqs": ["L-RQ1", "L-RQ3", "L-RQ4", "L-RQ9"],
+      "source_only_rqs": ["L-RQ7"],
+      "not_applicable_rqs": ["L-RQ2", "L-RQ6", "L-RQ8", "L-RQ10"],
+      "blocked_rqs": ["L-RQ5"],
+      "limitations": "TVM compiler experiments do not own serving KV pools, metadata allocators, or traffic epochs."
+    },
+    "Hexcute": {
+      "artifact": "hexcute.jsonl",
+      "runtime_rqs": [],
+      "architecture_blocked_rqs": ["L-RQ1", "L-RQ3", "L-RQ4", "L-RQ7", "L-RQ9"],
+      "source_only_rqs": [],
+      "not_applicable_rqs": ["L-RQ2", "L-RQ6", "L-RQ8", "L-RQ10"],
+      "blocked_rqs": ["L-RQ5"],
+      "limitations": "The public Hexcute artifact targets A100/H100; physical card 1 is an A10. These cells are blocked_architecture_unsupported and are never inferred from CUDA reference results."
+    }
+  },
+  "rqs": [
+    {
+      "rq": "L-RQ1",
+      "name": "Cross-edge layout rank inversion",
+      "case_scope": {"structures": "all", "reason": "every subgraph has at least one producer-consumer tensor boundary"},
+      "applicable_runtime_frameworks": ["CUDA-reference", "Triton", "TVM", "vLLM", "SGLang"],
+      "hypotheses": {
+        "H1.1": {"experiment": "RQ1-E3", "artifact": "rq_cuda_reference.csv", "method": "producer-local versus full-edge winner"},
+        "H1.2": {"experiment": "RQ1-E4", "artifact": "rq_cuda_reference.csv", "method": "reuse/fanout sweep"},
+        "H1.3": {"experiment": "RQ1-E4", "artifact": "llm_boundary_layout_sweep.jsonl", "method": "stride-polymorphic direct read versus materialization"},
+        "H1.4": {"experiment": "RQ1-E3", "artifact": "rq_cuda_reference.csv", "method": "producer-native HND versus NHD plus conversion"},
+        "H1.NEG": {"experiment": "RQ1-E0", "artifact": "rq_cuda_reference.csv", "method": "layout-insensitive/tiny-effect negative control"}
+      }
+    },
+    {
+      "rq": "L-RQ2",
+      "name": "Optimal layout-domain granularity",
+      "case_scope": {"structures": ["gqa", "sliding_attention", "sparse_attention", "mla", "moe"], "reason": "persistent or multi-consumer attention/MoE state can be partitioned into layout domains"},
+      "applicable_runtime_frameworks": ["CUDA-reference", "vLLM", "SGLang"],
+      "hypotheses": {
+        "H2.1": {"experiment": "RQ2-E2", "artifact": "rq_cuda_reference.csv", "method": "shared versus split domains over measured heterogeneity"},
+        "H2.2": {"experiment": "RQ2-E3", "artifact": "v13_measured_models.json", "method": "held-out weighted-regret versus equal-vote predictor"},
+        "H2.3": {"experiment": "RQ2-E0", "artifact": "rq_cuda_reference.csv", "method": "low-heterogeneity negative control"},
+        "H2.4": {"experiment": "RQ2-E4", "artifact": "v13_measured_models.json", "method": "acceptance-rate sweep anchored by measured consumers"},
+        "H2.5": {"experiment": "RQ2-E5", "artifact": "v13_measured_models.json", "method": "storage/allocator-overhead threshold sweep"}
+      }
+    },
+    {
+      "rq": "L-RQ3",
+      "name": "Layout adaptation amortization",
+      "case_scope": {"structures": "all", "reason": "every subgraph exposes materialize-versus-direct boundary alternatives and reuse"},
+      "applicable_runtime_frameworks": ["CUDA-reference", "TVM"],
+      "hypotheses": {
+        "H3.1": {"experiment": "RQ3-E2", "artifact": "rq_cuda_reference.csv", "method": "direct reuse break-even sweep"},
+        "H3.2": {"experiment": "RQ3-E3", "artifact": "v13_measured_models.json", "method": "measured-cost temporary-memory sensitivity"},
+        "H3.3": {"experiment": "RQ3-E4", "artifact": "v13_measured_models.json", "method": "measured-cost overlap sensitivity"},
+        "H3.4": {"experiment": "RQ3-E1", "artifact": "llm_boundary_layout_sweep.jsonl", "method": "zero-copy stride versus materialization"},
+        "H3.5": {"experiment": "RQ3-E0", "artifact": "rq_cuda_reference.csv", "method": "R=1 negative control"}
+      }
+    },
+    {
+      "rq": "L-RQ4",
+      "name": "Optimal-layout stability across workload/hardware",
+      "case_scope": {"structures": "all", "reason": "shape and phase stability is defined for every subgraph family"},
+      "applicable_runtime_frameworks": ["CUDA-reference", "Triton", "TVM", "vLLM", "SGLang"],
+      "hypotheses": {
+        "H4.1": {"experiment": "RQ4-E1", "artifact": "multi-framework runtime outputs", "method": "workload/shape crossover on card1; hardware axis deferred"},
+        "H4.2": {"experiment": "RQ4-E2", "artifact": "v13_hypothesis_results.json", "method": "held-out static-policy regret"},
+        "H4.3": {"experiment": "RQ4-E1", "artifact": "v13_hypothesis_results.json", "method": "contiguous winner-region coverage"},
+        "H4.4": {"experiment": "RQ4-E3", "status": "blocked_requires_multiple_hardware", "method": "held-out hardware comparison"},
+        "H4.5": {"experiment": "RQ4-E4", "artifact": "multi-framework runtime outputs", "method": "persistent-layout regret after local kernel dispatch"}
+      }
+    },
+    {
+      "rq": "L-RQ5",
+      "name": "Communication/placement-aware layout inversion",
+      "case_scope": {"structures": ["gqa", "sliding_attention", "sparse_attention", "mla", "moe"], "reason": "KV/state or expert tensors are placement and communication candidates"},
+      "applicable_runtime_frameworks": ["vLLM", "SGLang", "TensorRT-LLM"],
+      "single_gpu_status": "blocked_single_gpu",
+      "hypotheses": {
+        "H5.1": {"experiment": "RQ5-E2", "status": "blocked_single_gpu"},
+        "H5.2": {"experiment": "RQ5-E3", "status": "blocked_single_gpu"},
+        "H5.3": {"experiment": "RQ5-E4", "status": "blocked_single_gpu"},
+        "H5.4": {"experiment": "RQ5-E0", "status": "blocked_single_gpu"},
+        "H5.5": {"experiment": "RQ5-E5", "status": "blocked_single_gpu"}
+      }
+    },
+    {
+      "rq": "L-RQ6",
+      "name": "Persistent-layout reconfiguration threshold",
+      "case_scope": {"structures": ["gqa", "sliding_attention", "sparse_attention", "mla", "mamba2", "linear_attention"], "reason": "these subgraphs carry persistent cache or recurrent state across requests/tokens"},
+      "applicable_runtime_frameworks": ["measured-cost controller"],
+      "hypotheses": {
+        "H6.1": {"experiment": "RQ6-E2", "artifact": "v13_measured_models.json", "method": "migration horizon from measured layout costs"},
+        "H6.2": {"experiment": "RQ6-E3", "artifact": "v13_measured_models.json", "method": "per-request versus hysteretic policy"},
+        "H6.3": {"experiment": "RQ6-E0", "artifact": "v13_measured_models.json", "method": "stationary-trace negative control"},
+        "H6.4": {"experiment": "RQ6-E2", "artifact": "v13_measured_models.json", "method": "persistent-drift amortization"},
+        "H6.5": {"experiment": "RQ6-E4", "artifact": "v13_measured_models.json", "method": "recapture/duplicate-live sensitivity"}
+      }
+    },
+    {
+      "rq": "L-RQ7",
+      "name": "Layout equivalence and zero-copy transformability",
+      "case_scope": {"structures": "all", "reason": "stride legality and zero-copy equivalence apply to every tensor boundary"},
+      "applicable_runtime_frameworks": ["PyTorch", "Triton", "TVM"],
+      "hypotheses": {
+        "H7.1": {"experiment": "RQ7-E1", "artifact": "llm_boundary_layout_sweep.jsonl", "method": "legal zero-copy view fraction and speed"},
+        "H7.2": {"experiment": "RQ7-E3", "artifact": "v13_measured_models.json", "method": "intersection loss under consumers/alias constraints"},
+        "H7.3": {"experiment": "RQ7-E2", "artifact": "llm_boundary_layout_sweep.jsonl", "method": "stride/alignment legality versus layout-name predictor"},
+        "H7.4": {"experiment": "RQ7-E4", "artifact": "v13_measured_models.json", "method": "conversion reduction when stride support expands"}
+      }
+    },
+    {
+      "rq": "L-RQ8",
+      "name": "Coupled data-metadata co-layout",
+      "case_scope": {"structures": ["gqa", "sliding_attention", "sparse_attention", "mla", "moe"], "reason": "page tables, sparse indices, routes, and scale-like metadata are coupled to data"},
+      "applicable_runtime_frameworks": ["CUDA-reference", "Triton", "vLLM", "SGLang"],
+      "hypotheses": {
+        "H8.1": {"experiment": "RQ8-E2", "artifact": "rq_cuda_reference.csv", "method": "2x2 data-layout x metadata-layout interaction"},
+        "H8.2": {"experiment": "RQ8-E3", "artifact": "rq_cuda_reference.csv", "method": "paged data x block-table granularity"},
+        "H8.3": {"experiment": "RQ8-E1", "artifact": "rq_cuda_reference.csv", "method": "joint scale/data choice versus independent choice"},
+        "H8.4": {"experiment": "RQ8-E0", "artifact": "rq_cuda_reference.csv", "method": "per-head tiny metadata negative control"},
+        "H8.5": {"experiment": "RQ8-E4", "artifact": "rq_cuda_reference.csv", "method": "data winner conditioned on metadata placement"}
+      }
+    },
+    {
+      "rq": "L-RQ9",
+      "name": "Layout-space expressiveness and search-space truncation",
+      "case_scope": {"structures": "all", "reason": "every subgraph has a legal physical-layout search space"},
+      "applicable_runtime_frameworks": ["Triton", "TVM", "vLLM", "SGLang"],
+      "hypotheses": {
+        "H9.1": {"experiment": "RQ9-E2", "artifact": "triton_kv_layout.csv", "method": "native named subset versus extended legal oracle"},
+        "H9.2": {"experiment": "RQ9-E3", "artifact": "v13_measured_models.json", "method": "consumer-intersection restriction versus union plus repair"},
+        "H9.3": {"experiment": "RQ9-E4", "artifact": "triton_kv_layout.csv", "method": "extended-space gains by geometry/phase"},
+        "H9.4": {"experiment": "RQ9-E0", "artifact": "triton_kv_layout.csv", "method": "disable extension when native oracle already wins"},
+        "H9.5": {"experiment": "RQ9-E1", "artifact": "compiler dumps and physical strides", "method": "distinct legal mappings beyond named API set"}
+      }
+    },
+    {
+      "rq": "L-RQ10",
+      "name": "Paged/block layout granularity and allocator coupling",
+      "case_scope": {"structures": ["gqa", "sliding_attention", "sparse_attention", "mla"], "reason": "paged/block KV or latent state is part of these attention families"},
+      "applicable_runtime_frameworks": ["CUDA-reference", "SGLang", "vLLM"],
+      "hypotheses": {
+        "H10.1": {"experiment": "RQ10-E2", "artifact": "v13_measured_models.json", "method": "prefix-hit/fanout sweep over measured page kernels"},
+        "H10.2": {"experiment": "RQ10-E1", "artifact": "rq_cuda_reference.csv", "method": "block-table traffic plus analytical fragmentation terms"},
+        "H10.3": {"experiment": "RQ10-E3", "artifact": "v13_measured_models.json", "method": "fixed page versus per-trace oracle"},
+        "H10.4": {"experiment": "RQ10-E4", "artifact": "v13_measured_models.json", "method": "multi-pool overhead threshold"},
+        "H10.5": {"experiment": "RQ10-E1", "artifact": "v13_measured_models.json", "method": "kernel-only winner versus end-to-end allocator objective"}
+      }
+    }
+  ]
+}

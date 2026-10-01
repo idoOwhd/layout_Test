@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "name": "producer-consumer local-versus-graph layout counterexample",
+  "initial_layouts": {"x": "row_major"},
+  "conversion_cost_ms": {
+    "*:row_major->tiled": 0.8,
+    "*:tiled->row_major": 0.8
+  },
+  "ops": [
+    {
+      "id": "producer_gemm",
+      "inputs": ["x"],
+      "outputs": ["middle"],
+      "implementations": [
+        {"id": "producer_row_fast", "input_layouts": {"x": "row_major"}, "output_layouts": {"middle": "row_major"}, "kernel_ms": 1.0},
+        {"id": "producer_tiled_slightly_slower", "input_layouts": {"x": "row_major"}, "output_layouts": {"middle": "tiled"}, "kernel_ms": 1.2}
+      ]
+    },
+    {
+      "id": "consumer_reduction",
+      "inputs": ["middle"],
+      "outputs": ["y"],
+      "implementations": [
+        {"id": "consumer_row", "input_layouts": {"middle": "row_major"}, "output_layouts": {"y": "row_major"}, "kernel_ms": 2.0},
+        {"id": "consumer_tiled", "input_layouts": {"middle": "tiled"}, "output_layouts": {"y": "row_major"}, "kernel_ms": 0.5}
+      ]
+    }
+  ]
+}

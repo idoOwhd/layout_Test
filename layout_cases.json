@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "gpu_transaction_bytes": 128,
+  "shared_bank_count": 32,
+  "shared_bank_width_bytes": 4,
+  "cases": [
+    {
+      "case_id": "gqa_decode_qwen3",
+      "family": "attention_kv",
+      "phase": "decode",
+      "shape": {"tokens": 8192, "query_heads": 16, "kv_heads": 8, "head_dim": 128, "block_size": 16},
+      "layouts": ["NHD", "HND", "paged_NHD", "paged_HND"]
+    },
+    {
+      "case_id": "gqa_prefill_qwen3",
+      "family": "attention_kv",
+      "phase": "prefill",
+      "shape": {"tokens": 2048, "query_heads": 16, "kv_heads": 8, "head_dim": 128, "block_size": 16},
+      "layouts": ["NHD", "HND", "paged_NHD", "paged_HND"]
+    },
+    {
+      "case_id": "mla_decode_deepseek",
+      "family": "mla_cache",
+      "phase": "decode",
+      "shape": {"tokens": 8192, "query_heads": 128, "kv_heads": 1, "head_dim": 576, "latent_dim": 512, "rope_dim": 64, "block_size": 64},
+      "layouts": ["expanded_NHD", "latent_token_major", "latent_paged"]
+    },
+    {
+      "case_id": "swiglu_decode_llama3",
+      "family": "swiglu",
+      "phase": "decode",
+      "shape": {"m": 32, "hidden": 4096, "intermediate": 14336},
+      "layouts": ["separate_gate_up", "packed_gate_up", "interleaved_gate_up"]
+    },
+    {
+      "case_id": "swiglu_prefill_llama3",
+      "family": "swiglu",
+      "phase": "prefill",
+      "shape": {"m": 2048, "hidden": 4096, "intermediate": 14336},
+      "layouts": ["separate_gate_up", "packed_gate_up", "interleaved_gate_up"]
+    },
+    {
+      "case_id": "moe_decode_deepseek",
+      "family": "moe",
+      "phase": "decode",
+      "shape": {"tokens": 128, "hidden": 7168, "experts": 256, "topk": 8, "expert_capacity": 8},
+      "layouts": ["token_major_indirect", "expert_major_packed"]
+    },
+    {
+      "case_id": "mamba2_prefill",
+      "family": "state_space",
+      "phase": "prefill",
+      "shape": {"batch": 1, "tokens": 2048, "heads": 128, "head_dim": 64, "state_dim": 128, "chunk": 64},
+      "layouts": ["sequence_major", "head_major", "chunked_head_major"]
+    },
+    {
+      "case_id": "dit_attention",
+      "family": "diffusion_attention",
+      "phase": "denoise",
+      "shape": {"batch": 2, "tokens": 4096, "query_heads": 24, "kv_heads": 24, "head_dim": 128, "block_size": 64},
+      "layouts": ["NHD", "HND", "paged_NHD", "paged_HND"]
+    },
+    {
+      "case_id": "unet_conv",
+      "family": "diffusion_conv",
+      "phase": "denoise",
+      "shape": {"batch": 1, "channels": 320, "height": 64, "width": 64, "out_channels": 320, "kernel": 3},
+      "layouts": ["NCHW", "NHWC"]
+    },
+    {
+      "case_id": "norm_softmax_boundary",
+      "family": "reduction",
+      "phase": "all",
+      "shape": {"rows": 8192, "cols": 4096, "tile_rows": 16, "tile_cols": 16},
+      "layouts": ["row_major", "tiled_16x16", "tiled_to_row_major"]
+    },
+    {
+      "case_id": "shared_transpose_tile",
+      "family": "shared_memory",
+      "phase": "all",
+      "shape": {"rows": 32, "cols": 32, "element_bytes": 4},
+      "layouts": ["row_major_stride32", "padded_stride33", "xor_swizzle"]
+    }
+  ]
+}

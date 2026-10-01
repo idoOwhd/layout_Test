@@ -1,0 +1,108 @@
+{
+  "schema_version": 1,
+  "scope_note": "Serving systems, kernel libraries, kernel DSLs, and graph compilers make decisions at different layers. A missing decision is recorded as delegated, not inferred.",
+  "frameworks": [
+    {
+      "name": "sglang",
+      "kind": "serving_system",
+      "decision_scope": "Chooses attention backend, cache pool/page organization and model-specific cache representation; most register/shared-memory layouts are delegated to FlashInfer, FlashAttention, Triton, CUTLASS or vendor kernels.",
+      "source_root_env": "SGLANG_DIR",
+      "remote_repo": "sgl-project/sglang",
+      "evidence": [
+        {"path": "python/sglang/srt/mem_cache/memory_pool.py", "patterns": ["MHATokenToKVPool", "MLATokenToKVPool", "merge_kv", "store_kv_cache", "page_size"]},
+        {"path": "python/sglang/srt/layers/attention/flashinfer_backend.py", "patterns": ["kv_layout", "NHD", "HND", "paged_kv"]},
+        {"path": "python/sglang/srt/layers/attention/flashattention_backend.py", "patterns": ["kv_cache", "view", "reshape", "contiguous"]}
+      ],
+      "urls": [
+        "https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/mem_cache/memory_pool.py",
+        "https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/attention/flashinfer_backend.py",
+        "https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/attention/flashattention_backend.py"
+      ]
+    },
+    {
+      "name": "vllm",
+      "kind": "serving_system",
+      "decision_scope": "Resolves one compatible KV-cache layout from backend preference lists and explicit configuration, and manages fixed-size blocks/pages; kernel-internal layouts remain backend decisions.",
+      "source_root_env": "VLLM_DIR",
+      "remote_repo": "vllm-project/vllm",
+      "evidence": [
+        {"path": "vllm/v1/attention/backends/utils.py", "patterns": ["resolve_kv_cache_layout", "VLLM_KV_CACHE_LAYOUT", "supported_layouts", "candidates"]},
+        {"path": "vllm/v1/attention/backend.py", "patterns": ["KVCacheLayout", "get_supported_kv_cache_layouts", "preferred"]},
+        {"path": "vllm/v1/kv_cache_interface.py", "patterns": ["block_size", "page_size_bytes", "indexes_kv_by_block_stride"]}
+      ],
+      "urls": [
+        "https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/backends/utils.py",
+        "https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/backend.py",
+        "https://github.com/vllm-project/vllm/blob/main/vllm/v1/kv_cache_interface.py",
+        "https://github.com/vllm-project/vllm/blob/main/docs/design/hybrid_kv_cache_manager.md"
+      ]
+    },
+    {
+      "name": "cutlass",
+      "kind": "kernel_template_library",
+      "decision_scope": "The kernel author/manifest selects global-memory LayoutA/B/C, tile shape, collective schedule and CuTe shared-memory swizzle; CUTLASS validates contracts and instantiates them but is not a graph-wide automatic layout optimizer.",
+      "source_root_env": "CUTLASS_DIR",
+      "remote_repo": "NVIDIA/cutlass",
+      "evidence": [
+        {"path": "include/cute/swizzle_layout.hpp", "patterns": ["Swizzle", "make_layout", "composition"]},
+        {"path": "include/cutlass/gemm/collective/builders/sm90_common.inl", "patterns": ["LayoutA", "LayoutB", "Swizzle", "StageCount"]},
+        {"path": "examples/35_gemm_softmax/gemm_with_softmax.h", "patterns": ["LayoutC", "LayoutSoft", "AlignmentSoftmax", "RowMajor"]}
+      ],
+      "urls": [
+        "https://github.com/NVIDIA/cutlass/blob/main/include/cute/swizzle_layout.hpp",
+        "https://github.com/NVIDIA/cutlass/tree/main/examples/35_gemm_softmax",
+        "https://github.com/NVIDIA/cutlass/blob/main/media/docs/cpp/efficient_gemm.md"
+      ]
+    },
+    {
+      "name": "triton",
+      "kind": "kernel_dsl_compiler",
+      "decision_scope": "The program fixes pointer/index order and tile shape; Triton encodes register/lane/warp/CTA mappings as layouts, derives legal dot/shared layouts and lowers layout conversions. Autotuning selects annotated configurations, not arbitrary graph-wide storage layouts.",
+      "source_root_env": "TRITON_DIR",
+      "remote_repo": "triton-lang/triton",
+      "evidence": [
+        {"path": "include/triton/Tools/LinearLayout.h", "patterns": ["basis vectors", "Convert an existing Triton layout", "invertAndCompose"]},
+        {"path": "lib/Dialect/TritonGPU/IR/LinearLayoutConversions.cpp", "patterns": ["nvmmaSharedToLinearLayout", "getSwizzlingByteWidth", "broadcastedDotOperandLayout"]},
+        {"path": "lib/Analysis/Utility.cpp", "patterns": ["getWarpLayoutConvertDecomposition", "data movement", "srcLayout", "dstLayout"]}
+      ],
+      "urls": [
+        "https://github.com/triton-lang/triton/blob/main/include/triton/Tools/LinearLayout.h",
+        "https://github.com/triton-lang/triton/blob/main/lib/Dialect/TritonGPU/IR/LinearLayoutConversions.cpp",
+        "https://github.com/triton-lang/triton/blob/main/lib/Analysis/Utility.cpp"
+      ]
+    },
+    {
+      "name": "tvm",
+      "kind": "tensor_compiler",
+      "decision_scope": "Represents logical-to-physical mappings with IndexMap and applies explicit transform_layout/transform_block_layout; MetaSchedule can search schedule rules and rewrite compatible layouts, but coverage and cost modeling depend on operator templates and target rules.",
+      "source_root_env": "TVM_DIR",
+      "remote_repo": "apache/tvm",
+      "evidence": [
+        {"path": "src/s_tir/schedule/primitive/layout_transformation.cc", "patterns": ["TransformLayout", "IndexMap", "NonSurjectiveInverse"]},
+        {"path": "src/s_tir/meta_schedule/postproc/rewrite_layout.cc", "patterns": ["RewriteLayout", "SuggestIndexMap", "layout"]},
+        {"path": "python/tvm/s_tir/schedule/schedule.py", "patterns": ["def transform_layout", "def transform_block_layout"]}
+      ],
+      "urls": [
+        "https://github.com/apache/tvm/blob/main/src/s_tir/schedule/primitive/layout_transformation.cc",
+        "https://github.com/apache/tvm/blob/main/src/s_tir/meta_schedule/postproc/rewrite_layout.cc",
+        "https://github.com/apache/tvm-rfcs/blob/main/rfcs/0039-buffer-physical-layout.md"
+      ]
+    },
+    {
+      "name": "hexcute",
+      "kind": "tile_dsl_compiler",
+      "decision_scope": "Synthesizes thread-value layouts and task mappings by type/constraint propagation, inserts rearrangement when constraints conflict, then selects shared-memory layout/swizzle and program variants with a cost model.",
+      "source_root_env": "HEXCUTE_DIR",
+      "remote_repo": "hidet-org/hidet",
+      "evidence": [
+        {"path": "python/hidet/ir/cute", "patterns": ["TiledTensorLayout", "ThrValAtom", "auto_layout", "infer"]},
+        {"path": "python/hidet/transforms/cute", "patterns": ["infer", "layout", "rearrange", "cost"]}
+      ],
+      "urls": [
+        "https://github.com/hexcute/hexcute-bench",
+        "https://github.com/hidet-org/hidet/tree/main/python/hidet/ir/cute",
+        "https://arxiv.org/abs/2504.16214"
+      ]
+    }
+  ]
+}

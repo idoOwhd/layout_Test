@@ -1,0 +1,111 @@
+{
+  "schema_version": 1,
+  "claim_levels": {
+    "controlled": "Framework-independent controlled mechanism experiment on common LLM shapes.",
+    "native_problem": "A paired experiment inside the named framework reproduces the problem mechanism.",
+    "native_solution": "A paired framework-native counterfactual shows the proposed decision improves performance.",
+    "source": "Pinned source proves the decision/control exists, but is not performance evidence."
+  },
+  "rqs": [
+    {
+      "rq": "RQ1",
+      "observations": ["O-RQ1-TWO-LEVEL-CONTROL", "O-LRQ1-EDGE-INVERSION"],
+      "controlled_experiment": "NHD/HND producer, head-scan and token-scan plus v10 edge strategies",
+      "native_applicability": {
+        "vLLM": "native: KV layout is a persistent engine choice; compare legal layouts across request regimes.",
+        "SGLang": "native: NHD/HND cache layout is a persistent process choice; compare with backend fixed.",
+        "TVM": "not_applicable: TVM has no serving KV control plane in this harness."
+      }
+    },
+    {
+      "rq": "RQ2",
+      "observations": ["O-RQ2-ADAPTIVE-DOMAINS"],
+      "controlled_experiment": "common-NHD/common-HND versus split storage across multiple consumers",
+      "native_applicability": {
+        "vLLM": "missing_adapter: requires two coexisting cache groups/layout domains in one run.",
+        "SGLang": "missing_adapter: page-size experiments are not equivalent to split layout domains.",
+        "TVM": "not_applicable: serving cache-domain policy is outside the compiled kernel."
+      }
+    },
+    {
+      "rq": "RQ3",
+      "observations": ["O-RQ3-CONVERSION-INVESTMENT"],
+      "controlled_experiment": "convert-once versus no-convert over reuse 1/4/16/64",
+      "native_applicability": {
+        "vLLM": "missing_adapter: public runtime does not expose a safe live KV conversion action.",
+        "SGLang": "missing_adapter: public runtime does not expose a safe live KV conversion action.",
+        "TVM": "native: time row/tiled consumers and row-to-tiled conversion, then charge conversion once across reuse."
+      }
+    },
+    {
+      "rq": "RQ4",
+      "observations": ["O-RQ4-CRITICAL-PATH"],
+      "controlled_experiment": "isolated versus concurrent HBM-pressure consumer",
+      "native_applicability": {
+        "vLLM": "blocked_single_gpu: TP/EP max-rank and collective overlap require multiple GPUs.",
+        "SGLang": "blocked_single_gpu: TP/EP max-rank and collective overlap require multiple GPUs.",
+        "TVM": "not_applicable: one kernel timing cannot prove serving critical-path placement."
+      }
+    },
+    {
+      "rq": "RQ5",
+      "observations": ["O-RQ5-JOINT-CONSUMER-NEGOTIATION"],
+      "controlled_experiment": "two consumers with empty direct intersection, common/split/disable alternatives",
+      "native_applicability": {
+        "vLLM": "missing_adapter: requires a native speculative target/draft paired run.",
+        "SGLang": "missing_adapter: requires a native speculative target/draft paired run.",
+        "TVM": "not_applicable: speculative serving consumers are outside this kernel harness."
+      }
+    },
+    {
+      "rq": "RQ6",
+      "observations": ["O-RQ6-EPOCHAL-STATE"],
+      "controlled_experiment": "fixed, per-request and hysteretic epoch policies with measured migration cost",
+      "native_applicability": {
+        "vLLM": "problem_only: shape-dependent persistent-layout winners expose static-policy regret; online migration is not exposed.",
+        "SGLang": "problem_only: shape-dependent persistent-layout winners expose static-policy regret; online migration is not exposed.",
+        "TVM": "not_applicable: TVM kernel compilation does not own serving epochs."
+      }
+    },
+    {
+      "rq": "RQ7",
+      "observations": ["O-RQ7-TYPED-EDGE-CONTRACT"],
+      "controlled_experiment": "typed accepted-layout intersection followed by legal repair search",
+      "native_applicability": {
+        "vLLM": "source_and_rejection_only: backend support intersection is observable; no injected repair pass.",
+        "SGLang": "source_and_rejection_only: backend/layout compatibility is observable; no injected repair pass.",
+        "TVM": "native_feasibility: row producer and tiled-only consumer are connected by a checked IndexMap-style conversion."
+      }
+    },
+    {
+      "rq": "RQ8",
+      "observations": ["O-RQ8-NONCOMMUTATIVE-SEARCH"],
+      "controlled_experiment": "RoPE-before-convert, convert-before-RoPE and fused native-layout pipeline",
+      "native_applicability": {
+        "vLLM": "missing_adapter: requires compiler pass-order controls below the serving engine.",
+        "SGLang": "missing_adapter: requires compiler pass-order controls below the serving engine.",
+        "TVM": "native: compare materialize/convert orders with a fused TVM TE candidate."
+      }
+    },
+    {
+      "rq": "RQ9",
+      "observations": ["O-RQ9-RESIDUAL-METAPOLICY"],
+      "controlled_experiment": "best global static layout versus per-shape/per-consumer oracle",
+      "native_applicability": {
+        "vLLM": "native_single_gpu: compare one fixed KV layout with a per-request-regime oracle.",
+        "SGLang": "native_single_gpu: compare fixed NHD/HND with a per-request-regime oracle.",
+        "TVM": "native_single_gpu: compare one fixed physical layout with a per-shape oracle."
+      }
+    },
+    {
+      "rq": "RQ10",
+      "observations": ["O-RQ10-BOUNDED-REPAIR"],
+      "controlled_experiment": "legality-first repair graph with memory/correctness bounds",
+      "native_applicability": {
+        "vLLM": "missing_adapter: unsupported layouts currently reject/fallback; no bounded repair injection.",
+        "SGLang": "missing_adapter: unsupported layouts currently reject/fallback; no bounded repair injection.",
+        "TVM": "native: checked conversion repair, compared as convert-once versus repeated repair."
+      }
+    }
+  ]
+}

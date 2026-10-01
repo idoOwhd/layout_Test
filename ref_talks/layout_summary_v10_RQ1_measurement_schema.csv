@@ -1,0 +1,31 @@
+field,type,definition,status
+run_id,string,Unique process-level run identifier,required
+exp_id,string,Experiment ID from experiment matrix,required
+gpu_name,string,Exact GPU SKU,required
+gpu_uuid,string,GPU identifier for run isolation,recommended
+driver_cuda,string,Driver/CUDA runtime versions,required
+framework_commit,string,Framework/library commit or package version,required
+layout_producer,enum,Physical producer layout,required
+layout_consumer,enum,Physical consumer layout,required
+adaptation,enum,none/view/materialized/algebraic/native-emission,required
+dtype,enum,BF16/FP16/FP8/NVFP4/...,required
+batch,int,Batch size,required
+q_len,int,Query/speculative length,required
+kv_len,int,KV history length,required
+Hq,int,Query head count,required
+Hkv,int,KV head count,required
+page_size,int,Paged-KV page size,required
+producer_us,float,Producer-only median GPU time,required
+boundary_us,float,Adaptation/conversion median GPU time,required
+consumer_us,float,Consumer-only median GPU time,required
+edge_us,float,End-to-end edge median GPU time,required
+edge_p95_us,float,End-to-end p95 across process-level repetitions,required
+temp_bytes,int,Peak temporary bytes attributable to adaptation,required
+bytes_copied,int,Materialized copy/repack bytes,required
+hbm_read_bytes,float,Profiler-derived if available,optional
+hbm_write_bytes,float,Profiler-derived if available,optional
+l2_hit_rate,float,Profiler-derived if available,optional
+producer_winner,bool,Whether this layout is producer-local winner for workload,derived
+edge_winner,bool,Whether this strategy is edge-global winner,derived
+edge_regret_pct,float,Regret of producer-local winner relative to edge oracle,derived
+correctness_pass,bool,Numerical/logical output correctness,required

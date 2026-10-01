@@ -1,0 +1,21 @@
+# Generated native-framework environments and source/build trees.
+framework_envs/
+framework_sources/
+framework_install_logs/
+framework_envs.generated.sh
+framework_cache/
+models/
+
+# Benchmark outputs and local caches must never be committed.
+results/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.o
+*.a
+*.so
+*.cubin
+*.fatbin
+*.ptx

@@ -1,0 +1,138 @@
+{
+  "schema_version": 1,
+  "observations": [
+    {
+      "id": "O-LRQ1-EDGE-INVERSION",
+      "rq": "L-RQ1-v10",
+      "canonical_rq": "RQ1",
+      "observation": "A producer-local layout winner need not minimize the producer-to-consumer edge; boundary conversion, direct consumer-native emission and zero-copy stride access must be compared as complete edge strategies.",
+      "why_important": "Without an edge oracle, a producer optimization can make the composed subgraph slower and cannot distinguish direct HND emission from NHD plus a hidden transpose.",
+      "solution_decision": "Enumerate legal NN, NH-copy, HH-native, HN-copy and view strategies; select by measured edge cost and retain a negative no-conversion region.",
+      "source_denominator": "serving",
+      "source_rq": "RQ1",
+      "source_framework_override": ["FlashInfer", "vLLM"],
+      "performance_result": "v10",
+      "experiment": "v10 Stage0-3, five process repetitions, paired bootstrap CI and max(1%,3CV) threshold"
+    },
+    {
+      "id": "O-RQ1-TWO-LEVEL-CONTROL",
+      "rq": "RQ1",
+      "canonical_rq": "RQ1",
+      "observation": "Persistent cache/backend/layout commitment and live kernel adaptivity are different decision layers; a good local heuristic cannot recover alternatives removed by the persistent control plane.",
+      "why_important": "The solution must be hierarchical: preserve framework local experts while allowing a persistent policy to see batch, KV length, GQA ratio, reuse and system state.",
+      "solution_decision": "Use a persistent configuration selector plus local backend/kernel expert rather than replacing local heuristics.",
+      "source_denominator": "serving",
+      "source_rq": "RQ1",
+      "performance_result": "RQ1",
+      "experiment": "head-local versus token-local layout ranking across real attention shapes; v10 edge inversion is the stricter sub-test"
+    },
+    {
+      "id": "O-RQ2-ADAPTIVE-DOMAINS",
+      "rq": "RQ2",
+      "canonical_rq": "RQ2",
+      "observation": "The profitable layout scope is neither always global nor always per-operator: split domains win only when weighted consumer regret exceeds conversion, memory, fragmentation and pool overhead.",
+      "why_important": "An optimizer biased toward one global layout misses heterogeneous groups, while unconditional splitting loses in low-heterogeneity regimes.",
+      "solution_decision": "Search global, group/phase-specific and repaired split candidates under a hard memory budget; keep low-heterogeneity negative controls.",
+      "source_denominator": "serving",
+      "source_rq": "RQ2",
+      "performance_result": "RQ2",
+      "experiment": "directly timed common-NHD/common-HND/split-NHD+HND pipelines across multiple shapes"
+    },
+    {
+      "id": "O-RQ3-CONVERSION-INVESTMENT",
+      "rq": "RQ3",
+      "canonical_rq": "RQ3",
+      "observation": "Layout conversion is a one-time investment whose break-even depends on future reuse/fanout and memory pressure; it must be paid once and shared, not charged independently to every consumer.",
+      "why_important": "Conversion-blind selection rejects profitable native-consumer layouts, while conversion-always policies waste bandwidth and cache capacity on short-lived tensors.",
+      "solution_decision": "Model conversion, temporary bytes and remaining reads jointly; admit view, materialize-once, producer-native and no-conversion candidates.",
+      "source_denominator": "serving",
+      "source_rq": "RQ3",
+      "performance_result": "RQ3",
+      "experiment": "conversion_reuse_pipeline at reuse 1/4/16/64 plus v10 H1.2/H1.3/H1.4"
+    },
+    {
+      "id": "O-RQ4-CRITICAL-PATH",
+      "rq": "RQ4",
+      "canonical_rq": "RQ4",
+      "observation": "The relevant objective is token critical path or maximum rank time, not isolated attention latency; HBM, copy engines, TP/EP/All2All and overlap can reverse a local layout winner.",
+      "why_important": "A locally faster kernel can lengthen the system critical path by competing with communication or replicating KV state.",
+      "solution_decision": "Feed contention, placement and max-rank time into the layout objective; treat isolated timing only as a feature/baseline.",
+      "source_denominator": "serving",
+      "source_rq": "RQ4",
+      "performance_result": "RQ4",
+      "experiment": "isolated decode versus concurrent HBM-pressure decode; distributed TP/EP remains a required multi-GPU extension"
+    },
+    {
+      "id": "O-RQ5-JOINT-CONSUMER-NEGOTIATION",
+      "rq": "RQ5",
+      "canonical_rq": "RQ5",
+      "observation": "Independent target/draft or producer/consumer choices can have an empty direct layout intersection even when a second-best pair, conversion edge or separate pool is feasible and faster than disabling the feature.",
+      "why_important": "Pairwise compatibility is not enough: metadata placement, page geometry, dtype and lifetime are part of the joint contract.",
+      "solution_decision": "Jointly enumerate consumer pairs and bounded repairs; compare common layout, repaired split and feature-disable baselines.",
+      "source_denominator": "serving",
+      "source_rq": "RQ5",
+      "performance_result": "RQ5",
+      "experiment": "multi-consumer common/split pipeline plus typed empty-intersection repair; native speculative decoding is external validity"
+    },
+    {
+      "id": "O-RQ6-EPOCHAL-STATE",
+      "rq": "RQ6",
+      "canonical_rq": "RQ6",
+      "observation": "Layout selection is a stateful control problem: the winner changes across workload regimes, but migration, graph recapture and replanning costs make per-request switching unstable.",
+      "why_important": "A static policy accumulates drift regret, while an aggressive policy thrashes; the missing variable is expected regime duration/remaining reads.",
+      "solution_decision": "Use epochal reconfiguration with hysteresis and measured migration cost, retaining a fixed policy for stationary traffic.",
+      "source_denominator": "serving",
+      "source_rq": "RQ6",
+      "performance_result": "RQ6",
+      "experiment": "measured primitive cost trace comparing fixed, per-request and hysteretic epoch policies"
+    },
+    {
+      "id": "O-RQ7-TYPED-EDGE-CONTRACT",
+      "rq": "RQ7",
+      "canonical_rq": "RQ7",
+      "observation": "Shape and stride do not fully specify a layout boundary; axes, dtype, packing, scale format, page geometry, metadata placement, lifetime and device ownership form a typed edge contract.",
+      "why_important": "Without the full contract, a solver can choose physically plausible but semantically illegal layouts or miss a legal zero-copy/materialized repair.",
+      "solution_decision": "Represent accepted producer/consumer contracts explicitly, intersect them before costing, then attach legal repair edges.",
+      "source_denominator": "all",
+      "source_rq": "RQ7",
+      "performance_result": "RQ7",
+      "experiment": "typed contract exact search, empty-intersection cases and all-subgraph boundary stride sweep"
+    },
+    {
+      "id": "O-RQ8-NONCOMMUTATIVE-SEARCH",
+      "rq": "RQ8",
+      "canonical_rq": "RQ8",
+      "observation": "Fusion, tiling, pass order and layout selection are non-commutative: changing order changes both legality and performance, so layout cannot be optimized after a fixed fusion schedule.",
+      "why_important": "Sequential passes can permanently remove the fused/native-layout candidate that would have won globally.",
+      "solution_decision": "Generate semantic fused/order/layout candidates, prune illegal states first, and cost the remaining partial orders jointly.",
+      "source_denominator": "compiler",
+      "source_rq": "RQ8",
+      "performance_result": "RQ8",
+      "experiment": "RoPE-before-convert, convert-before-RoPE and fused native-HND pipelines with correctness checking"
+    },
+    {
+      "id": "O-RQ9-RESIDUAL-METAPOLICY",
+      "rq": "RQ9",
+      "canonical_rq": "RQ9",
+      "observation": "Framework heuristics are useful local experts but their thresholds are not portable across shape, GPU, backend version and graph context; the learnable problem is residual selection among legal experts, not layout generation from scratch.",
+      "why_important": "A single static threshold overfits one regime, while discarding mature local experts expands the search space and loses legality knowledge.",
+      "solution_decision": "Use held-out shape/hardware evaluation for a residual meta-policy over framework candidates and report regret against an exhaustive legal oracle.",
+      "source_denominator": "all",
+      "source_rq": "RQ9",
+      "performance_result": "RQ9",
+      "experiment": "best global static layout versus per-shape/per-consumer oracle; cross-GPU held-out run is mandatory for portability"
+    },
+    {
+      "id": "O-RQ10-BOUNDED-REPAIR",
+      "rq": "RQ10",
+      "canonical_rq": "RQ10",
+      "observation": "A failed direct match is not proof that an optimization is impossible: algebraic rewrites, transpose/pack, producer-side emission and resource repairs can restore legality, but must obey memory and correctness bounds.",
+      "why_important": "Reject/fallback-only systems discard profitable neighborhoods; unrestricted repair can instead violate memory or silently change semantics.",
+      "solution_decision": "Run legality-first shortest-path repair search with explicit temporary/persistent bytes and retain reject/fallback as a candidate.",
+      "source_denominator": "all",
+      "source_rq": "RQ10",
+      "performance_result": "RQ10",
+      "experiment": "empty direct intersection, illegal/over-budget repair pruning, and measured transpose repair cost"
+    }
+  ]
+}
