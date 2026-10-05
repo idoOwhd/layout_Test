@@ -1,0 +1,785 @@
+diff --git a/csrc/batch_prefill_sm90.cu b/csrc/batch_prefill_sm90.cu
+index 564ed6b08c4..a6285e7e4bb 100644
+--- a/csrc/batch_prefill_sm90.cu
++++ b/csrc/batch_prefill_sm90.cu
+@@ -236,6 +236,9 @@ void BatchPrefillWithPagedKVCacheSM90Run(
+             << "K and V must have same page stride for sparse attention";
+         TVM_FFI_ICHECK_EQ(params.k_stride_n, params.v_stride_n)
+             << "K and V must have same stride_n for sparse attention";
++        TVM_FFI_ICHECK_EQ(paged_k_cache.size(0), paged_v_cache.size(0))
++            << "K and V must have the same number of pages";
++        params.num_pages = paged_k_cache.size(0);
+         params.nnz_qo = q.size(0);
+         params.num_qo_heads = q.size(1);
+         params.num_kv_heads = num_kv_heads;
+diff --git a/csrc/batch_prefill_sm90_customize_config.jinja b/csrc/batch_prefill_sm90_customize_config.jinja
+index 640637c7dfa..21ddf212a01 100644
+--- a/csrc/batch_prefill_sm90_customize_config.jinja
++++ b/csrc/batch_prefill_sm90_customize_config.jinja
+@@ -114,6 +114,7 @@ struct PagedParams {
+   int num_kv_heads;
+   int group_size;
+   int page_size;
++  int num_pages;
+   int window_left;
+ 
+   bool causal;
+diff --git a/include/flashinfer/attention/hopper/default_params.cuh b/include/flashinfer/attention/hopper/default_params.cuh
+index bb2a33ac2c8..961338c7ef3 100644
+--- a/include/flashinfer/attention/hopper/default_params.cuh
++++ b/include/flashinfer/attention/hopper/default_params.cuh
+@@ -163,6 +163,7 @@ struct BatchPrefillPagedParams {
+   int num_kv_heads;
+   int group_size;
+   int page_size;
++  int num_pages;
+   int window_left;
+ 
+   bool causal;
+diff --git a/include/flashinfer/attention/hopper/kernel_traits.cuh b/include/flashinfer/attention/hopper/kernel_traits.cuh
+index abf164f61d2..a07a01739fc 100644
+--- a/include/flashinfer/attention/hopper/kernel_traits.cuh
++++ b/include/flashinfer/attention/hopper/kernel_traits.cuh
+@@ -39,11 +39,12 @@ struct SharedStorageQKVO {
+   };
+ };
+ 
+-template <bool USE_TMA_LOAD_KV, int HEAD_DIM_QK_, int HEAD_DIM_VO_, int CTA_Q_, int CTA_KV_,
++template <bool USE_TMA_LOAD_KV_, int HEAD_DIM_QK_, int HEAD_DIM_VO_, int CTA_Q_, int CTA_KV_,
+           int NUM_STAGES_, typename DTypeQ_, typename DTypeKV_, typename DTypeO_, typename IdType_,
+           typename AttentionVariant_>
+ struct AttentionKernelTraits {
+   using AttentionVariant = AttentionVariant_;
++  static constexpr bool USE_TMA_LOAD_KV = USE_TMA_LOAD_KV_;
+ 
+   using DTypeQ = DTypeQ_;
+   using DTypeKV = DTypeKV_;
+diff --git a/include/flashinfer/attention/hopper/mainloop.cuh b/include/flashinfer/attention/hopper/mainloop.cuh
+index e5bf4ffb9f3..6afce5e4435 100644
+--- a/include/flashinfer/attention/hopper/mainloop.cuh
++++ b/include/flashinfer/attention/hopper/mainloop.cuh
+@@ -73,6 +73,7 @@ struct CollectiveMainloop {
+       take<0, 2>(SmemLayoutV{}), select<2, 1>(TileShape_PDV{}), _1{}));  // no mcast
+ 
+   static constexpr bool USE_TMA_LOAD_KV = true;
++  static constexpr bool ZERO_V_TAIL = false;  // rows past kv_len are buffer data or TMA zeros
+   using MainloopPipeline = typename Ktraits::MainloopPipeline;
+   using PipelineParams = typename MainloopPipeline::Params;
+   using PipelineState = typename MainloopPipeline::PipelineState;
+diff --git a/include/flashinfer/attention/hopper/mainloop_mma.cuh b/include/flashinfer/attention/hopper/mainloop_mma.cuh
+index 27522f3187f..31978fc6ce5 100644
+--- a/include/flashinfer/attention/hopper/mainloop_mma.cuh
++++ b/include/flashinfer/attention/hopper/mainloop_mma.cuh
+@@ -16,8 +16,26 @@
+ 
+ namespace flashinfer {
+ 
++// Zero rows [row_begin, row_end) of a (rows, cols) smem tile, 16 bytes per store.
++template <typename STensor>
++CUTLASS_DEVICE void zero_smem_rows(STensor& tile, int row_begin, int row_end, int thread_idx,
++                                   int num_threads) {
++  using T = typename STensor::value_type;
++  constexpr int VEC = 16 / sizeof(T);
++  constexpr int VECS_PER_ROW = decltype(size<1>(tile))::value / VEC;
++  const int num_vecs = (row_end - row_begin) * VECS_PER_ROW;
++  for (int i = thread_idx; i < num_vecs; i += num_threads) {
++    *reinterpret_cast<uint4*>(&tile(row_begin + i / VECS_PER_ROW, (i % VECS_PER_ROW) * VEC)) =
++        uint4{0, 0, 0, 0};
++  }
++}
++
++// ZERO_V_TAIL: the producer loads the last KV tile in mainloop_params.box_rows-row boxes without
++// masking, so rows [kv_len, round_up(kv_len, box_rows)) of its V stage hold whatever the KV pool
++// contains there. They are zeroed before the first P*V, since 0 * NaN != 0. K needs nothing:
++// masked logits are overwritten, not accumulated.
+ template <typename Ktraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL, bool MULTIITEMSCORING,
+-          typename WarpScheduler, typename AttentionVariant, typename Params,
++          typename WarpScheduler, bool ZERO_V_TAIL, typename AttentionVariant, typename Params,
+           typename MainloopPipeline, typename PipelineState, typename SharedStorage,
+           typename FrgTensorO, typename AttentionUpdater>
+ CUTLASS_DEVICE void mma_f16(
+@@ -64,6 +82,32 @@ CUTLASS_DEVICE void mma_f16(
+   tiled_mma_pv.accumulate_ = GMMA::ScaleOut::Zero;
+   int kv_tile_idx = kv_tile_idx_count - 1;
+ 
++  // Garbage rows of the last tile's V, consumed by the first PV gemm; empty unless partial.
++  int v_tail_begin = CTA_KV, v_tail_end = CTA_KV;
++  if constexpr (ZERO_V_TAIL) {
++    const int valid_rows = kv_len - kv_tile_idx * CTA_KV;  // >= CTA_KV unless the tile is partial
++    if (valid_rows < CTA_KV) {
++      v_tail_begin = valid_rows;
++      v_tail_end = cutlass::round_up(valid_rows, mainloop_params.box_rows);
++    }
++  }
++  auto consumer_wait_v = [&]() {
++    consumer_wait(pipeline_v, smem_pipe_read_v);
++    if constexpr (ZERO_V_TAIL) {
++      if (v_tail_begin < v_tail_end) {
++        // Every warp zeroes the whole tail, so its own stores and fence cover its own wgmma; the
++        // other warps only ever write the same zeros. No cross-warp barrier is needed.
++        Tensor sV = make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutV{});
++        Tensor sV_stage = sV(_, _, smem_pipe_read_v.index());
++        zero_smem_rows(sV_stage, v_tail_begin, v_tail_end, thread_idx % cutlass::NumThreadsPerWarp,
++                       cutlass::NumThreadsPerWarp);
++        cutlass::arch::fence_view_async_shared();
++        __syncwarp();
++        v_tail_begin = v_tail_end;
++      }
++    }
++  };
++
+   cutlass::ConsumerToken barrier_token =
+       static_cast<cutlass::BarrierStatus>(shared_storage.barrier_Q.try_wait(work_idx % 2));
+   if (barrier_token == cutlass::BarrierStatus::WaitAgain) {
+@@ -190,7 +234,7 @@ CUTLASS_DEVICE void mma_f16(
+     if (masking_step > 0) {
+       attention_updater.rescale_o(tOrO);
+     }
+-    consumer_wait(pipeline_v, smem_pipe_read_v);
++    consumer_wait_v();
+     gemm</*init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, tOrP,
+                                          tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
+     WarpScheduler::barrier_arrive();
+@@ -235,7 +279,7 @@ CUTLASS_DEVICE void mma_f16(
+     gemm</*init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read_k.index()),
+                                         tSrS);
+     attention_updater.rescale_o(tOrO);
+-    consumer_wait(pipeline_v, smem_pipe_read_v);
++    consumer_wait_v();
+     gemm</*init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, tOrP,
+                                          tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
+     WarpScheduler::barrier_arrive();
+@@ -282,7 +326,7 @@ CUTLASS_DEVICE void mma_f16(
+       gemm</*init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ,
+                                           tSrK(_, _, _, smem_pipe_read_k.index()), tSrS);
+       attention_updater.rescale_o(tOrO);
+-      consumer_wait(pipeline_v, smem_pipe_read_v);
++      consumer_wait_v();
+       gemm</*init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, tOrP,
+                                            tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
+       WarpScheduler::barrier_arrive();
+@@ -315,7 +359,7 @@ CUTLASS_DEVICE void mma_f16(
+   cutlass::arch::NamedBarrier::arrive(NUM_MMA_THREADS + Ktraits::NUM_PRODUCER_THREADS,
+                                       /*id=*/static_cast<int>(NamedBarriers::kQueryEmpty));
+   attention_updater.rescale_o(tOrO);
+-  consumer_wait(pipeline_v, smem_pipe_read_v);
++  consumer_wait_v();
+   gemm</*init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, tOrP, tOrV(_, _, _, smem_pipe_read_v.index()),
+                                        tOrO);
+   attention_updater.finalize(tSrS, get_variant_scale_pv(variant));
+diff --git a/include/flashinfer/attention/hopper/prefill_sm90.cuh b/include/flashinfer/attention/hopper/prefill_sm90.cuh
+index f1e441a53b4..26a86e86e78 100644
+--- a/include/flashinfer/attention/hopper/prefill_sm90.cuh
++++ b/include/flashinfer/attention/hopper/prefill_sm90.cuh
+@@ -28,6 +28,7 @@
+ #include "mainloop.cuh"
+ #include "mainloop_mma.cuh"
+ #include "sparse_mainloop.cuh"
++#include "sparse_mainloop_tma.cuh"
+ #include "tile_scheduler.cuh"
+ #include "utils.cuh"
+ 
+@@ -274,7 +275,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
+         num_kv_tiles_prefix = cute::ceil_div(prefix_len, CTA_KV);
+       }
+       mma_f16<Ktraits, /*LEFT_SLIDING_WINDOW=*/LEFT_SLIDING_WINDOW, CAUSAL, MULTIITEMSCORING,
+-              CollectiveMainloop::WarpScheduler>(
++              CollectiveMainloop::WarpScheduler, CollectiveMainloop::ZERO_V_TAIL>(
+           mainloop_params, variant, pipeline_k, pipeline_v, smem_pipe_read_k, smem_pipe_read_v,
+           tOrO, attention_updater, num_kv_tiles, swa_begin_kv_tile_idx, swa_end_kv_tile_idx,
+           threadIdx.x - NUM_COPY_THREADS, work_idx, q_tile_idx, shared_storage, qo_len, kv_len,
+@@ -360,30 +361,49 @@ cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
+   using DTypeO = typename KernelTraits::DTypeO;
+   using IdType = typename KernelTraits::IdType;
+ 
+-  using CollectiveMainloop = SparseCollectiveMainloop<typename Params::AdditionalParams,
+-                                                      KernelTraits, CAUSAL, MULTIITEMSCORING>;
++  using CollectiveMainloop =
++      std::conditional_t<KernelTraits::USE_TMA_LOAD_KV,
++                         SparseTmaCollectiveMainloop<typename Params::AdditionalParams,
++                                                     KernelTraits, CAUSAL, MULTIITEMSCORING>,
++                         SparseCollectiveMainloop<typename Params::AdditionalParams, KernelTraits,
++                                                  CAUSAL, MULTIITEMSCORING>>;
+   using CollectiveEpilogue = CollectiveEpilogue<KernelTraits>;
+   using Scheduler =
+       std::conditional_t<SAME_SCHEDULE_FOR_ALL_HEADS, BatchPrefillTileScheduler<IdType>,
+                          BatchPrefillPersistentTileScheduler<IdType>>;
+ 
+-  typename CollectiveMainloop::Params mainloop_params = CollectiveMainloop::to_underlying_arguments(
+-      {params.q_ptr,
+-       get_gmem_layout(params.nnz_qo, params.num_qo_heads, KernelTraits::HEAD_DIM_QK,
+-                       params.q_stride_n,
+-                       params.q_stride_h),  // layout_Q
+-       params.k_ptr,
+-       // NOTE(Zihao): nnz was useless here, we can just pass 0
+-       get_gmem_layout(/*nnz=*/0, params.num_kv_heads, KernelTraits::HEAD_DIM_QK, params.k_stride_n,
+-                       params.k_stride_h),  // layout_K
+-       params.v_ptr,
+-       get_gmem_layout(/*nnz=*/0, params.num_kv_heads, KernelTraits::HEAD_DIM_VO, params.v_stride_n,
+-                       params.v_stride_h),  // layout_V
+-       params.kv_indices, params.window_left,
+-       params.k_page_stride,                     // Stride between pages for K
+-       params.v_page_stride,                     // Stride between pages for V
+-       static_cast<uint32_t>(params.page_size),  // Page size
+-       params.additional_params});
++  auto layout_Q = get_gmem_layout(params.nnz_qo, params.num_qo_heads, KernelTraits::HEAD_DIM_QK,
++                                  params.q_stride_n, params.q_stride_h);
++  typename CollectiveMainloop::Params mainloop_params = [&] {
++    if constexpr (KernelTraits::USE_TMA_LOAD_KV) {
++      return CollectiveMainloop::to_underlying_arguments(
++          {params.q_ptr, layout_Q, params.k_ptr,
++           get_paged_gmem_layout(params.page_size, params.num_kv_heads, KernelTraits::HEAD_DIM_QK,
++                                 params.num_pages, params.k_stride_n, params.k_stride_h,
++                                 params.k_page_stride),  // layout_K
++           params.v_ptr,
++           get_paged_gmem_layout(params.page_size, params.num_kv_heads, KernelTraits::HEAD_DIM_VO,
++                                 params.num_pages, params.v_stride_n, params.v_stride_h,
++                                 params.v_page_stride),  // layout_V
++           params.kv_indices, params.window_left, params.additional_params});
++    } else {
++      return CollectiveMainloop::to_underlying_arguments(
++          {params.q_ptr, layout_Q, params.k_ptr,
++           // NOTE(Zihao): nnz was useless here, we can just pass 0
++           get_gmem_layout(/*nnz=*/0, params.num_kv_heads, KernelTraits::HEAD_DIM_QK,
++                           params.k_stride_n,
++                           params.k_stride_h),  // layout_K
++           params.v_ptr,
++           get_gmem_layout(/*nnz=*/0, params.num_kv_heads, KernelTraits::HEAD_DIM_VO,
++                           params.v_stride_n,
++                           params.v_stride_h),  // layout_V
++           params.kv_indices, params.window_left,
++           params.k_page_stride,                     // Stride between pages for K
++           params.v_page_stride,                     // Stride between pages for V
++           static_cast<uint32_t>(params.page_size),  // Page size
++           params.additional_params});
++    }
++  }();
+   typename CollectiveEpilogue::Params epilogue_params =
+       CollectiveEpilogue::to_underlying_arguments({
+           params.o_ptr,
+@@ -576,7 +596,19 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, bool enable_p
+   constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
+   constexpr bool MULTIITEMSCORING = MASK_MODE == MaskMode::kMultiItemScoring;
+   if constexpr (HEAD_DIM_QK == HEAD_DIM_VO) {
+-    if constexpr (HEAD_DIM_VO == 64) {
++    if (params.page_size % PAGED_KV_TMA_MIN_BOX_ROWS == 0) {
++      // TMA gathers whole boxes from each page, so the dense tile shapes apply.
++      constexpr auto CTA_TILE_SIZE = getCTATileSize<HEAD_DIM_QK, HEAD_DIM_VO, CAUSAL>();
++      BatchPrefillWithPagedKVCacheKernelTraitsDispatched<
++          AttentionKernelTraits</*USE_TMA_LOAD_KV=*/true, HEAD_DIM_QK, HEAD_DIM_VO,
++                                /*CTA_Q_=*/get<0>(CTA_TILE_SIZE),
++                                /*CTA_KV_=*/get<1>(CTA_TILE_SIZE),
++                                /*NUM_STAGES_=*/2, typename Params::DTypeQ,
++                                typename Params::DTypeKV, typename Params::DTypeO,
++                                typename Params::IdType, AttentionVariant>,
++          LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS, Params, MULTIITEMSCORING>(
++          params, stream);
++    } else if constexpr (HEAD_DIM_VO == 64) {
+       // NOTE(Zihao): CTA_KV not tuned for HEAD_DIM == 64, need to optimize later
+       BatchPrefillWithPagedKVCacheKernelTraitsDispatched<
+           AttentionKernelTraits</*USE_TMA_LOAD_KV=*/false, HEAD_DIM_QK, HEAD_DIM_VO,
+diff --git a/include/flashinfer/attention/hopper/sparse_mainloop.cuh b/include/flashinfer/attention/hopper/sparse_mainloop.cuh
+index 1d9697af4e4..a216689a001 100644
+--- a/include/flashinfer/attention/hopper/sparse_mainloop.cuh
++++ b/include/flashinfer/attention/hopper/sparse_mainloop.cuh
+@@ -85,6 +85,7 @@ struct SparseCollectiveMainloop {
+       SmemLayoutQ{}, select<0, 2>(TileShape_QKD{}), _1{}));  // no mcast for Q
+ 
+   static constexpr bool USE_TMA_LOAD_KV = false;
++  static constexpr bool ZERO_V_TAIL = false;  // cp.async zero-fills rows past kv_len
+   static constexpr int NUM_MMA_THREADS = size(typename Ktraits::TiledMmaQK{});
+   // Verify NUM_PRODUCER_THREADS matches NUM_COPY_THREADS for sparse loading
+   static_assert(Ktraits::NUM_PRODUCER_THREADS == NUM_COPY_THREADS,
+diff --git a/include/flashinfer/attention/hopper/sparse_mainloop_tma.cuh b/include/flashinfer/attention/hopper/sparse_mainloop_tma.cuh
+new file mode 100644
+index 00000000000..a5a2b461137
+--- /dev/null
++++ b/include/flashinfer/attention/hopper/sparse_mainloop_tma.cuh
+@@ -0,0 +1,320 @@
++/*
++ * Copyright (c) 2026 by FlashInfer team.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++#ifndef FLASHINFER_ATTENTION_HOPPER_SPARSE_MAINLOOP_TMA_CUH_
++#define FLASHINFER_ATTENTION_HOPPER_SPARSE_MAINLOOP_TMA_CUH_
++
++#include <cutlass/cutlass.h>
++#include <cutlass/numeric_types.h>
++
++#include <algorithm>
++#include <numeric>
++#include <type_traits>
++
++#include "../../fastdiv.cuh"
++#include "cute/tensor.hpp"
++#include "cutlass/pipeline/pipeline.hpp"
++#include "named_barrier.cuh"
++#include "utils.cuh"
++
++namespace flashinfer {
++
++using namespace cute;
++
++// Smallest TMA box SparseTmaCollectiveMainloop issues; page_size must be a multiple of it.
++constexpr int PAGED_KV_TMA_MIN_BOX_ROWS = 16;
++
++// Paged-KV mainloop that gathers pages with TMA instead of per-thread cp.async.
++//
++// The KV pool is described to TMA as (head_dim, page_size, num_heads, num_pages), so a box of
++// box_rows tokens is addressed by (row in page, page) with no device-side pointer math. box_rows is
++// the largest divisor of page_size and CTA_KV up to MAX_BOX_ROWS, fixed per launch; a KV tile is
++// CTA_KV / box_rows boxes, box j issued by lane j of the producer warp, all completing on the
++// stage's transaction barrier. Boxes past kv_len target page num_pages, which TMA zero-fills, so
++// page-table reads never leave the request's range.
++template <typename AdditionalParams, typename Ktraits, bool CAUSAL, bool MULTIITEMSCORING = false>
++struct SparseTmaCollectiveMainloop {
++  using DTypeQ = typename Ktraits::DTypeQ;
++  using DTypeKV = typename Ktraits::DTypeKV;
++  using IdType = typename Ktraits::IdType;
++  using TileShape_QKD = typename Ktraits::TileShape_QKD;
++  using TileShape_PDV = typename Ktraits::TileShape_PDV;
++  static constexpr int CTA_Q = get<0>(TileShape_QKD{});
++  static constexpr int CTA_KV = get<1>(TileShape_QKD{});
++
++  static constexpr int NUM_STAGES = Ktraits::NUM_STAGES;
++  static constexpr int NUM_MMA_THREADS = Ktraits::NUM_MMA_THREADS;
++  static constexpr int HEAD_DIM_QK = Ktraits::HEAD_DIM_QK;
++  static constexpr int HEAD_DIM_VO = Ktraits::HEAD_DIM_VO;
++  static_assert(HEAD_DIM_QK == HEAD_DIM_VO);
++
++  static constexpr int MIN_BOX_ROWS = PAGED_KV_TMA_MIN_BOX_ROWS;
++  static constexpr int MAX_BOX_ROWS = 64;  // H100: 64-row boxes match the dense kernel's rate
++  static_assert(CTA_KV % MIN_BOX_ROWS == 0 && CTA_KV / MIN_BOX_ROWS <= cutlass::NumThreadsPerWarp);
++  // The last tile's V rows in [kv_len, round_up(kv_len, box_rows)) arrive unmasked; the consumer
++  // zeroes them before P*V.
++  static constexpr bool ZERO_V_TAIL = true;
++
++  using GmemTiledCopyQ = cute::SM90_TMA_LOAD;
++
++  using SmemLayoutQ = typename Ktraits::SmemLayoutQ;
++  using SmemLayoutK = typename Ktraits::SmemLayoutK;
++  using SmemLayoutV = typename Ktraits::SmemLayoutV;
++  using SmemLayoutVt = typename Ktraits::SmemLayoutVt;
++  using SmemLayoutAtomKV = typename Ktraits::SmemLayoutAtomK;
++  static_assert(std::is_same_v<SmemLayoutAtomKV, typename Ktraits::SmemLayoutAtomV> &&
++                std::is_same_v<SmemLayoutK, SmemLayoutV>);
++  // A box spans one swizzle atom row (128 B) along head_dim; a tile row is NUM_COL_BOXES of them.
++  static constexpr int BOX_COLS = size<1>(SmemLayoutAtomKV{});
++  static constexpr int NUM_COL_BOXES = HEAD_DIM_QK / BOX_COLS;
++  static_assert(HEAD_DIM_QK % BOX_COLS == 0);
++
++  using ShapeT = cute::Shape<int32_t, int32_t, int32_t>;
++  using StrideT = cute::Shape<int64_t, _1, int64_t>;  // (N, D, H)
++  using LayoutT = cute::Layout<ShapeT, StrideT>;
++
++  using ShapeKVT = cute::Shape<int32_t, int32_t, int32_t, int32_t>;
++  using StrideKVT = cute::Shape<int64_t, _1, int64_t, int64_t>;  // (page_size, D, H, num_pages)
++  using LayoutKVT = cute::Layout<ShapeKVT, StrideKVT>;
++
++  using TMA_Q = decltype(make_tma_copy(
++      GmemTiledCopyQ{},
++      make_tensor(make_gmem_ptr(static_cast<DTypeQ const*>(nullptr)),
++                  repeat_like(StrideT{}, int32_t(0)), StrideT{}),
++      SmemLayoutQ{}, select<0, 2>(TileShape_QKD{}), _1{}));  // no mcast for Q
++
++  static constexpr bool USE_TMA_LOAD_KV = true;
++  using MainloopPipeline = typename Ktraits::MainloopPipeline;
++  using PipelineParams = typename MainloopPipeline::Params;
++  using PipelineState = typename MainloopPipeline::PipelineState;
++
++  static constexpr uint32_t TmaTransactionBytesQ =
++      static_cast<uint32_t>(size(SmemLayoutQ{}) * cutlass::sizeof_bits_v<DTypeQ> / 8);
++  // All boxes of a tile complete on one barrier.
++  static constexpr uint32_t TmaTransactionBytesK =
++      static_cast<uint32_t>(size(take<0, 2>(SmemLayoutK{})) * cutlass::sizeof_bits_v<DTypeKV> / 8);
++  static constexpr uint32_t TmaTransactionBytesV =
++      static_cast<uint32_t>(size(take<0, 2>(SmemLayoutV{})) * cutlass::sizeof_bits_v<DTypeKV> / 8);
++
++  static constexpr bool UseSchedulerBarrier =
++      cutlass::sizeof_bits_v<DTypeQ> == 8 ? HEAD_DIM_VO >= 128 : HEAD_DIM_VO <= 128;
++  using WarpScheduler = WarpScheduler<Ktraits, UseSchedulerBarrier>;
++
++  // Host side kernel arguments
++  struct Arguments {
++    DTypeQ const* Q_ptr;
++    LayoutT layout_Q;
++    DTypeKV const* K_ptr;
++    LayoutKVT layout_K;
++    DTypeKV const* V_ptr;
++    LayoutKVT layout_V;
++    IdType const* kv_indices;
++    int window_left;
++    AdditionalParams additional_params;
++  };
++
++  // Device side kernel params
++  struct Params {
++    LayoutT layout_Q;
++    TMA_Q tma_load_Q;
++    TmaDescriptor tma_desc_K;
++    TmaDescriptor tma_desc_V;
++    IdType* kv_indices;
++    uint_fastdiv page_size;
++    int num_pages;
++    int box_rows;
++    int window_left;
++    AdditionalParams additional_params;
++  };
++
++  // (BOX_COLS x box_rows) boxes over the pool; TMA dim 0 is head_dim, the contiguous mode.
++  static TmaDescriptor make_tma_desc(DTypeKV const* ptr, LayoutKVT const& layout, int box_rows) {
++    Tensor gtensor = make_tensor(make_gmem_ptr(ptr), layout);
++    auto tma_gbasis = make_layout(make_shape(Int<BOX_COLS>{}, box_rows, _1{}, _1{}),
++                                  make_stride(E<1>{}, E<0>{}, E<2>{}, E<3>{}));
++    return get<0>(cute::detail::make_tma_copy_desc<DTypeKV>(
++        gtensor, tma_gbasis, get_swizzle_portion(SmemLayoutAtomKV{}), /*num_multicast=*/1));
++  }
++
++  static Params to_underlying_arguments(Arguments const& args) {
++    Tensor mQ = make_tensor(make_gmem_ptr(args.Q_ptr), args.layout_Q);
++    TMA_Q tma_load_Q =
++        make_tma_copy(GmemTiledCopyQ{}, mQ, SmemLayoutQ{}, select<0, 2>(TileShape_QKD{}), _1{});
++    const int page_size = get<0>(args.layout_K.shape());
++    const int box_rows = std::min(std::gcd(page_size, CTA_KV), MAX_BOX_ROWS);
++    return {args.layout_Q,
++            tma_load_Q,
++            make_tma_desc(args.K_ptr, args.layout_K, box_rows),
++            make_tma_desc(args.V_ptr, args.layout_V, box_rows),
++            const_cast<IdType*>(args.kv_indices),
++            uint_fastdiv(static_cast<uint32_t>(page_size)),
++            get<3>(args.layout_K.shape()),
++            box_rows,
++            args.window_left,
++            args.additional_params};
++  }
++
++  CUTLASS_DEVICE
++  static void prefetch_tma_descriptors(Params const& mainloop_params) {
++    cute::prefetch_tma_descriptor(mainloop_params.tma_load_Q.get_tma_descriptor());
++    cute::prefetch_tma_descriptor(&mainloop_params.tma_desc_K);
++    cute::prefetch_tma_descriptor(&mainloop_params.tma_desc_V);
++  }
++
++  CUTLASS_DEVICE
++  int get_num_kv_tiles(Params const& mainloop_params, int q_tile_idx, const int qo_len,
++                       const int kv_len) {
++    static constexpr int CTA_Q = get<0>(TileShape_QKD{});
++    static constexpr int CTA_KV = get<1>(TileShape_QKD{});
++    int num_kv_tiles = cute::ceil_div(kv_len, CTA_KV);
++    if constexpr (CAUSAL || MULTIITEMSCORING) {
++      num_kv_tiles = std::min(num_kv_tiles,
++                              cute::ceil_div((q_tile_idx + 1) * CTA_Q + kv_len - qo_len, CTA_KV));
++    }
++    return num_kv_tiles;
++  }
++
++  template <bool LEFT_SLIDING_WINDOW, typename BlockCoord, typename Scheduler,
++            typename SharedStorage>
++  CUTLASS_DEVICE void load(Params const& mainloop_params, MainloopPipeline pipeline_k,
++                           MainloopPipeline pipeline_v, PipelineState& smem_pipe_write_k,
++                           PipelineState& smem_pipe_write_v, SharedStorage& shared_storage,
++                           Scheduler& scheduler, typename Scheduler::Params const& scheduler_params,
++                           typename Scheduler::WorkTileInfo& work_tile_info,
++                           BlockCoord const& block_coord, int work_idx,
++                           const int num_kv_tiles_outside_items_window = 0,
++                           const int num_kv_tiles_prefix = 0) {
++    Tensor sQ = make_tensor(make_smem_ptr(shared_storage.smem_q.data()), SmemLayoutQ{});
++    Tensor mQ = mainloop_params.tma_load_Q.get_tma_tensor(mainloop_params.layout_Q.shape());
++
++    auto [q_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len, batch_idx] =
++        block_coord;
++
++    Tensor gQ = get_local_tile_tensor(mQ, select<0, 2>(TileShape_QKD{}), qo_head_idx, qo_indptr,
++                                      qo_len)(_, _, q_tile_idx);  // (Q, D)
++    Tensor sQ_x = make_tensor(sQ.data(), make_layout(sQ.layout(), Layout<_1>{}));
++    Tensor gQ_x = make_tensor(gQ.data(), make_layout(gQ.layout(), Layout<_1>{}));
++    auto [tQgQ, tQsQ] =
++        tma_partition(mainloop_params.tma_load_Q, _0{}, Layout<_1>{}, group_modes<0, 2>(sQ_x),
++                      group_modes<0, 2>(gQ_x));  // (TMA), (TMA)
++
++    int num_kv_tiles = get_num_kv_tiles(mainloop_params, q_tile_idx, qo_len, kv_len);
++    int kv_tile_idx = num_kv_tiles - 1;
++    int swa_begin_kv_tile_idx = 0;
++    if constexpr (LEFT_SLIDING_WINDOW) {
++      swa_begin_kv_tile_idx = get_swa_begin_kv_tile_idx<CTA_Q, CTA_KV>(mainloop_params.window_left,
++                                                                       q_tile_idx, qo_len, kv_len);
++    }
++
++    const int lane_predicate = cute::elect_one_sync();
++    const int lane_idx = threadIdx.x % cutlass::NumThreadsPerWarp;
++    const int box_rows = mainloop_params.box_rows;
++    const bool owns_box = lane_idx * box_rows < CTA_KV;
++    IdType const* kv_indices = mainloop_params.kv_indices + kv_indptr;
++
++    // (row in page, page) of this lane's box in a tile; past kv_len, a page TMA zero-fills.
++    auto locate = [&](int kv_tile_idx) {
++      int kv_idx = kv_tile_idx * CTA_KV + lane_idx * box_rows;
++      int2 coord = make_int2(0, mainloop_params.num_pages);
++      if (owns_box && kv_idx < kv_len) {
++        uint32_t page_iter, entry_idx;
++        mainloop_params.page_size.divmod(kv_idx, page_iter, entry_idx);
++        coord = make_int2(entry_idx, static_cast<int>(__ldg(kv_indices + page_iter)));
++      }
++      return coord;
++    };
++    auto kv_tile_idx_decrement = [&](int kv_tile_idx) {
++      int result = kv_tile_idx - 1;
++      if constexpr (MULTIITEMSCORING) {
++        if ((kv_tile_idx == num_kv_tiles_outside_items_window) &
++            (kv_tile_idx >= num_kv_tiles_prefix)) {
++          result = num_kv_tiles_prefix - 1;
++        }
++      }
++      return result;
++    };
++    // Lane j lands box j at rows [j * box_rows, (j + 1) * box_rows) of the stage, one TMA per
++    // 128 B column chunk; the swizzle is the hardware's.
++    auto issue = [&](TmaDescriptor const& desc, auto* barrier, DTypeKV* smem, int stage,
++                     int2 coord) {
++      if (!owns_box) return;
++      auto tile = get_nonswizzle_portion(SmemLayoutK{});  // == SmemLayoutV
++      CUTLASS_PRAGMA_UNROLL
++      for (int c = 0; c < NUM_COL_BOXES; ++c) {
++        SM90_TMA_LOAD_4D::copy(&desc, reinterpret_cast<uint64_t*>(barrier),
++                               static_cast<uint64_t>(TMA::CacheHintSm90::EVICT_NORMAL),
++                               smem + tile(lane_idx * box_rows, c * BOX_COLS, stage), c * BOX_COLS,
++                               coord.x, kv_head_idx, coord.y);
++      }
++    };
++    auto load_k = [&](int2 coord) {
++      pipeline_k.producer_acquire(smem_pipe_write_k);
++      issue(mainloop_params.tma_desc_K, pipeline_k.producer_get_barrier(smem_pipe_write_k),
++            shared_storage.smem_k.data(), smem_pipe_write_k.index(), coord);
++      ++smem_pipe_write_k;
++    };
++    auto load_v = [&](int2 coord) {
++      pipeline_v.producer_acquire(smem_pipe_write_v);
++      issue(mainloop_params.tma_desc_V, pipeline_v.producer_get_barrier(smem_pipe_write_v),
++            shared_storage.smem_v.data(), smem_pipe_write_v.index(), coord);
++      ++smem_pipe_write_v;
++    };
++
++    int2 coord_v = locate(kv_tile_idx);
++    load_k(coord_v);
++
++    // Wait for the MMA warpgroups to say that smem_q is ready
++    cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS + Ktraits::NUM_PRODUCER_THREADS,
++                                      static_cast<int>(NamedBarriers::kQueryEmpty));
++
++    if (lane_predicate) {
++      shared_storage.barrier_Q.arrive_and_expect_tx(TmaTransactionBytesQ);
++      copy(mainloop_params.tma_load_Q.with(
++               reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(
++                   shared_storage.barrier_Q),
++               /*mcast_mask=*/0),
++           tQgQ, tQsQ);
++    }
++
++    // See CollectiveMainloop::load for why this is a cluster barrier.
++    shared_storage.barrier_O.wait((work_idx + 1) % 2);
++
++#pragma unroll 2
++    for (; kv_tile_idx > swa_begin_kv_tile_idx; kv_tile_idx = kv_tile_idx_decrement(kv_tile_idx)) {
++      int2 coord_k = locate(kv_tile_idx_decrement(kv_tile_idx));
++      load_k(coord_k);
++      load_v(coord_v);
++      coord_v = coord_k;
++    }
++    scheduler.prefetch_next_work(scheduler_params, work_tile_info);
++    load_v(coord_v);
++    scheduler.broadcast_next_work(work_tile_info);
++  }
++
++  CUTLASS_DEVICE void load_tail(MainloopPipeline pipeline_k, MainloopPipeline pipeline_v,
++                                PipelineState& smem_pipe_write_k,
++                                PipelineState& smem_pipe_write_v) {
++    int lane_predicate = cute::elect_one_sync();
++    int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
++    if (warp_idx_in_warpgroup == 0 && lane_predicate) {
++      pipeline_k.producer_tail(smem_pipe_write_k);
++      pipeline_v.producer_tail(smem_pipe_write_v);
++    }
++  }
++};
++
++}  // namespace flashinfer
++
++#endif  // FLASHINFER_ATTENTION_HOPPER_SPARSE_MAINLOOP_TMA_CUH_
+diff --git a/include/flashinfer/attention/hopper/utils.cuh b/include/flashinfer/attention/hopper/utils.cuh
+index 8aeb5b19442..d7fd0068db9 100644
+--- a/include/flashinfer/attention/hopper/utils.cuh
++++ b/include/flashinfer/attention/hopper/utils.cuh
+@@ -58,6 +58,14 @@ CUTLASS_HOST_DEVICE auto get_gmem_layout(int nnz, int num_heads, int head_dim, i
+                      make_stride(n_stride, cute::_1{}, h_stride));
+ }
+ 
++// (page_size, head_dim, num_heads, num_pages) view of a paged KV pool.
++CUTLASS_HOST_DEVICE auto get_paged_gmem_layout(int page_size, int num_heads, int head_dim,
++                                               int num_pages, int64_t n_stride, int64_t h_stride,
++                                               int64_t page_stride) {
++  return make_layout(make_shape(page_size, head_dim, num_heads, num_pages),
++                     make_stride(n_stride, cute::_1{}, h_stride, page_stride));
++}
++
+ CUTLASS_HOST_DEVICE auto get_lse_gmem_layout(int nnz, int num_heads) {
+   return make_layout(make_shape(num_heads, nnz), make_stride(cute::_1{}, int64_t(num_heads)));
+ }
+diff --git a/tests/attention/test_hopper.py b/tests/attention/test_hopper.py
+index 6334a23dfec..b5f7a6a5949 100644
+--- a/tests/attention/test_hopper.py
++++ b/tests/attention/test_hopper.py
+@@ -542,6 +542,143 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring_fa3_bsz2(
+     torch.testing.assert_close(o_fa2, o_fa3, rtol=1e-3, atol=1e-3)
+ 
+ 
++def _paged_attention_reference(
++    q,
++    k_pool,
++    v_pool,
++    qo_indptr,
++    kv_indptr,
++    kv_indices,
++    kv_lens,
++    page_size,
++    kv_layout,
++    causal,
++    window_left,
++):
++    """fp32 attention over the tokens a paged KV cache actually holds."""
++    num_qo_heads, head_dim = q.shape[1], q.shape[2]
++    num_kv_heads = k_pool.shape[2] if kv_layout == "NHD" else k_pool.shape[1]
++    group_size = num_qo_heads // num_kv_heads
++    out = torch.empty(q.shape, dtype=torch.float32, device=q.device)
++    for b in range(qo_indptr.numel() - 1):
++        qs, qe = qo_indptr[b].item(), qo_indptr[b + 1].item()
++        pages = kv_indices[kv_indptr[b].item() : kv_indptr[b + 1].item()].long()
++        k = k_pool[pages]
++        v = v_pool[pages]
++        if kv_layout == "HND":
++            k, v = k.transpose(1, 2), v.transpose(1, 2)
++        kv_len = kv_lens[b]
++        k = k.reshape(-1, num_kv_heads, head_dim)[:kv_len].float()
++        v = v.reshape(-1, num_kv_heads, head_dim)[:kv_len].float()
++        k = k.repeat_interleave(group_size, dim=1)
++        v = v.repeat_interleave(group_size, dim=1)
++        qo_len = qe - qs
++        s = torch.einsum("qhd,khd->hqk", q[qs:qe].float(), k) * head_dim**-0.5
++        q_pos = torch.arange(qo_len, device=q.device)[:, None] + kv_len - qo_len
++        k_pos = torch.arange(kv_len, device=q.device)[None, :]
++        mask = torch.ones(qo_len, kv_len, dtype=torch.bool, device=q.device)
++        if causal:
++            mask &= k_pos <= q_pos
++        if window_left >= 0:
++            mask &= k_pos >= q_pos - window_left
++        p = torch.softmax(s.masked_fill(~mask[None], float("-inf")), dim=-1)
++        out[qs:qe] = torch.einsum("hqk,khd->qhd", p, v)
++    return out
++
++
++@pytest.mark.parametrize("page_size", [8, 16, 32, 48, 64, 128, 256])
++@pytest.mark.parametrize("head_dim", [64, 128, 256])
++@pytest.mark.parametrize("causal", [False, True])
++@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
++@pytest.mark.parametrize("window_left", [-1, 333])
++def test_batch_paged_prefill_page_table(
++    page_size, head_dim, causal, kv_layout, window_left
++):
++    """Scattered page tables with NaN in every unused KV slot, across page sizes.
++
++    page_size >= 16 exercises the TMA gather in the SM90 paged mainloop; 8 keeps the cp.async
++    path covered. The NaN poison verifies rows past kv_len never reach P*V.
++    """
++    if not is_sm90a_supported(torch.device("cuda")):
++        pytest.skip("SM90A is not supported")
++    torch.manual_seed(42)
++    num_qo_heads, num_kv_heads = 8, 2
++    lens = [(11, 11), (12, 99), (300, 4096), (5, 517), (129, 129), (2, 4099)]
++    qo_lens = [l[0] for l in lens]
++    kv_lens = [l[1] for l in lens]
++    pages_per_request = [(kv_len + page_size - 1) // page_size for kv_len in kv_lens]
++    total_pages = sum(pages_per_request) + 3
++    pool_shape = (
++        (total_pages, page_size, num_kv_heads, head_dim)
++        if kv_layout == "NHD"
++        else (total_pages, num_kv_heads, page_size, head_dim)
++    )
++    k_pool = torch.randn(pool_shape, dtype=torch.half, device="cuda")
++    v_pool = torch.randn(pool_shape, dtype=torch.half, device="cuda")
++    kv_indices = torch.randperm(total_pages)[: sum(pages_per_request)].int()
++    kv_indptr = torch.tensor([0] + pages_per_request).cumsum(0).int()
++    qo_indptr = torch.tensor([0] + qo_lens).cumsum(0).int()
++    last_page_len = torch.tensor(
++        [
++            kv_len - (n - 1) * page_size
++            for kv_len, n in zip(kv_lens, pages_per_request, strict=True)
++        ]
++    ).int()
++
++    used = torch.zeros(total_pages, page_size, dtype=torch.bool)
++    for b in range(len(lens)):
++        pages = kv_indices[kv_indptr[b] : kv_indptr[b + 1]].tolist()
++        used[pages[:-1]] = True
++        used[pages[-1], : last_page_len[b]] = True
++    unused = ~used.cuda()
++    if kv_layout == "HND":
++        unused = unused[:, None, :].expand(-1, num_kv_heads, -1)
++    k_pool[unused] = float("nan")
++    v_pool[unused] = float("nan")
++
++    q = torch.randn(
++        sum(qo_lens), num_qo_heads, head_dim, dtype=torch.half, device="cuda"
++    )
++    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
++    outputs = {}
++    for backend in ["fa2", "fa3"]:
++        wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
++            workspace_buffer, kv_layout, backend=backend
++        )
++        wrapper.plan(
++            qo_indptr,
++            kv_indptr,
++            kv_indices,
++            last_page_len,
++            num_qo_heads,
++            num_kv_heads,
++            head_dim,
++            page_size,
++            causal=causal,
++            window_left=window_left,
++            q_data_type=torch.half,
++        )
++        outputs[backend] = wrapper.run(q, (k_pool, v_pool))
++
++    o_ref = _paged_attention_reference(
++        q,
++        k_pool,
++        v_pool,
++        qo_indptr,
++        kv_indptr,
++        kv_indices,
++        kv_lens,
++        page_size,
++        kv_layout,
++        causal,
++        window_left,
++    )
++    torch.testing.assert_close(outputs["fa3"].float(), o_ref, rtol=2e-2, atol=2e-2)
++    if causal or window_left < 0:
++        # fa2 mishandles the first query tile of non-causal sliding-window requests (#4972).
++        torch.testing.assert_close(outputs["fa3"], outputs["fa2"], rtol=1e-3, atol=1e-3)
++
++
+ if __name__ == "__main__":
+     # test_batch_prefill(14, 64, 32, 32, False, 128)
+     # test_batch_prefill(1, 32767, 8, 8, True, 128)

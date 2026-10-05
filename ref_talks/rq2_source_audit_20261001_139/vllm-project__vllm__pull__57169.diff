@@ -1,0 +1,4577 @@
+diff --git a/tests/kernels/attention/test_deepgemm_attention.py b/tests/kernels/attention/test_deepgemm_attention.py
+index 5d11063c7a2b..b3c8ef1bb572 100644
+--- a/tests/kernels/attention/test_deepgemm_attention.py
++++ b/tests/kernels/attention/test_deepgemm_attention.py
+@@ -313,3 +313,53 @@ def test_deepgemm_fp8_fp4_paged_mqa_logits(batch_size: int, next_n: int):
+             ref_logits = ref_logits.masked_fill(~mask, 0)
+             diff = calc_diff(logits, ref_logits)
+             assert diff < 1e-3, f"{diff=}"
++
++
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA only")
++@pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
++@pytest.mark.skipif(
++    not current_platform.has_device_capability(90), reason="SM90 and SM100 only"
++)
++def test_deepgemm_paged_mqa_packed_manager_block_stride():
++    from vllm.models.glm5next.common.sparse_indexer import _kpool_flat_page_view
++
++    torch.manual_seed(0)
++    num_blocks, block_size, packed_rows = 4, 256, 320
++    num_heads, head_dim, row_bytes = 64, 128, 132
++    page_size = 64
++    pages_per_block = block_size // page_size
++    dense_stride = pages_per_block
++    compact_pages = kv_cache_cast_to_fp8(
++        torch.randn(
++            num_blocks, block_size, 1, head_dim, device="cuda", dtype=torch.bfloat16
++        ).view(num_blocks * pages_per_block, page_size, 1, head_dim)
++    )
++    packed_backing = torch.zeros(
++        num_blocks,
++        packed_rows,
++        row_bytes,
++        device="cuda",
++        dtype=torch.uint8,
++    )
++    packed_manager = packed_backing[:, :block_size]
++    packed_manager.copy_(compact_pages.squeeze(2).view(num_blocks, block_size, -1))
++    packed_stride = packed_manager.stride(0) // (page_size * row_bytes)
++    packed_pages = _kpool_flat_page_view(packed_manager).unsqueeze(2)
++    offsets = torch.arange(pages_per_block, device="cuda", dtype=torch.int32)
++    tables = [
++        (stride + offsets).unsqueeze(0) for stride in (dense_stride, packed_stride)
++    ]
++
++    q = torch.randn(1, 1, num_heads, head_dim, device="cuda", dtype=torch.bfloat16).to(
++        torch.float8_e4m3fn
++    )
++    weights = torch.randn(1, num_heads, device="cuda", dtype=torch.float32)
++    context_lens = torch.full((1, 1), block_size, device="cuda", dtype=torch.int32)
++    schedule = get_paged_mqa_logits_metadata(context_lens, page_size, get_num_sms())
++    logits = [
++        fp8_fp4_paged_mqa_logits(
++            (q, None), cache, weights, context_lens, table, schedule, block_size, False
++        )
++        for cache, table in zip((compact_pages, packed_pages), tables)
++    ]
++    torch.testing.assert_close(*logits, rtol=0, atol=0)
+diff --git a/tests/kernels/attention/test_rocm_aiter_mla_sink.py b/tests/kernels/attention/test_rocm_aiter_mla_sink.py
+index 6de46afe3e87..f021a4d6433d 100644
+--- a/tests/kernels/attention/test_rocm_aiter_mla_sink.py
++++ b/tests/kernels/attention/test_rocm_aiter_mla_sink.py
+@@ -455,7 +455,8 @@ def test_sparse_mla_sink_forward_mqa_preserves_split_query(dtype):
+     set_random_seed(412)
+     num_tokens, num_heads, block_size = 2, 8, 16
+     q = torch.randn(num_tokens, num_heads, Q_HEAD_DIM, device="cuda").to(dtype)
+-    kv = torch.randn(2 * block_size, 1, Q_HEAD_DIM, device="cuda").to(dtype)
++    backing = torch.randn(2, 2, block_size, Q_HEAD_DIM, device="cuda").to(dtype)
++    kv = backing[:, 1]
+     selected = torch.tensor([[1, 7, 18], [0, 3, 20]], dtype=torch.int32, device="cuda")
+     sinks = torch.linspace(-3.0, 5.0, num_heads, device="cuda")
+     impl = object.__new__(ROCMAiterMLASparseImpl)
+@@ -495,7 +496,7 @@ def test_sparse_mla_sink_forward_mqa_preserves_split_query(dtype):
+         SimpleNamespace(_q_scale=None, _k_scale=None),
+     )
+     references = [
+-        _sink_reference(q[i], kv[:, 0][selected[i].long()], sinks, SM_SCALE)
++        _sink_reference(q[i], kv.flatten(0, 1)[selected[i].long()], sinks, SM_SCALE)
+         for i in range(num_tokens)
+     ]
+     expected, _, value_scale, score_error = (
+diff --git a/tests/v1/attention/test_dspark_noncausal_sparse_mla.py b/tests/v1/attention/test_dspark_noncausal_sparse_mla.py
+index 3d4af1741362..dc76d04f4378 100644
+--- a/tests/v1/attention/test_dspark_noncausal_sparse_mla.py
++++ b/tests/v1/attention/test_dspark_noncausal_sparse_mla.py
+@@ -409,7 +409,7 @@ def _skip_if_backend_unavailable(backend_cls, kv_cache_dtype: str, block_size: i
+         and kv_cache_dtype != "fp8_ds_mla"
+     ):
+         pytest.skip("FlashMLA Sparse fp8 only supports fp8_ds_mla kv-cache dtype")
+-    if block_size not in backend_cls.get_supported_kernel_block_sizes():
++    if not backend_cls.supports_block_size(block_size):
+         pytest.skip(
+             f"{backend_cls.get_name()} does not support block_size={block_size}"
+         )
+diff --git a/tests/v1/attention/test_flashinfer_mla_sparse_sm90.py b/tests/v1/attention/test_flashinfer_mla_sparse_sm90.py
+index b25656cf6ebe..1a69fa4788cb 100644
+--- a/tests/v1/attention/test_flashinfer_mla_sparse_sm90.py
++++ b/tests/v1/attention/test_flashinfer_mla_sparse_sm90.py
+@@ -29,7 +29,15 @@
+ TOPK = 128  # triton convert requires width % 128 == 0
+ 
+ 
+-def ref_convert(req_id, block_table, token_indices, BLOCK_SIZE=64, **_):
++def ref_convert(
++    req_id,
++    block_table,
++    token_indices,
++    BLOCK_SIZE=64,
++    BLOCK_STRIDE_ROWS=None,
++    **_,
++):
++    block_stride_rows = BLOCK_STRIDE_ROWS or BLOCK_SIZE
+     out = torch.full_like(token_indices, -1)
+     counts = torch.zeros(token_indices.shape[0], dtype=torch.int32)
+     for t in range(token_indices.shape[0]):
+@@ -41,7 +49,7 @@ def ref_convert(req_id, block_table, token_indices, BLOCK_SIZE=64, **_):
+             blk = int(block_table[int(req_id[t]), pos // BLOCK_SIZE])
+             if blk < 0:
+                 continue
+-            vals.append(blk * BLOCK_SIZE + pos % BLOCK_SIZE)
++            vals.append(blk * block_stride_rows + pos % BLOCK_SIZE)
+         out[t, : len(vals)] = torch.tensor(vals, dtype=out.dtype)
+         counts[t] = len(vals)
+     return out, counts
+@@ -107,7 +115,10 @@ def make_batch(rows, topk_rows, own_blocks):
+     for t, row in enumerate(topk_rows):
+         topk[t, : len(row)] = torch.tensor(row, dtype=torch.int32)
+     return SimpleNamespace(
+-        req_id_per_token=req_id, block_table=block_table, block_size=BLOCK_SIZE
++        req_id_per_token=req_id,
++        block_table=block_table,
++        block_size=BLOCK_SIZE,
++        topk_indices=topk,
+     )
+ 
+ 
+@@ -130,14 +141,18 @@ def test_forward_wiring(monkeypatch, qk_rope, kv_dtype):
+     state.kv_indptr[1:5] = torch.tensor([8, 13, 16, 17], dtype=torch.int32)
+     state.kv_indptr[5:] = 17
+     meta = make_batch(rows, topk_rows, [3])
++    impl.topk_indices_buffer.copy_(meta.topk_indices)
+     meta.state = state
+     q_nope = torch.randn(rows, impl.num_heads, HEAD)
+     q_rope = torch.randn(rows, impl.num_heads, qk_rope)
+-    cache = torch.zeros(
+-        8 * BLOCK_SIZE,
++    backing = torch.zeros(
++        8,
++        2,
++        BLOCK_SIZE,
+         impl.head_size,
+         dtype=torch.uint8 if impl.use_fp8_kv_cache else torch.bfloat16,
+     )
++    cache = backing[:, 0]
+ 
+     out, lse = impl.forward_mqa(
+         (q_nope, q_rope), cache, meta, SimpleNamespace(_k_scale_float=0.5)
+@@ -147,7 +162,10 @@ def test_forward_wiring(monkeypatch, qk_rope, kv_dtype):
+     # Reserved buffers carry this step's slots; lengths are NOT refreshed
+     # here (the builder plans them host-side before capture/replay).
+     ref_slots, ref_counts = ref_convert(
+-        meta.req_id_per_token, meta.block_table, impl.topk_indices_buffer
++        meta.req_id_per_token,
++        meta.block_table,
++        impl.topk_indices_buffer,
++        BLOCK_STRIDE_ROWS=2 * BLOCK_SIZE,
+     )
+     offset = 0
+     for t in range(rows):
+@@ -161,7 +179,7 @@ def test_forward_wiring(monkeypatch, qk_rope, kv_dtype):
+     assert state.wrapper.run_args is not None
+     q_pe, ckv, kpe, kwargs = state.wrapper.run_args[1:]
+     assert q_pe.shape == (rows, impl.num_heads, qk_rope)
+-    assert ckv.shape == (8 * BLOCK_SIZE, 1, HEAD)
++    assert ckv.shape == ((8 - 1) * 2 * BLOCK_SIZE + BLOCK_SIZE, 1, HEAD)
+     assert kpe.shape[-1] == qk_rope
+     if impl.use_fp8_kv_cache:
+         assert kwargs["ckv_scale"] == 0.5 and kwargs["kpe_scale"] == 1.0
+@@ -290,6 +308,21 @@ def test_pack_indices_replays_with_updated_offsets(width):
+         assert (state.kv_indices[expected.numel() :] == -99).all()
+ 
+ 
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
++def test_pack_indices_padding_uses_valid_slot():
++    """Planned rows may read padding; it must not point at unrelated cache rows."""
++    state = sm90_mod._SM90State.__new__(sm90_mod._SM90State)
++    state.kv_indptr = torch.tensor([0, 6, 10], dtype=torch.int32, device="cuda")
++    state.kv_indices = torch.empty(10, dtype=torch.int32, device="cuda")
++    slots = torch.full((2, TOPK), -1, dtype=torch.int32, device="cuda")
++    slots[0, :2] = torch.tensor([7, 3], device="cuda")
++    slots[1, 0] = 13
++
++    state.pack_indices(slots)
++
++    assert state.kv_indices.tolist() == [7, 3, 7, 7, 7, 7, 13, 13, 13, 13]
++
++
+ @pytest.mark.parametrize("adaptive", [False, True])
+ def test_kv_lens_host_formula(adaptive):
+     """Per-row host lengths: context == position + 1; capped at
+diff --git a/tests/v1/attention/test_flashmla_nope_sm90_backend_selection.py b/tests/v1/attention/test_flashmla_nope_sm90_backend_selection.py
+index db2c1becc411..c61dc6935d39 100644
+--- a/tests/v1/attention/test_flashmla_nope_sm90_backend_selection.py
++++ b/tests/v1/attention/test_flashmla_nope_sm90_backend_selection.py
+@@ -24,6 +24,20 @@
+     QUANTIZED_DS_MLA_CACHE_FORMATS,
+     FlashMLASparseBackend,
+ )
++from vllm.v1.kv_cache_interface import (
++    KVCacheConfig,
++    KVCacheGroupSpec,
++    KVCacheLayout,
++    KVCacheTensor,
++    KVQuantMode,
++    MLAAttentionSpec,
++)
++from vllm.v1.worker.utils import (
++    AttentionGroup,
++    allocate_kv_cache,
++    prepare_kernel_block_sizes,
++    select_common_block_size,
++)
+ 
+ SM90 = DeviceCapability(major=9, minor=0)
+ SM100 = DeviceCapability(major=10, minor=0)
+@@ -82,6 +96,63 @@ def test_supported_head_sizes_include_512():
+     assert FlashMLASparseBackend.get_supported_head_sizes() == [576, 512]
+ 
+ 
++def test_flashmla_bf16_nope_accepts_packed_manager_blocks():
++    spec = MLAAttentionSpec(
++        block_size=1152,
++        num_kv_heads=1,
++        head_size=512,
++        dtype=torch.bfloat16,
++        cache_dtype_str="bfloat16",
++        block_stride_alignment=1024,
++    )
++    assert FlashMLASparseBackend.get_supported_kernel_block_sizes() == [64]
++    assert FlashMLASparseBackend.get_strided_block_page_rows(spec) == 1
++    num_blocks = 2
++    layers = ["layer.0", "layer.1"]
++    page_size = spec.page_size_bytes
++    config = KVCacheConfig(
++        num_blocks=num_blocks,
++        kv_cache_tensors=[
++            KVCacheTensor(
++                size=num_blocks * len(layers) * page_size,
++                layers=layers,
++                layer_stride=page_size,
++                block_stride=len(layers) * page_size,
++            )
++        ],
++        kv_cache_groups=[KVCacheGroupSpec(layers, spec)],
++    )
++    groups = [[AttentionGroup(FlashMLASparseBackend, layers, spec, 0)]]
++
++    kernel_block_sizes = prepare_kernel_block_sizes(config, groups)
++    caches = allocate_kv_cache(
++        config,
++        torch.device("cpu"),
++        KVCacheLayout.BLHNC,
++        kernel_block_sizes,
++    )
++
++    assert kernel_block_sizes == [1152]
++    assert caches["layer.0"].shape == (num_blocks, 1, 1152, 512)
++
++
++def test_flashmla_quantized_cache_keeps_fixed_kernel_pages():
++    spec = MLAAttentionSpec(
++        block_size=1152,
++        num_kv_heads=1,
++        head_size=576,
++        dtype=torch.float8_e4m3fn,
++        cache_dtype_str="fp8_ds_mla",
++        kv_quant_mode=KVQuantMode.FP8_PER_TENSOR,
++        state_content_bytes=656,
++    )
++
++    assert FlashMLASparseBackend.get_supported_kernel_block_sizes() == [64]
++    assert FlashMLASparseBackend.get_supported_kernel_block_sizes(spec) == [64]
++    assert FlashMLASparseBackend.get_strided_block_page_rows(spec) is None
++    assert select_common_block_size(1152, [FlashMLASparseBackend]) == 64
++
++
+ def test_quantized_ds_mla_formats_are_the_envelope_set():
+     assert frozenset({"fp8_ds_mla", "nvfp4_ds_mla"}) == QUANTIZED_DS_MLA_CACHE_FORMATS
+ 
+diff --git a/tests/v1/attention/test_kpool_page_geometry.py b/tests/v1/attention/test_kpool_page_geometry.py
+new file mode 100644
+index 000000000000..1443d4afa0ff
+--- /dev/null
++++ b/tests/v1/attention/test_kpool_page_geometry.py
+@@ -0,0 +1,178 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from vllm.models.glm5next.common.sparse_indexer import _kpool_flat_page_view
++from vllm.v1.attention.backends.mla.indexer import (
++    DeepseekV32IndexerBackend,
++    DeepseekV32IndexerMetadataBuilder,
++)
++from vllm.v1.kv_cache_interface import MLAAttentionSpec
++from vllm.v1.worker.utils import AttentionGroup
++
++ROW = 132  # 128 fp8 bytes + 4 scale bytes per indexer state
++
++
++class _RecordingBuilder:
++    requires_block_table_width = False
++    requires_block_stride_bytes = True
++
++    def __init__(self, kv_cache_spec, *_args, block_stride_bytes=None, **_kwargs):
++        self.kv_cache_spec = kv_cache_spec
++        self.block_stride_bytes = block_stride_bytes
++
++    def set_kernel_block_size(self, block_size):
++        self.kernel_block_size = block_size
++
++
++class _RecordingBackend:
++    @staticmethod
++    def get_builder_cls():
++        return _RecordingBuilder
++
++
++@pytest.mark.parametrize(("page_states", "stride_pages"), [(32, 7), (64, 5)])
++def test_kernel_page_table_uses_physical_stride(page_states, stride_pages):
++    pages_per_block = 4
++    builder = object.__new__(DeepseekV32IndexerMetadataBuilder)
++    builder.kv_cache_spec = MLAAttentionSpec(
++        block_size=pages_per_block * page_states * 4,
++        num_kv_heads=1,
++        head_size=128,
++        head_size_v=0,
++        dtype=torch.uint8,
++        state_content_bytes=ROW,
++        tokens_per_state=4,
++        kernel_page_size=page_states * 4,
++    )
++    builder._kernel_page_size = builder.kv_cache_spec.kernel_page_size
++    builder.block_stride_bytes = stride_pages * page_states * ROW
++    builder.arange_buffer = torch.arange(16, dtype=torch.int32)
++
++    page_size, page_table = builder._expand_kernel_page_table(
++        torch.tensor([[0, 2]], dtype=torch.int32)
++    )
++    assert page_size == page_states
++    assert page_table.tolist() == [
++        list(range(pages_per_block))
++        + list(range(2 * stride_pages, 2 * stride_pages + pages_per_block))
++    ]
++
++
++def test_single_page_table_uses_strided_cache_block_ids():
++    page_states, row_width, num_blocks = 64, ROW, 3
++    page_bytes = page_states * row_width
++    block_stride_bytes = 2 * page_bytes + 4
++    backing = torch.empty(
++        (num_blocks - 1) * block_stride_bytes + page_bytes, dtype=torch.uint8
++    )
++    cache = backing.as_strided(
++        (num_blocks, page_states, row_width),
++        (block_stride_bytes, row_width, 1),
++    )
++    kernel_cache = _kpool_flat_page_view(cache)
++
++    builder = object.__new__(DeepseekV32IndexerMetadataBuilder)
++    builder.kv_cache_spec = MLAAttentionSpec(
++        block_size=page_states * 4,
++        num_kv_heads=1,
++        head_size=128,
++        head_size_v=0,
++        dtype=torch.uint8,
++        state_content_bytes=ROW,
++        tokens_per_state=4,
++        kernel_page_size=page_states * 4,
++    )
++    builder._kernel_page_size = builder.kv_cache_spec.kernel_page_size
++    builder.block_stride_bytes = block_stride_bytes
++    block_table = torch.tensor([[0, 2]], dtype=torch.int32)
++
++    page_size, page_table = builder._expand_kernel_page_table(block_table)
++
++    assert block_stride_bytes % 4 == 0
++    assert block_stride_bytes % page_bytes != 0
++    assert kernel_cache is cache
++    assert page_size == page_states
++    assert page_table is block_table
++    assert kernel_cache[page_table[0, 1]].storage_offset() == 2 * block_stride_bytes
++
++
++@pytest.mark.parametrize(
++    ("block_size", "expected_kernel_page", "expected_alignment"),
++    [
++        (640, 128, 32 * ROW),
++        (1024, 256, 64 * ROW),
++        (1152, 128, 32 * ROW),
++        (256, 256, None),
++    ],
++)
++def test_kpool_spec_declares_repage_alignment(
++    default_vllm_config, block_size, expected_kernel_page, expected_alignment
++):
++    from vllm.models.glm5next.common.attention import Glm5NextIndexerCache
++
++    default_vllm_config.cache_config.block_size = block_size
++    cache = Glm5NextIndexerCache(
++        head_dim=ROW,
++        dtype=torch.uint8,
++        prefix=f"indexer_{block_size}",
++        cache_config=default_vllm_config.cache_config,
++        index_kpool=4,
++    )
++    spec = cache.get_kv_cache_spec(default_vllm_config)
++    assert spec.kernel_page_size == expected_kernel_page
++    assert spec.block_stride_alignment == expected_alignment
++    assert DeepseekV32IndexerBackend.get_supported_kernel_block_sizes(spec) == [64]
++    assert DeepseekV32IndexerBackend.get_strided_block_page_rows(spec) == (
++        expected_kernel_page // 4
++    )
++
++
++@pytest.mark.parametrize(
++    (
++        "manager_block_size",
++        "stride_pages",
++        "kernel_block_size",
++        "builder_block_size",
++        "kernel_page_size",
++    ),
++    [
++        (1024, 1, 64, 256, None),
++        (256, 1, 64, 256, None),
++        (256, 1, 256, 256, 256),
++        (1024, 2, 1024, 1024, 256),
++    ],
++)
++def test_kpool_builder_uses_the_cache_view_geometry(
++    manager_block_size,
++    stride_pages,
++    kernel_block_size,
++    builder_block_size,
++    kernel_page_size,
++):
++    spec = MLAAttentionSpec(
++        block_size=manager_block_size,
++        num_kv_heads=1,
++        head_size=128,
++        dtype=torch.uint8,
++        state_content_bytes=ROW,
++        tokens_per_state=4,
++        kernel_page_size=256,
++    )
++    group = AttentionGroup(_RecordingBackend, ["indexer"], spec, 0)
++    group.create_metadata_builders(
++        SimpleNamespace(),
++        torch.device("cpu"),
++        kernel_block_size,
++        block_stride_bytes=stride_pages * spec.page_size_bytes,
++    )
++
++    builder = group.get_metadata_builder()
++    assert builder.kv_cache_spec.block_size == builder_block_size
++    assert builder.kv_cache_spec.kernel_page_size == kernel_page_size
++    assert builder.kernel_block_size == kernel_block_size
++    assert builder.block_stride_bytes == stride_pages * spec.page_size_bytes
+diff --git a/tests/v1/attention/test_kpool_tail_slot_mapping.py b/tests/v1/attention/test_kpool_tail_slot_mapping.py
+index 157366e49cc5..ff52a4a04032 100644
+--- a/tests/v1/attention/test_kpool_tail_slot_mapping.py
++++ b/tests/v1/attention/test_kpool_tail_slot_mapping.py
+@@ -3,15 +3,16 @@
+ """CPU tests for the kpool tail slot mapping (no GPU required).
+ 
+ The kpool tail cache is a 1-block-per-request circular ring addressed by
+-``pos % kpool`` (``KpoolTailSpec`` / ``KpoolTailManager``: exactly one block
+-allocated per request, never grown, so only column 0 of its block table is
+-ever written; the rest stays zero-initialized).
++``pos % ring_size``. The ring is one kpool without speculation and expands by
++whole kpools to preserve speculative rows. ``CircularBufferSpec`` /
++``CircularBufferManager`` still allocate exactly one block per request, so only
++column 0 of its block table is ever written; the rest stays zero-initialized.
+ 
+ The generic per-group slot kernel cannot express that layout: it maps
+ ``pos -> bt[req][pos // bs] * bs + pos % bs`` (``_compute_slot_mappings_kernel``
+-in vllm/v1/worker/gpu/block_table.py), so every token at ``pos >= kpool``
++in vllm/v1/worker/gpu/block_table.py), so every token at ``pos >= ring_size``
+ reads a zero column and collapses onto physical tail block 0. All concurrent
+-requests then share one ``kpool``-slot ring and corrupt each other's pool
++requests then share one tail ring and corrupt each other's pool
+ compression.
+ 
+ These tests pin that defect's arithmetic, verify the circular replacement
+@@ -24,90 +25,62 @@
+ import pytest
+ import torch
+ 
+-from vllm.config import VllmConfig, set_current_vllm_config
+-from vllm.models.glm5next.common.attention import Glm5NextTailCache
+ from vllm.v1.attention.backend import CommonAttentionMetadata
+ from vllm.v1.attention.backends.mla.indexer import (
+     KpoolTailBackend,
+     KpoolTailMetadataBuilder,
+     compute_kpool_tail_slot_mapping,
+ )
+-from vllm.v1.kv_cache_interface import KpoolTailSpec, compute_layout_strides
++from vllm.v1.kv_cache_interface import CircularBufferSpec, compute_layout_strides
+ from vllm.v1.kv_cache_layout import KVCacheLayout
+-from vllm.v1.worker.block_table import get_block_table_width
+ 
+ KPOOL = 4
+ 
+ 
+ def test_tail_backend_layout_matches_kernel_pointer_arithmetic():
+     (layout,) = KpoolTailBackend.supported_kv_cache_layouts()
+-    spec = KpoolTailSpec(
++    assert layout is KVCacheLayout.BLHNC
++    spec = CircularBufferSpec(
+         block_size=KPOOL,
+         num_kv_heads=2,
+         head_size=128,
+         head_size_v=0,
+         dtype=torch.bfloat16,
+-        sliding_window=KPOOL,
+     )
+     strides = compute_layout_strides(spec, num_blocks=8, num_layers=3, layout=layout)
+     _, _, head_stride, state_stride, content_stride = strides
+ 
+-    assert layout is KVCacheLayout.LBHNC
+     assert head_stride == KPOOL * 128 * torch.bfloat16.itemsize
+     assert state_stride == 128 * torch.bfloat16.itemsize
+     assert content_stride == 1
+ 
+ 
+ @pytest.mark.parametrize(
+-    "num_speculative_tokens, ring", [(0, 4), (1, 8), (4, 8), (7, 16), (13, 32)]
++    ("num_speculative_tokens", "ring"),
++    [(0, 4), (1, 8), (4, 8), (7, 16), (13, 32)],
+ )
+-def test_tail_ring_divides_the_attention_block(num_speculative_tokens, ring):
+-    """With 7 draft tokens the ring was 12 slots. 12 does not divide the
+-    640-token KDA attention block, so the scheduler block grew to their lcm
+-    and prefix-cache hits were cut down to multiples of 1920."""
+-    with set_current_vllm_config(VllmConfig()):
+-        cache = Glm5NextTailCache(
+-            head_dim=128,
+-            dtype=torch.bfloat16,
+-            prefix="tail",
+-            cache_config=SimpleNamespace(block_size=640),
+-            index_kpool=KPOOL,
+-        )
+-    spec = cache.get_kv_cache_spec(
+-        SimpleNamespace(num_speculative_tokens=num_speculative_tokens)
+-    )
+-
+-    assert spec.block_size == spec.sliding_window == ring
+-    assert ring >= KPOOL + num_speculative_tokens
+-    assert 640 % ring == 0
+-
++def test_tail_spec_reserves_complete_pools_for_speculation(
++    num_speculative_tokens, ring
++):
++    from vllm.models.glm5next.common.attention import Glm5NextTailCache
+ 
+-def test_tail_spec_opts_out_of_generic_slot_mapping():
+-    """The tail row is one block wide (padded to the block-table alignment), so
+-    the generic kernel's ``pos // kpool`` column index runs off the end of the
+-    allocation for long prompts. The spec must opt out of it entirely."""
+-    spec = KpoolTailSpec(
+-        block_size=KPOOL,
+-        num_kv_heads=2,
+-        head_size=128,
+-        head_size_v=0,
+-        dtype=torch.bfloat16,
+-        sliding_window=KPOOL,
++    cache = SimpleNamespace(
++        _index_kpool=KPOOL,
++        head_dim=128,
++        cache_config=SimpleNamespace(block_size=640),
+     )
+-    max_len = 1 << 20
+-    width = get_block_table_width(
+-        spec.max_num_blocks_per_req(None, max_len),
+-        spec.block_size,
+-        token_alignment=spec.block_table_token_alignment,
++    spec = Glm5NextTailCache.get_kv_cache_spec(
++        cache, SimpleNamespace(num_speculative_tokens=num_speculative_tokens)
+     )
+ 
+-    assert width * KPOOL < max_len
+-    assert spec.uses_slot_mapping is False
++    assert isinstance(spec, CircularBufferSpec)
++    assert spec.block_size == ring
++    assert cache.cache_config.block_size % ring == 0
+ 
+ 
+ def make_tail_block_table(own_blocks, width=64):
+     """Tail-group block table as BlockTables produces it: column 0 holds the
+-    request's single KpoolTailManager block, the remaining columns are never
++    request's single CircularBufferManager block, the remaining columns are never
+     written and stay zero."""
+     bt = torch.zeros(len(own_blocks), width, dtype=torch.int32)
+     bt[:, 0] = torch.tensor(own_blocks, dtype=torch.int32)
+@@ -127,7 +100,13 @@ def legacy_generic_tail_slots(block_table, query_start_loc, positions):
+ 
+ 
+ def circular_tail_slots(
+-    slot_mapping, block_table, query_start_loc, positions, num_actual, num_reqs
++    slot_mapping,
++    block_table,
++    query_start_loc,
++    positions,
++    num_actual,
++    num_reqs,
++    ring_size=KPOOL,
+ ):
+     return compute_kpool_tail_slot_mapping(
+         slot_mapping,
+@@ -136,7 +115,7 @@ def circular_tail_slots(
+         positions,
+         num_actual,
+         num_reqs,
+-        KPOOL,
++        ring_size,
+     )
+ 
+ 
+@@ -420,15 +399,15 @@ def test_interleaved_decode_pollution_legacy_vs_circular():
+ 
+ @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+ @pytest.mark.parametrize(
+-    "per_req,num_actual,padded_len",
++    "per_req,num_actual,padded_len,ring_size",
+     [
+-        ([list(range(10)), list(range(12))], 22, 22),
+-        ([list(range(10)), list(range(12))], 22, 30),
+-        ([[3, 4], [0], [7, 8, 9]], 6, 8),
+-        ([[5]], 1, 1),
++        ([list(range(10)), list(range(12))], 22, 22, KPOOL),
++        ([list(range(10)), list(range(12))], 22, 30, 2 * KPOOL),
++        ([[3, 4], [0], [7, 8, 9]], 6, 8, KPOOL),
++        ([[5]], 1, 1, KPOOL),
+     ],
+ )
+-def test_triton_mapping_matches_cpu(per_req, num_actual, padded_len):
++def test_triton_mapping_matches_cpu(per_req, num_actual, padded_len, ring_size):
+     """The CUDA (Triton) path must match the CPU torch reference, including
+     tokens between the last request boundary and num_actual_tokens (mapped to
+     the last request) and untouched padding beyond num_actual."""
+@@ -440,7 +419,9 @@ def test_triton_mapping_matches_cpu(per_req, num_actual, padded_len):
+     slot_mapping = torch.arange(padded_len, dtype=torch.int64) + 1000
+     bt = make_tail_block_table(list(range(5, 5 + num_reqs)))
+ 
+-    ref = circular_tail_slots(slot_mapping, bt, qsl, positions, num_actual, num_reqs)
++    ref = circular_tail_slots(
++        slot_mapping, bt, qsl, positions, num_actual, num_reqs, ring_size
++    )
+     got = circular_tail_slots(
+         slot_mapping.cuda(),
+         bt.cuda(),
+@@ -448,6 +429,7 @@ def test_triton_mapping_matches_cpu(per_req, num_actual, padded_len):
+         positions.cuda(),
+         num_actual,
+         num_reqs,
++        ring_size,
+     )
+     torch.testing.assert_close(got.cpu(), ref)
+ 
+@@ -467,9 +449,11 @@ def test_triton_mapping_reads_strided_block_table():
+     ref = circular_tail_slots(
+         slot_mapping, bt.contiguous(), qsl, positions, num_actual, num_reqs
+     )
++    bt_cuda = wide.cuda()[:, 1:4]
++    assert bt_cuda.stride() == bt.stride() == (8, 1)
+     got = circular_tail_slots(
+         slot_mapping.cuda(),
+-        bt.cuda(),
++        bt_cuda,
+         qsl.cuda().to(torch.int32),
+         positions.cuda(),
+         num_actual,
+diff --git a/tests/v1/attention/test_mla_backends.py b/tests/v1/attention/test_mla_backends.py
+index 9ae0fc216a47..969dcc5b0811 100644
+--- a/tests/v1/attention/test_mla_backends.py
++++ b/tests/v1/attention/test_mla_backends.py
+@@ -9,7 +9,7 @@
+ """
+ 
+ import sys
+-from types import MethodType, SimpleNamespace
++from types import SimpleNamespace
+ 
+ import pytest
+ import torch
+@@ -218,14 +218,13 @@ def test_mla_kv_cache_spec_uses_layer_cache_dtype(
+     cache_dtype: str, expected_quant_mode: KVQuantMode
+ ):
+     layer = SimpleNamespace(
+-        attn_backend=flashmla_module.FlashMLABackend,
+         kv_cache_dtype=cache_dtype,
+         head_size=576,
++        attn_backend=SimpleNamespace(get_strided_block_page_rows=lambda _spec: 32),
+         indexer=None,
+         non_causal_multi_token_decode=False,
+         sliding_window=None,
+     )
+-    layer._uses_flat_kv_cache = MethodType(MLAAttention._uses_flat_kv_cache, layer)
+     vllm_config = SimpleNamespace(
+         cache_config=SimpleNamespace(block_size=64), model_config=None
+     )
+@@ -235,6 +234,7 @@ def test_mla_kv_cache_spec_uses_layer_cache_dtype(
+     assert isinstance(spec, MLAAttentionSpec)
+     assert spec.cache_dtype_str == cache_dtype
+     assert spec.kv_quant_mode == expected_quant_mode
++    assert spec.block_stride_alignment == 32 * spec.state_content_size_bytes
+     if cache_dtype == "fp8_ds_mla":
+         assert spec.page_size_bytes == 64 * 656
+ 
+diff --git a/tests/v1/attention/test_rocm_glm5next_sparse.py b/tests/v1/attention/test_rocm_glm5next_sparse.py
+index ccc9e5c6178e..77e974ab5c01 100644
+--- a/tests/v1/attention/test_rocm_glm5next_sparse.py
++++ b/tests/v1/attention/test_rocm_glm5next_sparse.py
+@@ -9,15 +9,23 @@
+ from vllm.platforms import current_platform
+ from vllm.triton_utils import tl, triton
+ from vllm.v1.attention.backends.mla import rocm_aiter_mla_sparse as sparse_mod
++from vllm.v1.attention.backends.mla.indexer import (
++    DeepseekV32IndexerBackend,
++    KpoolTailBackend,
++)
+ from vllm.v1.attention.backends.mla.rocm_aiter_mla_sparse import (
++    ROCMAiterMLASparseBackend,
+     _use_rocm_sparse_triton,
+     fit_kpool_indices_to_aiter,
++    triton_convert_req_index_to_global_index,
+ )
++from vllm.v1.attention.backends.utils import get_supported_kv_cache_layouts
+ from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+     _sparse_kv_row_offset,
+     _validate_dsv4_sparse_dims,
+     _validate_sparse_dims,
+ )
++from vllm.v1.kv_cache_interface import KVCacheLayout, MLAAttentionSpec
+ 
+ 
+ @triton.jit
+@@ -60,6 +68,21 @@ def test_fit_kpool_indices_rejects_narrow_input():
+         )
+ 
+ 
++def test_rocm_sparse_mla_supports_glm_packed_layout():
++    layouts = get_supported_kv_cache_layouts(
++        (ROCMAiterMLASparseBackend, DeepseekV32IndexerBackend, KpoolTailBackend)
++    )
++    spec = MLAAttentionSpec(
++        block_size=64,
++        num_kv_heads=1,
++        head_size=512,
++        dtype=torch.bfloat16,
++    )
++
++    assert layouts == [KVCacheLayout.BLHNC]
++    assert ROCMAiterMLASparseBackend.get_strided_block_page_rows(spec) == 1
++
++
+ @pytest.mark.parametrize(
+     (
+         "kv_cache_dtype",
+@@ -180,3 +203,26 @@ def test_sparse_prefill_kv_row_offset_does_not_overflow_int32():
+     _store_sparse_kv_row_offset_kernel[(1,)](slot, output, stride=512)
+ 
+     assert output.item() == 6554 * 640 * 512
++
++
++@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm required")
++def test_rocm_sparse_index_conversion_uses_physical_block_stride():
++    req_id = torch.tensor([0], dtype=torch.int32, device="cuda")
++    block_table = torch.tensor([[2]], dtype=torch.int32, device="cuda")
++    token_indices = torch.full((1, 128), -1, dtype=torch.int32, device="cuda")
++    token_indices[0, 0] = 5
++    indptr = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
++    output = torch.empty(128, dtype=torch.int32, device="cuda")
++
++    triton_convert_req_index_to_global_index(
++        req_id,
++        block_table,
++        token_indices,
++        indptr,
++        output,
++        BLOCK_SIZE=64,
++        BLOCK_STRIDE_ROWS=128,
++        NUM_TOPK_TOKENS=128,
++    )
++
++    assert output[0].item() == 2 * 128 + 5
+diff --git a/tests/v1/attention/test_sparse_mla_backends.py b/tests/v1/attention/test_sparse_mla_backends.py
+index 1d7fc389ef69..f7b36c884696 100644
+--- a/tests/v1/attention/test_sparse_mla_backends.py
++++ b/tests/v1/attention/test_sparse_mla_backends.py
+@@ -137,7 +137,7 @@ def test_nope_flashinfer_sparse_mla_uses_model_scale(monkeypatch):
+     metadata = SimpleNamespace(
+         req_id_per_token=torch.zeros(1, dtype=torch.int32),
+         block_table=torch.zeros((1, 1), dtype=torch.int32),
+-        block_size=1,
++        block_size=32,
+     )
+     recorded_scale = None
+ 
+@@ -175,7 +175,7 @@ def fake_flashinfer(**kwargs):
+     )
+     impl.forward_mqa(
+         torch.zeros(1, 1, kv_lora_rank),
+-        torch.zeros(1, 1, kv_lora_rank),
++        torch.zeros(1, 32, kv_lora_rank),
+         metadata,
+         SimpleNamespace(),
+     )
+@@ -433,6 +433,29 @@ def test_sparse_backend_decode_correctness(
+             "vllm.v1.attention.backends.mla.flashmla_sparse.split_prefill_chunks",
+             lambda rows, capacity: [(i, i + 1) for i in range(len(rows))],
+         )
++    _run_sparse_backend_decode_correctness(
++        backend_cls,
++        SPARSE_BACKEND_BATCH_SPECS[batch_name],
++        kv_cache_dtype,
++        tensor_parallel_size,
++        block_size,
++        q_scale,
++        k_scale,
++    )
++
++
++def _run_sparse_backend_decode_correctness(
++    backend_cls,
++    batch_spec,
++    kv_cache_dtype,
++    tensor_parallel_size,
++    block_size,
++    q_scale: float,
++    k_scale: float,
++    *,
++    block_stride_rows: int | None = None,
++    spread_sparse_indices: bool = False,
++):
+     if kv_cache_dtype not in backend_cls.supported_kv_cache_dtypes:
+         pytest.skip(f"{backend_cls.get_name()} does not support {kv_cache_dtype}")
+ 
+@@ -457,8 +480,7 @@ def test_sparse_backend_decode_correctness(
+         if device_capability is None or device_capability.major != 10:
+             pytest.skip("The NVFP4 DS-MLA kv-cache dtype requires SM 10.x")
+ 
+-    supported_block_sizes = backend_cls.get_supported_kernel_block_sizes()
+-    if block_size not in supported_block_sizes:
++    if not backend_cls.supports_block_size(block_size):
+         pytest.skip(
+             f"{backend_cls.get_name()} does not support block_size={block_size}"
+         )
+@@ -474,7 +496,6 @@ def test_sparse_backend_decode_correctness(
+         ):
+             pytest.skip("FlashInferMLASparseTRTLLMBackend requires SM 10.x capability")
+ 
+-    batch_spec = SPARSE_BACKEND_BATCH_SPECS[batch_name]
+     use_fp8_ds_mla_quantization = kv_cache_dtype == "fp8_ds_mla"
+     use_nvfp4_ds_mla_quantization = kv_cache_dtype == "nvfp4_ds_mla"
+ 
+@@ -502,7 +523,11 @@ def test_sparse_backend_decode_correctness(
+         model_name="deepseek-ai/DeepSeek-V2-Lite-Chat",
+         tensor_parallel_size=1,
+         max_model_len=max_seqlen,
+-        num_gpu_blocks=max(2048, cdiv(total_cache_tokens, block_size) + 1),
++        num_gpu_blocks=(
++            max(2048, cdiv(total_cache_tokens, block_size) + 1)
++            if block_stride_rows is None
++            else cdiv(total_cache_tokens, block_size) + 2
++        ),
+         block_size=block_size,
+         hf_config_override={
+             "index_topk": topk_tokens,
+@@ -573,7 +598,11 @@ def test_sparse_backend_decode_correctness(
+         num_valid = min(topk_tokens // 2, max_valid_idx + 1)
+         if num_valid > 0:
+             valid_range = torch.arange(num_valid, device=device, dtype=torch.int32)
+-            tok_indices = (valid_range + offset) % (max_valid_idx + 1)
++            if spread_sparse_indices:
++                tok_indices = valid_range * (max_valid_idx + 1) // num_valid
++                tok_indices[-1] = max_valid_idx
++            else:
++                tok_indices = (valid_range + offset) % (max_valid_idx + 1)
+             # Pad with -1 for the remaining positions
+             tok_indices = torch.cat(
+                 [
+@@ -703,6 +732,22 @@ def test_sparse_backend_decode_correctness(
+         kv_cache_dtype=kv_cache_dtype,
+         scale=kv_cache_scale,
+     )
++    if block_stride_rows is not None:
++        backing = torch.zeros(
++            kv_cache.shape[0],
++            kv_cache.shape[1],
++            block_stride_rows,
++            kv_cache.shape[-1],
++            dtype=kv_cache.dtype,
++            device=kv_cache.device,
++        )
++        packed_kv_cache = backing[:, :, :block_size]
++        packed_kv_cache.copy_(kv_cache)
++        kv_cache = packed_kv_cache
++        assert kv_cache.stride(0) // kv_cache.shape[-1] == block_stride_rows
++        assert common_attn_metadata.slot_mapping.numel() == 1
++        query_slot = int(common_attn_metadata.slot_mapping[0].item())
++        kv_cache[query_slot // block_size, :, query_slot % block_size].zero_()
+ 
+     # The sparse builder clones the layer's dense-MHA prefill backend from
+     # static_forward_context; register a mock layer carrying one.
+@@ -798,6 +843,15 @@ def test_sparse_backend_decode_correctness(
+             out_buffer,
+         )
+ 
++    if block_stride_rows is not None:
++        expected_cache_row = torch.cat((kv_c_vllm[0], k_pe_vllm[0, 0]))
++        torch.testing.assert_close(
++            kv_cache[query_slot // block_size, 0, query_slot % block_size],
++            expected_cache_row,
++            rtol=0,
++            atol=0,
++        )
++
+     assert backend_output.shape == sdpa_reference.shape
+     assert backend_output.dtype == sdpa_reference.dtype
+     assert torch.isfinite(backend_output).all()
+@@ -812,6 +866,41 @@ def test_sparse_backend_decode_correctness(
+         torch.testing.assert_close(backend_output, sdpa_reference, rtol=0.01, atol=0.01)
+ 
+ 
++def test_flashinfer_sparse_mla_packed_stride(
++    dist_init,
++    workspace_init,
++):
++    _run_sparse_backend_decode_correctness(
++        FlashInferMLASparseTRTLLMBackend,
++        BatchSpec(seq_lens=[300], query_lens=[1]),
++        "auto",
++        1,
++        256,
++        1.0,
++        1.0,
++        block_stride_rows=320,
++        spread_sparse_indices=True,
++    )
++
++
++def test_flashmla_sparse_packed_stride(
++    default_vllm_config,
++    dist_init,
++    workspace_init,
++):
++    _run_sparse_backend_decode_correctness(
++        FlashMLASparseBackend,
++        BatchSpec(seq_lens=[100], query_lens=[1]),
++        "auto",
++        1,
++        64,
++        1.0,
++        1.0,
++        block_stride_rows=96,
++        spread_sparse_indices=True,
++    )
++
++
+ def _triton_convert_reference_impl(
+     req_ids: torch.Tensor,
+     block_table: torch.Tensor,
+diff --git a/tests/v1/attention/test_sparse_mla_kv_cache_layout.py b/tests/v1/attention/test_sparse_mla_kv_cache_layout.py
+index cd3c9b218147..5ce9dccaf8e0 100644
+--- a/tests/v1/attention/test_sparse_mla_kv_cache_layout.py
++++ b/tests/v1/attention/test_sparse_mla_kv_cache_layout.py
+@@ -48,8 +48,8 @@
+ @pytest.mark.parametrize(
+     "backend,cache_dtype,sm100,stride_alignment",
+     [
+-        (FlashInferMLASparseTRTLLMBackend, "auto", True, 1152),
+-        (FlashInferMLASparseTRTLLMBackend, "fp8", True, 576),
++        (FlashInferMLASparseTRTLLMBackend, "auto", True, 32 * 1152),
++        (FlashInferMLASparseTRTLLMBackend, "fp8", True, 32 * 576),
+         (FlashMLASparseBackend, "auto", True, 1152),
+         (FlashMLASparseBackend, "fp8_ds_mla", False, None),
+         (FlashMLASparseBackend, "fp8_ds_mla", True, 656),
+diff --git a/tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py b/tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py
+index f1301d928837..4cf8b3d782d4 100644
+--- a/tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py
++++ b/tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py
+@@ -22,8 +22,8 @@
+ )
+ from vllm.v1.core.sched.scheduler import Scheduler
+ from vllm.v1.kv_cache_interface import (
++    CircularBufferSpec,
+     FullAttentionSpec,
+-    KpoolTailSpec,
+     KVCacheConfig,
+     KVCacheGroupSpec,
+     MambaSpec,
+@@ -2081,12 +2081,11 @@ def test_opted_out_scratch_group_keeps_partial_hash_hits():
+             ),
+             KVCacheGroupSpec(
+                 ["tail"],
+-                KpoolTailSpec(
++                CircularBufferSpec(
+                     block_size=mamba_block_size,
+                     num_kv_heads=1,
+                     head_size=1,
+                     dtype=torch.float32,
+-                    sliding_window=mamba_block_size,
+                 ),
+             ),
+         ],
+@@ -2113,8 +2112,8 @@ def test_opted_out_scratch_group_keeps_partial_hash_hits():
+ 
+ def test_kpool_tail_supports_128_token_partial_hash_hits():
+     hash_block_size = 128
+-    cache_block_size = 9 * hash_block_size
+-    kpool_block_size = 64
++    cache_block_size = 5 * hash_block_size
++    kpool_block_size = 16
+     kv_cache_config = KVCacheConfig(
+         num_blocks=24,
+         kv_cache_tensors=[],
+@@ -2139,12 +2138,11 @@ def test_kpool_tail_supports_128_token_partial_hash_hits():
+             ),
+             KVCacheGroupSpec(
+                 ["tail"],
+-                KpoolTailSpec(
++                CircularBufferSpec(
+                     block_size=kpool_block_size,
+                     num_kv_heads=1,
+                     head_size=1,
+                     dtype=torch.float32,
+-                    sliding_window=kpool_block_size,
+                 ),
+             ),
+         ],
+diff --git a/tests/v1/core/test_contiguous_kv_packing.py b/tests/v1/core/test_contiguous_kv_packing.py
+index 638deeedc579..e33fa6dba2b6 100644
+--- a/tests/v1/core/test_contiguous_kv_packing.py
++++ b/tests/v1/core/test_contiguous_kv_packing.py
+@@ -21,7 +21,6 @@
+ from vllm.v1.core.kv_cache_utils import (
+     _get_kv_cache_bytes_per_block,
+     _get_packed_kv_cache_groups,
+-    _pool_bytes_per_block,
+     generate_scheduler_kv_cache_config,
+     get_kv_cache_config_from_groups,
+     get_kv_cache_groups,
+@@ -88,7 +87,7 @@ def test_packed_alignment_preserves_hot_pages_and_generic_stride():
+     hot = HiSparseHotSpec(block_size=16, page_size=5120, blocks_per_request=2)
+     groups = [KVCacheGroupSpec(["attention"], spec), KVCacheGroupSpec(["hot"], hot)]
+     alignment = lcm(1152, hot.page_size_bytes)
+-    stride = _pool_bytes_per_block(groups)
++    stride = _get_kv_cache_bytes_per_block(groups)
+     assert stride == alignment
+     layout = KVCacheLayout.BLHNC
+     tensors = _build_hisparse_kv_cache_tensors(groups, 3, 3 * stride, layout, stride)
+@@ -562,7 +561,9 @@ def test_overlaid_groups_alias_and_stay_isolated(self):
+             _mock_vllm_config("BLNHC"), groups, MEMORY
+         )
+         assert config.num_blocks == MEMORY // _expected_bytes_per_block(groups)
+-        assert _pool_bytes_per_block(groups) == _expected_bytes_per_block(groups)
++        assert _get_kv_cache_bytes_per_block(groups) == _expected_bytes_per_block(
++            groups
++        )
+ 
+         views = _bind(config, "BLNHC")
+         assert set(views) == set(g1) | set(g2)
+diff --git a/tests/v1/core/test_kv_cache_utils.py b/tests/v1/core/test_kv_cache_utils.py
+index c2c86053f0f5..94ef9d86fcb5 100644
+--- a/tests/v1/core/test_kv_cache_utils.py
++++ b/tests/v1/core/test_kv_cache_utils.py
+@@ -10,7 +10,7 @@
+ from dataclasses import replace
+ from pathlib import Path
+ from types import SimpleNamespace
+-from typing import Any, cast
++from typing import Any
+ 
+ import pytest
+ import torch
+@@ -19,7 +19,6 @@
+ import vllm.v1.hisparse.runtime as hisparse_runtime_module
+ from vllm.config import (
+     CacheConfig,
+-    KVTransferConfig,
+     ModelConfig,
+     SchedulerConfig,
+     VllmConfig,
+@@ -66,7 +65,6 @@
+     HiddenStateCacheSpec,
+     HiSparseHotSpec,
+     HiSparseResidentSpec,
+-    KpoolTailSpec,
+     KVCacheConfig,
+     KVCacheGroupSpec,
+     KVCacheSpec,
+@@ -2617,501 +2615,77 @@ def test_generate_scheduler_kv_cache_config():
+     )
+ 
+ 
+-def _glm5_like_kv_cache_spec(
+-    mamba_spec_factory=new_mamba_spec,
+-) -> tuple[dict[str, KVCacheSpec], list[str]]:
+-    """(mamba, mamba, mamba, MLA + indexer) * 11 plus a trailing mamba."""
++def test_packed_groups_glm5_like_hybrid():
++    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=8192))
++    vllm_config.cache_config.kv_cache_layout = "BLHNC"
++    kpool, block_size = 4, 1024
+     kv_cache_spec: dict[str, KVCacheSpec] = {}
+-    mamba_layers = []
+-    for i in range(45):
+-        if i % 4 == 3:
+-            kv_cache_spec[f"layers.{i}.attn"] = MLAAttentionSpec(
+-                block_size=1024,
+-                num_kv_heads=1,
+-                head_size=576,
+-                dtype=torch.bfloat16,
+-            )
+-            kv_cache_spec[f"layers.{i}.indexer"] = MLAAttentionSpec(
+-                block_size=1024,
+-                num_kv_heads=1,
+-                head_size=132,
+-                dtype=torch.uint8,
+-                tokens_per_state=16,
+-            )
+-        else:
+-            name = f"layers.{i}.linear_attn"
+-            kv_cache_spec[name] = mamba_spec_factory()
+-            mamba_layers.append(name)
+-    return kv_cache_spec, mamba_layers
+-
+-
+-def _glm5_like_kv_cache_spec_with_tail(
+-    mamba_spec_factory=new_mamba_spec,
+-) -> dict[str, KVCacheSpec]:
+-    """Production kpool=4 proportions: (mamba*3, MLA + indexer + tail) * 11.
+-
+-    The tail's logical page (2 * kpool * 2*indexer_head_dim * bf16) must fit
+-    inside the indexer page it parasitizes (block_size//kpool * 132 B), which
+-    is why the fixture drops the tokens_per_state=16 shape used above.
+-    """
+-    kv_cache_spec, _ = _glm5_like_kv_cache_spec(mamba_spec_factory)
+-    for i in range(3, 45, 4):
+-        kpool = 4
+-        kv_cache_spec[f"layers.{i}.indexer"] = replace(
+-            cast(MLAAttentionSpec, kv_cache_spec[f"layers.{i}.indexer"]),
++    for i in range(11):
++        kv_cache_spec[f"layers.{i}.attn"] = MLAAttentionSpec(
++            block_size=block_size,
++            num_kv_heads=1,
++            head_size=576,
++            dtype=torch.bfloat16,
++            block_stride_alignment=32 * 576 * 2,
++        )
++        kv_cache_spec[f"layers.{i}.indexer"] = MLAAttentionSpec(
++            block_size=block_size,
++            num_kv_heads=1,
++            head_size=132,
++            dtype=torch.uint8,
+             tokens_per_state=kpool,
++            block_stride_alignment=64 * 132,
+         )
+-        kv_cache_spec[f"layers.{i}.tail"] = KpoolTailSpec(
++        kv_cache_spec[f"layers.{i}.tail"] = CircularBufferSpec(
+             block_size=kpool,
+             num_kv_heads=2,
+             head_size=128,
+             head_size_v=0,
+             dtype=torch.bfloat16,
+-            sliding_window=kpool,
+         )
+-    return kv_cache_spec
+-
+-
+-def _tensor_by_layer(kv_cache_config: KVCacheConfig) -> dict[str, KVCacheTensor]:
+-    return {
+-        layer_name: tensor
+-        for tensor in kv_cache_config.kv_cache_tensors
+-        for layer_name in tensor.layers
+-    }
+-
+-
+-def _layer_offset(tensor: KVCacheTensor, layer_name: str) -> int:
+-    return tensor.offset + tensor.layers.index(layer_name) * tensor.layer_stride
+-
+-
+-def test_get_kv_cache_config_balanced_mamba_hybrid():
+-    """Hybrid slot sharing: mamba layers co-own the MLA slot tensors."""
+-    model_config = ModelConfig(max_model_len=8192)
+-    vllm_config = VllmConfig(model_config=model_config)
+-
+-    kv_cache_spec, mamba_layers = _glm5_like_kv_cache_spec()
+-    mla_page = kv_cache_spec["layers.3.attn"].page_size_bytes
+-    idx_page = kv_cache_spec["layers.3.indexer"].page_size_bytes
+-
+-    groups = kv_cache_utils.get_kv_cache_groups(vllm_config, kv_cache_spec)
+-    uniform_groups = [
+-        group
+-        for group in groups
+-        if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+-    ]
+-    mamba_groups = [
+-        group for group in groups if isinstance(group.kv_cache_spec, MambaSpec)
+-    ]
+-
+-    # Round-robin into G = ceil(34 / 11) = 4 groups so every mamba layer
+-    # gets an MLA slot.
+-    assert len(groups) == 5
+-    assert len(uniform_groups) == 1
+-    assert len(uniform_groups[0].layer_names) == 22
+-    assert uniform_groups[0].kv_cache_spec.get_max_layers_per_page_size() == 11
+-    assert [len(group.layer_names) for group in mamba_groups] == [9, 9, 8, 8]
+-    for k, name in enumerate(mamba_layers):
+-        assert name in mamba_groups[k % 4].layer_names
+-    # Mamba pages are padded up to the MLA page.
+-    for group in mamba_groups:
+-        assert group.kv_cache_spec.page_size_padded == mla_page
+-        assert group.kv_cache_spec.page_size_bytes == mla_page
+-
+-    bytes_per_block = kv_cache_utils._pool_bytes_per_block(groups)
+-    assert bytes_per_block == 11 * mla_page + 11 * idx_page
+-
+-    # Every block id is charged the full per-block sum.
+-    attn_blocks = uniform_groups[0].kv_cache_spec.max_memory_usage_pages(vllm_config)
+-    mamba_blocks_per_group = 1 + new_mamba_spec().num_speculative_blocks
+-    blocks_per_request = attn_blocks + 4 * mamba_blocks_per_group
+-    assert (
+-        kv_cache_utils._max_memory_usage_bytes_from_groups(vllm_config, groups)
+-        == blocks_per_request * bytes_per_block
+-    )
+-
+-    available_memory = bytes_per_block * 100 + 1
+-    kv_cache_config = kv_cache_utils.get_kv_cache_config_from_groups(
+-        vllm_config, groups, available_memory
+-    )
+-    assert kv_cache_config.num_blocks == 100
+-
+-    # Every logical layer has a view into one backing allocation. Mamba views
+-    # alias their corresponding MLA slot by using the same byte offset.
+-    assert len(kv_cache_config.kv_cache_tensors) == 56
+-    assert {t.size for t in kv_cache_config.kv_cache_tensors} == {bytes_per_block * 100}
+-    tensors = _tensor_by_layer(kv_cache_config)
+-    mla_layer_names = [f"layers.{i}.attn" for i in range(3, 45, 4)]
+-    for i, mla_name in enumerate(mla_layer_names):
+-        mla_tensor = tensors[mla_name]
+-        assert mla_tensor.block_stride == mla_page
+-        for group in mamba_groups:
+-            if i < len(group.layer_names):
+-                assert tensors[group.layer_names[i]].offset == mla_tensor.offset
+-    for i in range(11):
+-        assert tensors[f"layers.{4 * i + 3}.indexer"].block_stride == idx_page
+-
+-    total_allocated = next(iter({t.size for t in kv_cache_config.kv_cache_tensors}))
+-    assert total_allocated == bytes_per_block * 100
+-    assert 0 <= available_memory - total_allocated < bytes_per_block
+-
+-    assert get_max_concurrency_for_kv_cache_config(
+-        vllm_config, kv_cache_config
+-    ) == pytest.approx(100 / blocks_per_request)
+-
+-
+-def test_get_kv_cache_config_kpool_tail_coowns_indexer_tensor():
+-    """The kpool tail parasitizes the indexer tensors instead of getting its
+-    own: sibling idx/tail tensors paired by layer order, zero standalone tail
+-    bytes, one shared block per request, and no prefix-caching leakage from
+-    the kpool-sized scratch group."""
+-    model_config = ModelConfig(max_model_len=8192)
+-    vllm_config = VllmConfig(model_config=model_config)
+-
+-    kv_cache_spec = _glm5_like_kv_cache_spec_with_tail()
+-    mla_page = kv_cache_spec["layers.3.attn"].page_size_bytes
+-    idx_page = kv_cache_spec["layers.3.indexer"].page_size_bytes
+-    tail_logical_page = kv_cache_spec["layers.3.tail"].page_size_bytes
+-    assert tail_logical_page < idx_page
+-
+-    groups = kv_cache_utils.get_kv_cache_groups(vllm_config, kv_cache_spec)
+-    tail_group = next(
+-        group
+-        for group in groups
+-        if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+-        and all(
+-            isinstance(spec, KpoolTailSpec)
+-            for spec in group.kv_cache_spec.kv_cache_specs.values()
++    for i in range(34):
++        kv_cache_spec[f"layers.{i}.kda"] = MambaSpec(
++            shapes=((3, 6144), (16, 128, 128)),
++            dtypes=(torch.bfloat16, torch.float32),
++            block_size=block_size,
+         )
+-    )
+-    # The tail never prefix-caches; its page is padded up to the indexer page
+-    # so the runner's strided view rides the indexer storage.
+-    assert not tail_group.kv_cache_spec.prefix_cacheable
+-    tail_inner = cast(
+-        KpoolTailSpec, tail_group.kv_cache_spec.kv_cache_specs["layers.3.tail"]
+-    )
+-    assert tail_inner.page_size_padded == idx_page
+-
+-    bytes_per_block = kv_cache_utils._pool_bytes_per_block(groups)
+-    assert bytes_per_block == 11 * mla_page + 11 * idx_page
+-
+-    kv_cache_config = kv_cache_utils.get_kv_cache_config_from_groups(
+-        vllm_config, groups, bytes_per_block * 100 + 1
+-    )
+-    assert kv_cache_config.num_blocks == 100
+-    # Tail layers get logical views but no additional storage: each view aliases
+-    # its sibling indexer at the same offset in the shared allocation.
+-    assert len(kv_cache_config.kv_cache_tensors) == 67
+-    tensors = _tensor_by_layer(kv_cache_config)
+-    for i in range(11):
+-        idx_name = f"layers.{4 * i + 3}.indexer"
+-        tail_name = f"layers.{4 * i + 3}.tail"
+-        assert tensors[idx_name].offset == tensors[tail_name].offset
+-    assert {t.size for t in kv_cache_config.kv_cache_tensors} == {bytes_per_block * 100}
+-
+-    # The layout detector surfaces the sibling names in layer order for the
+-    # accounting and connector paths.
+-    layout = kv_cache_utils._glm5_next_tensor_layout(kv_cache_config.kv_cache_groups)
+-    assert layout is not None
+-    assert layout[3] == [f"layers.{4 * i + 3}.indexer" for i in range(11)]
+-    assert layout[6] == [f"layers.{4 * i + 3}.tail" for i in range(11)]
+-
+-    # Accounting charges exactly one extra shared block per request for the
+-    # tail, not a per-sequence allocation.
+-    attn_group = next(
+-        group
+-        for group in groups
+-        if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+-        and group is not tail_group
+-    )
+-    attn_blocks = attn_group.kv_cache_spec.max_memory_usage_pages(vllm_config)
+-    mamba_blocks_per_group = 1 + new_mamba_spec().num_speculative_blocks
+-    blocks_per_request = attn_blocks + 4 * mamba_blocks_per_group + 1
+-    assert (
+-        kv_cache_utils._max_memory_usage_bytes_from_groups(vllm_config, groups)
+-        == blocks_per_request * bytes_per_block
+-    )
+-
+-
+-def test_glm5_kpool_tail_does_not_drag_hash_block_size():
+-    """The tail's kpool-sized scratch block (4 tokens) must not constrain the
+-    prefix-cache hash granularity: participating groups alone decide it."""
+-    model_config = ModelConfig(max_model_len=8192)
+-    vllm_config = VllmConfig(model_config=model_config)
+-
+-    def align_mamba():
+-        return new_mamba_spec(mamba_cache_mode="align")
+-
+-    groups = kv_cache_utils.get_kv_cache_groups(
+-        vllm_config, _glm5_like_kv_cache_spec_with_tail(align_mamba)
+-    )
+-    kv_cache_config = KVCacheConfig(
+-        num_blocks=1,
+-        kv_cache_tensors=[],
+-        kv_cache_groups=groups,
+-    )
+-    hash_vllm_config = SimpleNamespace(
+-        cache_config=SimpleNamespace(
+-            block_size=16,
+-            enable_prefix_caching=True,
+-            prefix_match_unit=None,
+-        ),
+-        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+-        kv_transfer_config=object(),
+-    )
+-    # gcd(attn 1024, mamba 16) with the tail's 4 excluded; scheduler size is
+-    # the lcm including the tail (1024 % 4 == 0, so it coincides).
+-    assert kv_cache_utils.resolve_kv_cache_block_sizes(
+-        kv_cache_config, hash_vllm_config
+-    ) == (1024, 16)
+-
+-
+-def test_get_kv_cache_config_mamba_hybrid_sharing_infeasible():
+-    """Reject GLM-5.3-Flash layouts whose Mamba page exceeds the MLA page."""
+-    model_config = ModelConfig(max_model_len=8192)
+-    vllm_config = VllmConfig(model_config=model_config)
+-
+-    # (512, 1024) fp32 state = 2 MiB per page > 1.125 MiB MLA page.
+-    def big_mamba_spec():
+-        return new_mamba_spec(shapes=((512, 1024),), dtypes=(torch.float32,))
+-
+-    kv_cache_spec, _ = _glm5_like_kv_cache_spec(big_mamba_spec)
+-    mla_page = kv_cache_spec["layers.3.attn"].page_size_bytes
+-    assert big_mamba_spec().page_size_bytes > mla_page
+-
+-    with pytest.raises(ValueError, match="does not fit the MLA page"):
+-        kv_cache_utils.get_kv_cache_groups(vllm_config, kv_cache_spec)
+-
+-
+-def test_get_kv_cache_config_mamba_hybrid_sharing_infeasible_no_indexer():
+-    """Use the generic layout error when no kpool indexer is present."""
+-    model_config = ModelConfig(max_model_len=8192)
+-    vllm_config = VllmConfig(model_config=model_config)
+-    vllm_config.cache_config.kv_cache_layout = "LBHNC"
+-
+-    kv_cache_spec: dict[str, KVCacheSpec] = {}
+-    for i in range(27):
+-        if i % 4 == 3 or i == 26:
+-            kv_cache_spec[f"layers.{i}.attn"] = MLAAttentionSpec(
+-                block_size=1024,
+-                num_kv_heads=1,
+-                head_size=576,
+-                dtype=torch.bfloat16,
+-            )
+-        else:
+-            kv_cache_spec[f"layers.{i}.linear_attn"] = new_mamba_spec(
+-                shapes=((512, 1024),), dtypes=(torch.float32,)
+-            )
+-    mla_page = kv_cache_spec["layers.3.attn"].page_size_bytes
+-    assert kv_cache_spec["layers.0.linear_attn"].page_size_bytes > mla_page
+-
+-    with pytest.raises(NotImplementedError, match="page size"):
+-        kv_cache_utils.get_kv_cache_groups(vllm_config, kv_cache_spec)
+-
+-
+-def test_get_kv_cache_config_mamba_hybrid_sharing_prepadded_mamba():
+-    """Platform-prepadded mamba pages (mamba_page_size_padded hint) must not
+-    disable slot sharing; the layout re-pads them to the MLA page."""
+-    model_config = ModelConfig(max_model_len=8192)
+-    vllm_config = VllmConfig(model_config=model_config)
+-
+-    def prepadded_mamba_spec():
+-        return new_mamba_spec(page_size_padded=294_912)
+-
+-    kv_cache_spec, _ = _glm5_like_kv_cache_spec(prepadded_mamba_spec)
+-    mla_page = kv_cache_spec["layers.3.attn"].page_size_bytes
+-    assert prepadded_mamba_spec().page_size_bytes < mla_page
+ 
+     groups = kv_cache_utils.get_kv_cache_groups(vllm_config, kv_cache_spec)
+-    mamba_groups = [
+-        group for group in groups if isinstance(group.kv_cache_spec, MambaSpec)
++    attn = [
++        g
++        for g in groups
++        if isinstance(g.kv_cache_spec, UniformTypeKVCacheSpecs)
++        and isinstance(g.kv_cache_spec.first_spec, MLAAttentionSpec)
+     ]
+-    assert len(groups) == 5
+-    assert [len(group.layer_names) for group in mamba_groups] == [9, 9, 8, 8]
+-    for group in mamba_groups:
+-        assert group.kv_cache_spec.page_size_bytes == mla_page
+-
+-    bytes_per_block = kv_cache_utils._pool_bytes_per_block(groups)
+-    kv_cache_config = kv_cache_utils.get_kv_cache_config_from_groups(
+-        vllm_config, groups, bytes_per_block * 100 + 1
+-    )
+-    assert kv_cache_config.num_blocks == 100
+-    assert len(kv_cache_config.kv_cache_tensors) == 56
+-
+-
+-def test_get_kv_cache_config_mamba_hybrid_sharing_pp_balanced_projection():
+-    """Round-robin mamba grouping keeps practical PP splits balanced: every
+-    stage's largest projected mamba group slice fits its projected MLA
+-    layers, so per-stage slot tensors all have an MLA owner."""
+-    model_config = ModelConfig(max_model_len=8192)
+-    vllm_config = VllmConfig(model_config=model_config)
+-
+-    kv_cache_spec, _ = _glm5_like_kv_cache_spec()
+-    global_groups = kv_cache_utils.get_kv_cache_groups(vllm_config, kv_cache_spec)
+-    mla_page = kv_cache_spec["layers.3.attn"].page_size_bytes
+-    idx_page = kv_cache_spec["layers.3.indexer"].page_size_bytes
+-
+-    # PP=2 split at transformer layer 22/23.
+-    # Stage 0 of a PP=2 split at transformer layer 22/23: 5 MLA(+indexer)
+-    # layers, projected mamba groups [5, 5, 4, 4].
+-    worker_spec = {n: s for n, s in kv_cache_spec.items() if int(n.split(".")[1]) <= 22}
+-    groups = kv_cache_utils._project_kv_cache_groups_to_worker(
+-        global_groups, worker_spec
+-    )
+-    mamba_groups = [
+-        group for group in groups if isinstance(group.kv_cache_spec, MambaSpec)
++    rings = [
++        g
++        for g in groups
++        if isinstance(g.kv_cache_spec, UniformTypeKVCacheSpecs)
++        and isinstance(g.kv_cache_spec.first_spec, CircularBufferSpec)
+     ]
+-    assert [len(group.layer_names) for group in mamba_groups] == [5, 5, 4, 4]
+-
+-    bytes_per_block = kv_cache_utils._pool_bytes_per_block(groups)
+-    assert bytes_per_block == 5 * mla_page + 5 * idx_page
+-
+-    kv_cache_config = kv_cache_utils.get_kv_cache_config_from_groups(
+-        vllm_config, groups, bytes_per_block * 100 + 1
+-    )
+-    assert kv_cache_config.num_blocks == 100
+-    tensors = _tensor_by_layer(kv_cache_config)
+-    # Every projected Mamba slot aliases an MLA owner.
+-    assert tensors["layers.3.attn"].offset == tensors["layers.0.linear_attn"].offset
+-    assert tensors["layers.3.attn"].offset == tensors["layers.1.linear_attn"].offset
+-    assert tensors["layers.3.attn"].offset == tensors["layers.2.linear_attn"].offset
+-    assert tensors["layers.3.attn"].offset == tensors["layers.4.linear_attn"].offset
+-    # The last slot only hosts the two groups with a 5th projected layer.
+-    assert tensors["layers.19.attn"].offset == tensors["layers.21.linear_attn"].offset
+-    assert tensors["layers.19.attn"].offset == tensors["layers.22.linear_attn"].offset
+-    assert {t.size for t in kv_cache_config.kv_cache_tensors} == {bytes_per_block * 100}
+-
+-
+-def test_get_kv_cache_config_mamba_hybrid_sharing_pp_group_count_bump(monkeypatch):
+-    """PP=4's default partition [11,11,12,11] leaves stage 0 with 2 MLA
+-    layers but a round-robin slice of 3 under the minimum 4 mamba groups;
+-    grouping bumps to 5 groups so every stage's projection keeps sharing
+-    on instead of silently falling back on stage 0."""
+-    from vllm.config import ParallelConfig
+-    from vllm.distributed.utils import get_pp_indices
+-
+-    monkeypatch.setattr(ModelConfig, "get_total_num_hidden_layers", lambda self: 45)
+-    vllm_config = VllmConfig(
+-        model_config=ModelConfig(max_model_len=8192),
+-        parallel_config=ParallelConfig(pipeline_parallel_size=4),
+-    )
+-
+-    kv_cache_spec, mamba_layers = _glm5_like_kv_cache_spec()
+-    groups = kv_cache_utils.get_kv_cache_groups(vllm_config, kv_cache_spec)
+-    mamba_groups = [g for g in groups if isinstance(g.kv_cache_spec, MambaSpec)]
+-    assert [len(g.layer_names) for g in mamba_groups] == [7, 7, 7, 7, 6]
+-    for k, name in enumerate(mamba_layers):
+-        assert name in mamba_groups[k % 5].layer_names
+-
+-    for rank in range(4):
+-        start, end = get_pp_indices(45, rank, 4)
+-        worker_spec = {
+-            n: s
+-            for n, s in kv_cache_spec.items()
+-            if start <= int(n.split(".")[1]) < end
+-        }
+-        projected = kv_cache_utils._project_kv_cache_groups_to_worker(
+-            groups, worker_spec
++    mamba = [
++        g
++        for g in groups
++        if isinstance(
++            getattr(g.kv_cache_spec, "first_spec", g.kv_cache_spec), MambaSpec
+         )
+-        assert kv_cache_utils._glm5_next_tensor_layout(projected) is not None
+-
+-
+-def test_get_kv_cache_config_mamba_hybrid_sharing_pp_starved_stage(monkeypatch):
+-    """Reject PP stages whose Mamba layers have no MLA slot to share."""
+-    from vllm.config import ParallelConfig
+-
+-    monkeypatch.setattr(ModelConfig, "get_total_num_hidden_layers", lambda self: 45)
+-    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "3,42")
+-    vllm_config = VllmConfig(
+-        model_config=ModelConfig(max_model_len=8192),
+-        parallel_config=ParallelConfig(pipeline_parallel_size=2),
+-    )
+-
+-    kv_cache_spec, _ = _glm5_like_kv_cache_spec()
+-    with pytest.raises(ValueError, match="VLLM_PP_LAYER_PARTITION"):
+-        kv_cache_utils.get_kv_cache_groups(vllm_config, kv_cache_spec)
+-
+-
+-def test_get_kv_cache_config_mamba_hybrid_sharing_beats_cross_layers_flag():
+-    """Hybrid slot sharing must take precedence over the experimental
+-    enable_cross_layers_blocks packed layout: generic packing would give the
+-    MLA slots a strided view, breaking the contiguous virtual split."""
+-    model_config = ModelConfig(max_model_len=8192)
+-    kv_transfer_config = KVTransferConfig(
+-        kv_connector="NixlConnector",
+-        kv_role="kv_both",
+-        kv_connector_extra_config={"enable_cross_layers_blocks": "true"},
+-    )
+-    vllm_config = VllmConfig(
+-        model_config=model_config, kv_transfer_config=kv_transfer_config
+-    )
+-
+-    kv_cache_spec, _ = _glm5_like_kv_cache_spec()
+-    groups = kv_cache_utils.get_kv_cache_groups(vllm_config, kv_cache_spec)
+-
+-    mla_page = kv_cache_spec["layers.3.attn"].page_size_bytes
+-    idx_page = kv_cache_spec["layers.3.indexer"].page_size_bytes
+-    bytes_per_block = kv_cache_utils._pool_bytes_per_block(groups)
+-    assert bytes_per_block == 11 * mla_page + 11 * idx_page
+-
+-    kv_cache_config = kv_cache_utils.get_kv_cache_config_from_groups(
+-        vllm_config, groups, bytes_per_block * 100 + 1
+-    )
+-    assert kv_cache_config.num_blocks == 100
+-    assert len(kv_cache_config.kv_cache_tensors) == 56
+-    assert all(
+-        tensor.block_stride in (mla_page, idx_page)
+-        for tensor in kv_cache_config.kv_cache_tensors
+-    )
+-    assert {t.size for t in kv_cache_config.kv_cache_tensors} == {bytes_per_block * 100}
+-
+-
+-def test_get_kv_cache_config_mamba_hybrid_sharing_no_indexer():
+-    """Kimi-Linear-like: MLA without indexer layers, idx_stride == 0."""
+-    model_config = ModelConfig(max_model_len=8192)
+-    vllm_config = VllmConfig(model_config=model_config)
+-    vllm_config.cache_config.kv_cache_layout = "LBNHC"
+-
+-    # 20 mamba + 7 MLA layers -> G = ceil(20 / 7) = 3 groups of [7, 7, 6].
+-    kv_cache_spec: dict[str, KVCacheSpec] = {}
+-    for i in range(27):
+-        if i % 4 == 3 or i == 26:
+-            kv_cache_spec[f"layers.{i}.attn"] = MLAAttentionSpec(
+-                block_size=1024,
+-                num_kv_heads=1,
+-                head_size=576,
+-                dtype=torch.bfloat16,
+-            )
+-        else:
+-            kv_cache_spec[f"layers.{i}.linear_attn"] = new_mamba_spec()
+-    mla_page = kv_cache_spec["layers.3.attn"].page_size_bytes
+-
+-    groups = kv_cache_utils.get_kv_cache_groups(vllm_config, kv_cache_spec)
+-    mamba_groups = [
+-        group for group in groups if isinstance(group.kv_cache_spec, MambaSpec)
+     ]
+-    assert len(groups) == 4
+-    assert [len(group.layer_names) for group in mamba_groups] == [7, 7, 6]
+-    for group in mamba_groups:
+-        assert group.kv_cache_spec.page_size_bytes == mla_page
+-
+-    bytes_per_block = kv_cache_utils._pool_bytes_per_block(groups)
+-    assert bytes_per_block == 7 * mla_page
++    assert len(attn) == 1 and len(attn[0].layer_names) == 22
++    assert len(rings) == 1 and len(rings[0].layer_names) == 11
++    # 11 * (1.18 MB MLA + 34 KB indexer) per block fits 12 fp32-SSM KDA states.
++    assert len(mamba) == 3
++    assert sum(len(g.layer_names) for g in mamba) == 34
+ 
+     kv_cache_config = kv_cache_utils.get_kv_cache_config_from_groups(
+-        vllm_config, groups, bytes_per_block * 100 + 1
++        vllm_config, groups, available_memory=2 * 1024**3
+     )
+-    assert kv_cache_config.num_blocks == 100
+-    # Each group has one tensor descriptor and all groups alias the same slots.
+-    assert len(kv_cache_config.kv_cache_tensors) == 4
+-    tensors = _tensor_by_layer(kv_cache_config)
+-    mla_names = [f"layers.{i}.attn" for i in (*range(3, 27, 4), 26)]
+-    for index, mla_name in enumerate(mla_names):
+-        mla_offset = _layer_offset(tensors[mla_name], mla_name)
+-        for group in mamba_groups:
+-            if index < len(group.layer_names):
+-                mamba_name = group.layer_names[index]
+-                assert _layer_offset(tensors[mamba_name], mamba_name) == mla_offset
+-    assert {t.size for t in kv_cache_config.kv_cache_tensors} == {bytes_per_block * 100}
++    strides = {t.block_stride for t in kv_cache_config.kv_cache_tensors}
++    assert len(strides) == 1
++    (block_stride,) = strides
++    # Blocks sit a whole number of 32-row MLA pages and 64-state indexer pages
++    # apart so both caches can be re-paged for their kernels.
++    assert block_stride % (32 * 576 * 2) == 0
++    assert block_stride % (64 * 132) == 0
+ 
+ 
+ def test_get_kv_cache_capacity_after_scheduler_unwrap():
+@@ -3127,6 +2701,7 @@ def test_get_kv_cache_capacity_after_scheduler_unwrap():
+     """
+     model_config = ModelConfig(max_model_len=8192)
+     vllm_config = VllmConfig(model_config=model_config)
++    vllm_config.cache_config.kv_cache_layout = "BLHNC"
+ 
+     kv_cache_spec: dict[str, KVCacheSpec] = {}
+     for i in range(45):
+@@ -3148,7 +2723,7 @@ def test_get_kv_cache_capacity_after_scheduler_unwrap():
+             kv_cache_spec[f"layers.{i}.linear_attn"] = new_mamba_spec()
+ 
+     groups = kv_cache_utils.get_kv_cache_groups(vllm_config, kv_cache_spec)
+-    bytes_per_block = kv_cache_utils._pool_bytes_per_block(groups)
++    bytes_per_block = kv_cache_utils._get_kv_cache_bytes_per_block(groups)
+     kv_cache_config = kv_cache_utils.get_kv_cache_config_from_groups(
+         vllm_config, groups, bytes_per_block * 100 + 1
+     )
+@@ -3165,7 +2740,7 @@ def test_get_kv_cache_capacity_after_scheduler_unwrap():
+     expected_max_mem = kv_cache_utils._max_memory_usage_bytes_from_groups(
+         vllm_config, unwrapped_groups
+     )
+-    expected_pool = kv_cache_utils._pool_bytes_per_block(unwrapped_groups)
++    expected_pool = kv_cache_utils._get_kv_cache_bytes_per_block(unwrapped_groups)
+     expected_blocks_per_request = (
+         expected_max_mem + expected_pool - 1
+     ) // expected_pool
+diff --git a/tests/v1/kv_connector/unit/test_mooncake_connector.py b/tests/v1/kv_connector/unit/test_mooncake_connector.py
+index 5a5fffac3d72..fc61cabded80 100644
+--- a/tests/v1/kv_connector/unit/test_mooncake_connector.py
++++ b/tests/v1/kv_connector/unit/test_mooncake_connector.py
+@@ -44,6 +44,8 @@
+     KVCacheConfig,
+     KVCacheGroupSpec,
+     KVCacheLayout,
++    KVCacheTensor,
++    MLAAttentionSpec,
+ )
+ from vllm.v1.request import RequestStatus
+ 
+@@ -1505,6 +1507,51 @@ def test_register_kv_caches(layout: KVCacheLayout, separate_kv_head_groups: bool
+                 assert worker.registered_layer_indices == [0, 1]
+ 
+ 
++def test_register_dense_kpool_cache_uses_transfer_page_stride():
++    layer_name = "model.layers.0.indexer"
++    spec = MLAAttentionSpec(
++        block_size=1024,
++        num_kv_heads=1,
++        head_size=128,
++        dtype=torch.uint8,
++        state_content_bytes=132,
++        tokens_per_state=4,
++        kernel_page_size=256,
++    )
++    logical_num_blocks = 2
++    transfer_ratio = 16
++    config = KVCacheConfig(
++        num_blocks=logical_num_blocks,
++        kv_cache_tensors=[
++            KVCacheTensor(
++                size=logical_num_blocks * spec.page_size_bytes,
++                layers=[layer_name],
++                layer_stride=logical_num_blocks * spec.page_size_bytes,
++                block_stride=spec.page_size_bytes,
++            )
++        ],
++        kv_cache_groups=[KVCacheGroupSpec([layer_name], spec)],
++    )
++    raw = torch.zeros(logical_num_blocks * spec.page_size_bytes, dtype=torch.int8)
++    cache = raw.view(8, 1, 64, 132)
++
++    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
++    worker.use_mla = True
++    worker.is_kv_consumer = True
++    worker.engine = MagicMock()
++    worker.engine.batch_register_memory.return_value = 0
++    worker.kv_cache_config = config
++    worker._layer_specs = {layer_name: spec}
++    worker._physical_blocks_per_logical_kv_block = transfer_ratio
++
++    worker.register_kv_caches({layer_name: cache})
++
++    transfer_page_bytes = spec.page_size_bytes // transfer_ratio
++    assert cache.stride(0) * cache.element_size() == 4 * transfer_page_bytes
++    assert worker.block_len_per_layer == [transfer_page_bytes]
++    assert worker.kv_block_len_per_layer == [transfer_page_bytes]
++
++
+ def test_register_kv_caches_supports_mixed_mla_and_eagle_shapes():
+     """Mixed MLA+Eagle caches should register by byte length, not shape."""
+     vllm_config = create_vllm_config(
+diff --git a/tests/v1/kv_connector/unit/test_mooncake_connector_hybrid_mamba.py b/tests/v1/kv_connector/unit/test_mooncake_connector_hybrid_mamba.py
+index 9376745516a9..d916a14b94d6 100644
+--- a/tests/v1/kv_connector/unit/test_mooncake_connector_hybrid_mamba.py
++++ b/tests/v1/kv_connector/unit/test_mooncake_connector_hybrid_mamba.py
+@@ -164,12 +164,19 @@ def test_register_kv_caches_emits_fa_and_gdn_regions(monkeypatch):
+         fa_spec = kv_cache_config.kv_cache_groups[0].kv_cache_spec
+         gdn_spec = kv_cache_config.kv_cache_groups[1].kv_cache_spec
+         fa_raw = torch.empty(num_blocks * fa_spec.page_size_bytes, dtype=torch.int8)
+-        gdn_raw = torch.empty(num_blocks * gdn_spec.page_size_bytes, dtype=torch.int8)
++        gdn_block_stride = gdn_spec.page_size_bytes + 64
+         (fa_cache,) = dense_kv_cache_views(
+             fa_raw, fa_spec, num_blocks, 1, KVCacheLayout.LBHNC
+         )
+-        (gdn_cache,) = dense_kv_cache_views(
+-            gdn_raw, gdn_spec, num_blocks, 1, KVCacheLayout.LBHNC
++        gdn_cache = torch.empty_strided(
++            size=(num_blocks, 1, 1, gdn_spec.page_size_bytes),
++            stride=(
++                gdn_block_stride,
++                gdn_spec.page_size_bytes,
++                gdn_spec.page_size_bytes,
++                1,
++            ),
++            dtype=torch.int8,
+         )
+ 
+         worker.register_kv_caches(
+@@ -185,6 +192,10 @@ def test_register_kv_caches_emits_fa_and_gdn_regions(monkeypatch):
+             "model.layers.1.linear_attn",
+         ]
+         assert worker.block_len_per_layer == [
++            fa_spec.page_size_bytes,
++            gdn_block_stride,
++        ]
++        assert worker.kv_block_len_per_layer == [
+             fa_spec.page_size_bytes,
+             gdn_spec.page_size_bytes,
+         ]
+diff --git a/tests/v1/kv_connector/unit/test_mooncake_store_hma_e2e.py b/tests/v1/kv_connector/unit/test_mooncake_store_hma_e2e.py
+index 6c2cff0a542c..a8354390d71e 100644
+--- a/tests/v1/kv_connector/unit/test_mooncake_store_hma_e2e.py
++++ b/tests/v1/kv_connector/unit/test_mooncake_store_hma_e2e.py
+@@ -31,7 +31,6 @@
+ from vllm.v1.kv_cache_interface import (
+     CircularBufferSpec,
+     FullAttentionSpec,
+-    KpoolTailSpec,
+     KVCacheConfig,
+     KVCacheGroupSpec,
+     KVCacheTensor,
+@@ -711,13 +710,12 @@ def test_worker_setup_tolerates_finer_scratch_group():
+         mamba_cache_mode="align",
+     )
+     # Scratch block 4 is not divisible by the hash unit 8 below.
+-    scratch = KpoolTailSpec(
++    scratch = CircularBufferSpec(
+         block_size=4,
+         num_kv_heads=2,
+         head_size=64,
+         head_size_v=0,
+         dtype=torch.bfloat16,
+-        sliding_window=4,
+     )
+     cfg = KVCacheConfig(
+         num_blocks=4,
+diff --git a/tests/v1/kv_connector/unit/test_nixl_connector.py b/tests/v1/kv_connector/unit/test_nixl_connector.py
+index 017dee10d8b1..0ce566486c70 100644
+--- a/tests/v1/kv_connector/unit/test_nixl_connector.py
++++ b/tests/v1/kv_connector/unit/test_nixl_connector.py
+@@ -674,8 +674,8 @@ def test_pcp_producer_exposes_dcp_shards_or_canonical_replica(
+         with (
+             patch(
+                 "vllm.distributed.kv_transfer.kv_connector.v1.nixl."
+-                "base_worker.get_current_attn_backends",
+-                return_value=[FlashAttentionBackend],
++                "base_worker.get_current_attn_backend_layouts",
++                return_value=[(FlashAttentionBackend, None, False)],
+             ),
+             patch(
+                 "vllm.distributed.kv_transfer.kv_connector.v1.nixl."
+@@ -2228,9 +2228,11 @@ def test_register_kv_caches(
+         patch(f"{nixl_worker}.NixlWrapper") as mock_nixl_wrapper,
+         patch(f"{nixl_worker}.threading.Event"),
+         patch(f"{nixl_worker}.threading.Thread") as mock_thread,
+-        patch(f"{nixl_worker}.get_current_attn_backends") as mock_get_attn_backends,
++        patch(
++            f"{nixl_worker}.get_current_attn_backend_layouts"
++        ) as mock_get_attn_backends,
+     ):
+-        mock_get_attn_backends.return_value = [backend_cls]
++        mock_get_attn_backends.return_value = [(backend_cls, None, False)]
+         block_size = 16
+         num_blocks = 8
+         num_heads = 4
+@@ -2368,9 +2370,9 @@ def test_register_packed_dsv4_mla_cache_as_single_region(
+         patch(f"{nixl_worker}.NixlWrapper") as mock_nixl_wrapper,
+         patch(f"{nixl_worker}.threading.Event"),
+         patch(f"{nixl_worker}.threading.Thread") as mock_thread,
+-        patch(f"{nixl_worker}.get_current_attn_backends") as mock_backends,
++        patch(f"{nixl_worker}.get_current_attn_backend_layouts") as mock_backends,
+     ):
+-        mock_backends.return_value = [TritonAttentionBackend]
++        mock_backends.return_value = [(TritonAttentionBackend, None, False)]
+         num_blocks = 2
+         num_layers = 4
+         block_size = 256
+@@ -2709,7 +2711,9 @@ def setup(self, monkeypatch):
+             patch.object(bw, "get_tensor_model_parallel_rank", return_value=0),
+             patch.object(bw, "get_tensor_model_parallel_world_size", return_value=1),
+             patch.object(
+-                bw, "get_current_attn_backends", return_value=[FlashAttentionBackend]
++                bw,
++                "get_current_attn_backend_layouts",
++                return_value=[(FlashAttentionBackend, None, False)],
+             ),
+         ):
+             self.worker = FakeNixlConnectorWorker(config, "local", hand_shake_latency=0)
+diff --git a/tests/v1/kv_connector/unit/test_nixl_connector_hma.py b/tests/v1/kv_connector/unit/test_nixl_connector_hma.py
+index 125dfa614315..dcfedb143fda 100644
+--- a/tests/v1/kv_connector/unit/test_nixl_connector_hma.py
++++ b/tests/v1/kv_connector/unit/test_nixl_connector_hma.py
+@@ -2187,7 +2187,11 @@ def test_nixl_keeps_device_block_count_with_hisparse_host_pool(kernel_block_size
+         patch.object(bw, "NixlWrapper"),
+         patch.object(bw, "get_tensor_model_parallel_rank", return_value=0),
+         patch.object(bw, "get_tensor_model_parallel_world_size", return_value=1),
+-        patch.object(bw, "get_current_attn_backends", return_value=[fake_backend]),
++        patch.object(
++            bw,
++            "get_current_attn_backend_layouts",
++            return_value=[(fake_backend, None, False)],
++        ),
+         patch.object(bw, "current_platform", fake_platform),
+         set_current_vllm_config(vllm_config),
+     ):
+@@ -2253,7 +2257,11 @@ def test_register_kv_caches_hybrid_mla_dual_purpose_regions():
+         patch.object(bw, "NixlWrapper"),
+         patch.object(bw, "get_tensor_model_parallel_rank", return_value=0),
+         patch.object(bw, "get_tensor_model_parallel_world_size", return_value=1),
+-        patch.object(bw, "get_current_attn_backends", return_value=[fake_backend]),
++        patch.object(
++            bw,
++            "get_current_attn_backend_layouts",
++            return_value=[(fake_backend, None, False)],
++        ),
+         patch.object(bw, "current_platform", fake_platform),
+         patch(
+             "vllm.model_executor.layers.mamba.mamba_utils.get_conv_state_layout",
+diff --git a/tests/v1/kv_connector/unit/test_nixl_desc_geometry.py b/tests/v1/kv_connector/unit/test_nixl_desc_geometry.py
+index 029ffafd3ceb..7d5afa30996a 100644
+--- a/tests/v1/kv_connector/unit/test_nixl_desc_geometry.py
++++ b/tests/v1/kv_connector/unit/test_nixl_desc_geometry.py
+@@ -126,10 +126,11 @@ def _make_packed_mla_view_worker(
+     num_blocks=4,
+     pp_size=1,
+     backend_names=("FLASHMLA",),
++    padding_bytes=0,
+ ):
+     """Register real strided views; only NIXL and distributed runtime are fake."""
+     block_size = 16
+-    raw = torch.zeros(num_blocks * block_stride, dtype=torch.int8)
++    raw = torch.zeros(num_blocks * block_stride + padding_bytes, dtype=torch.int8)
+     tensors, groups, caches = [], [], {}
+     for name, (offset, page_size) in layouts.items():
+         spec = MLAAttentionSpec(
+@@ -162,11 +163,19 @@ def _make_packed_mla_view_worker(
+         backend.get_name.return_value = name
+         backend.full_cls_name.return_value = f"fake.{name}"
+         backends.append(backend)
++    backend_layouts = [
++        (backend, groups[index % len(groups)].kv_cache_spec, False)
++        for index, backend in enumerate(backends)
++    ]
+     with (
+         patch.object(bw, "NixlWrapper", _RecordingNixl),
+         patch.object(bw, "get_tensor_model_parallel_rank", return_value=0),
+         patch.object(bw, "get_tensor_model_parallel_world_size", return_value=1),
+-        patch.object(bw, "get_current_attn_backends", return_value=backends),
++        patch.object(
++            bw,
++            "get_current_attn_backend_layouts",
++            return_value=backend_layouts,
++        ),
+         patch("threading.Thread"),
+     ):
+         worker = NixlPushConnectorWorker(
+@@ -180,11 +189,13 @@ def _make_packed_mla_view_worker(
+ 
+ 
+ @pytest.mark.cpu_test
+-@pytest.mark.parametrize("num_layers", [1, 2])
+-def test_packed_mla_pp1_push_peer_transfers_whole_rows(num_layers):
++@pytest.mark.parametrize("num_layers, padding_bytes", [(1, 0), (2, 0), (1, 64)])
++def test_packed_mla_pp1_push_peer_transfers_whole_rows(num_layers, padding_bytes):
+     layouts = {f"L{i}": (i * 128, 128) for i in range(num_layers)}
+     stride = num_layers * 128
+-    worker, raw = _make_packed_mla_view_worker(layouts, stride)
++    worker, raw = _make_packed_mla_view_worker(
++        layouts, stride, padding_bytes=padding_bytes
++    )
+     assert worker._registered_descs == [[(raw.data_ptr(), raw.nbytes, 0, "")]]
+     assert worker.src_blocks_data.tolist() == [
+         [raw.data_ptr() + block * stride, stride, 0] for block in range(4)
+@@ -220,6 +231,19 @@ def test_packed_push_compatibility_hash_uses_all_backends_in_stable_order(
+     assert (producer.compat_hash == consumer.compat_hash) is compatible
+ 
+ 
++@pytest.mark.cpu_test
++def test_packed_push_compatibility_hash_deduplicates_backend_names():
++    single, _ = _make_packed_mla_view_worker(
++        {"L0": (0, 128)}, 128, backend_names=("FLASHMLA",)
++    )
++    repeated, _ = _make_packed_mla_view_worker(
++        {"L0": (0, 128), "L1": (128, 64)},
++        192,
++        backend_names=("FLASHMLA", "FLASHMLA"),
++    )
++    assert single.compat_hash == repeated.compat_hash
++
++
+ @pytest.mark.cpu_test
+ @pytest.mark.parametrize("p_num_blocks, d_num_blocks", [(4, 4), (4, 6), (6, 4)])
+ def test_packed_mla_pp_pairs_asymmetric_strides_and_overlapping_layers(
+@@ -603,7 +627,11 @@ def _make_mla_hybrid_worker(local_block_size, kernel_block_size, num_logical_blo
+         patch.object(bw, "NixlWrapper", _RecordingNixl),
+         patch.object(bw, "get_tensor_model_parallel_rank", return_value=0),
+         patch.object(bw, "get_tensor_model_parallel_world_size", return_value=1),
+-        patch.object(bw, "get_current_attn_backends", return_value=[fake_backend]),
++        patch.object(
++            bw,
++            "get_current_attn_backend_layouts",
++            return_value=[(fake_backend, None, False)],
++        ),
+         patch.object(bw, "current_platform", fake_platform),
+         patch(
+             "vllm.model_executor.layers.mamba.mamba_utils.get_conv_state_layout",
+@@ -641,164 +669,228 @@ def _make_mla_hybrid_worker(local_block_size, kernel_block_size, num_logical_blo
+ 
+ 
+ @pytest.mark.cpu_test
+-@pytest.mark.parametrize("logical_block_size", [1152, 640])
+-@pytest.mark.parametrize("tail_first", [False, True])
+-def test_register_compressed_indexer_uses_virtual_transfer_pages(
+-    logical_block_size, tail_first
+-):
+-    """Compressed indexer rows must split into contiguous NIXL transfer pages."""
+-    from unittest.mock import MagicMock
++def test_flashmla_manager_block_is_preserved_for_nixl():
++    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
++        NixlBaseConnectorWorker,
++    )
++    from vllm.v1.attention.backends.mla.flashmla_sparse import (
++        FlashMLASparseBackend,
++    )
++    from vllm.v1.kv_cache_interface import MLAAttentionSpec
+ 
+-    from vllm.config import set_current_vllm_config
+-    from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
+-        base_worker as bw,
++    worker = object.__new__(NixlBaseConnectorWorker)
++    worker.block_size = 1152
++    worker.num_blocks = 2
++    worker._physical_blocks_per_logical_kv_block = 1
++    spec = MLAAttentionSpec(
++        block_size=1152,
++        num_kv_heads=1,
++        head_size=512,
++        dtype=torch.bfloat16,
+     )
+-    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
+-        NixlConnectorWorker,
++    worker.attn_backend_layouts = [(FlashMLASparseBackend, spec, True)]
++
++    worker._sync_block_size_with_kernel()
++
++    assert worker.block_size == 1152
++    assert worker.num_blocks == 2
++    assert worker._physical_blocks_per_logical_kv_block == 1
++
++
++@pytest.mark.cpu_test
++def test_glm_packed_backends_preserve_manager_blocks_for_nixl():
++    from vllm.distributed.kv_transfer.kv_connector import utils as connector_utils
++    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
++        NixlBaseConnectorWorker,
++    )
++    from vllm.v1.attention.backends.gdn_attn import GDNAttentionBackend
++    from vllm.v1.attention.backends.mla.flashmla_sparse import (
++        FlashMLASparseBackend,
+     )
++    from vllm.v1.attention.backends.mla.indexer import (
++        DeepseekV32IndexerBackend,
++        KpoolTailBackend,
++    )
++    from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+     from vllm.v1.kv_cache_interface import (
+-        KpoolTailSpec,
++        CircularBufferSpec,
+         KVCacheConfig,
+         KVCacheGroupSpec,
+-        KVCacheLayout,
+         KVCacheTensor,
++        MambaSpec,
+         MLAAttentionSpec,
+-        UniformTypeKVCacheSpecs,
+-        create_kv_cache_views,
+     )
+ 
+-    num_logical_blocks = 3
+-    transfer_block_size = 64
+-    kernel_block_size = 128
+-    tokens_per_state = 4
+-    state_content_bytes = 132
+-
+-    indexer_spec = MLAAttentionSpec(
+-        block_size=logical_block_size,
+-        num_kv_heads=1,
+-        head_size=128,
+-        head_size_v=0,
+-        dtype=torch.uint8,
+-        state_content_bytes=state_content_bytes,
+-        tokens_per_state=tokens_per_state,
+-    )
+-    indexer_page_size = indexer_spec.page_size_bytes
+-    tail_spec = KpoolTailSpec(
+-        block_size=tokens_per_state,
+-        num_kv_heads=2,
+-        head_size=128,
+-        head_size_v=0,
+-        dtype=torch.bfloat16,
+-        page_size_padded=indexer_page_size,
+-        sliding_window=tokens_per_state,
++    manager_block_size = 1024
++    specs = {
++        "mla": MLAAttentionSpec(
++            block_size=manager_block_size,
++            num_kv_heads=1,
++            head_size=512,
++            dtype=torch.bfloat16,
++        ),
++        "indexer": MLAAttentionSpec(
++            block_size=manager_block_size,
++            num_kv_heads=1,
++            head_size=128,
++            dtype=torch.uint8,
++            state_content_bytes=132,
++            tokens_per_state=4,
++            kernel_page_size=256,
++        ),
++        "tail": CircularBufferSpec(
++            block_size=16,
++            num_kv_heads=1,
++            head_size=128,
++            dtype=torch.bfloat16,
++        ),
++        "gdn": MambaSpec(
++            block_size=manager_block_size,
++            shapes=((8, 3), (1, 4, 4)),
++            dtypes=(torch.float16, torch.float32),
++            page_size_padded=256,
++            mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
++        ),
++    }
++    backends = {
++        "mla": FlashMLASparseBackend,
++        "indexer": DeepseekV32IndexerBackend,
++        "tail": KpoolTailBackend,
++        "gdn": GDNAttentionBackend,
++    }
++    packed_stride = sum(spec.page_size_bytes for spec in specs.values())
++    config = KVCacheConfig(
++        num_blocks=2,
++        kv_cache_tensors=[
++            KVCacheTensor(
++                size=2 * packed_stride,
++                layers=[name],
++                layer_stride=2 * packed_stride,
++                block_stride=packed_stride,
++            )
++            for name in specs
++        ],
++        kv_cache_groups=[
++            KVCacheGroupSpec([name], spec) for name, spec in specs.items()
++        ],
+     )
++    layers = {
++        name: SimpleNamespace(get_attn_backend=lambda backend=backend: backend)
++        for name, backend in backends.items()
++    }
++    with patch.object(
++        connector_utils, "get_layers_from_vllm_config", return_value=layers
++    ):
++        layouts = connector_utils.get_current_attn_backend_layouts(MagicMock(), config)
+ 
+-    allocation_size = num_logical_blocks * indexer_page_size
+-    indexer_tensor = KVCacheTensor(
+-        size=allocation_size,
+-        layers=["indexer"],
+-        layer_stride=allocation_size,
+-        block_stride=indexer_page_size,
++    assert layouts == [
++        (backends["mla"], specs["mla"], True),
++        (backends["indexer"], specs["indexer"], True),
++        (backends["tail"], specs["tail"], True),
++        (backends["gdn"], None, False),
++    ]
++
++    worker = object.__new__(NixlBaseConnectorWorker)
++    worker.block_size = manager_block_size
++    worker.num_blocks = 2
++    worker._physical_blocks_per_logical_kv_block = 1
++    worker.attn_backend_layouts = layouts
++    worker._sync_block_size_with_kernel()
++
++    assert worker.block_size == manager_block_size
++    assert worker.num_blocks == 2
++    assert worker._physical_blocks_per_logical_kv_block == 1
++
++
++@pytest.mark.cpu_test
++@pytest.mark.parametrize(
++    ("stride_pages", "expected"),
++    [((2, 2), True), ((1, 2), True), ((1, 1), False)],
++)
++def test_connector_layout_tracks_any_strided_layer(stride_pages, expected):
++    from vllm.distributed.kv_transfer.kv_connector import utils as connector_utils
++    from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseBackend
++    from vllm.v1.kv_cache_interface import (
++        KVCacheConfig,
++        KVCacheGroupSpec,
++        KVCacheTensor,
++        MLAAttentionSpec,
+     )
+-    tail_tensor = KVCacheTensor(
+-        size=allocation_size,
+-        layers=["tail"],
+-        layer_stride=allocation_size,
+-        block_stride=indexer_page_size,
++    from vllm.v1.worker.utils import select_common_block_size_for_layout
++
++    spec = MLAAttentionSpec(
++        block_size=256, num_kv_heads=1, head_size=512, dtype=torch.bfloat16
+     )
+-    kv_cache_config = KVCacheConfig(
+-        num_blocks=num_logical_blocks,
+-        kv_cache_tensors=[indexer_tensor, tail_tensor],
+-        kv_cache_groups=[
+-            KVCacheGroupSpec(
+-                ["indexer"],
+-                UniformTypeKVCacheSpecs(
+-                    block_size=logical_block_size,
+-                    kv_cache_specs={"indexer": indexer_spec},
+-                ),
+-            ),
+-            KVCacheGroupSpec(
+-                ["tail"],
+-                UniformTypeKVCacheSpecs(
+-                    block_size=tokens_per_state,
+-                    kv_cache_specs={"tail": tail_spec},
+-                ),
+-            ),
++    page_size = spec.page_size_bytes
++    names = ["layer.0", "layer.1"]
++    config = KVCacheConfig(
++        num_blocks=2,
++        kv_cache_tensors=[
++            KVCacheTensor(
++                size=4 * page_size,
++                layers=[name],
++                layer_stride=4 * page_size,
++                block_stride=stride * page_size,
++            )
++            for name, stride in zip(names, stride_pages, strict=True)
+         ],
++        kv_cache_groups=[KVCacheGroupSpec(names, spec)],
+     )
++    layers = {
++        name: SimpleNamespace(get_attn_backend=lambda: FlashMLASparseBackend)
++        for name in names
++    }
++    with patch.object(
++        connector_utils, "get_layers_from_vllm_config", return_value=layers
++    ):
++        layouts = connector_utils.get_current_attn_backend_layouts(MagicMock(), config)
+ 
+-    raw = torch.zeros(allocation_size, dtype=torch.int8)
+-    (indexer_cache,) = create_kv_cache_views(
+-        raw,
+-        indexer_spec,
+-        num_logical_blocks,
+-        KVCacheLayout.LBHNC,
+-        indexer_tensor,
+-        kernel_block_size=kernel_block_size,
+-    )
+-    (tail_cache,) = create_kv_cache_views(
+-        raw,
+-        tail_spec,
+-        num_logical_blocks,
+-        KVCacheLayout.LBHNC,
+-        tail_tensor,
++    assert layouts == [(FlashMLASparseBackend, spec, expected)]
++    assert select_common_block_size_for_layout(256, layouts) == (
++        256 if expected else 64
+     )
+-    assert indexer_cache.data_ptr() == tail_cache.data_ptr() == raw.data_ptr()
+ 
+-    vllm_config = create_vllm_config(block_size=logical_block_size)
+-    vllm_config.cache_config.kv_cache_layout = "LBHNC"
+-    vllm_config.kv_transfer_config.kv_buffer_device = "cuda"
+-    fake_backend = MagicMock()
+-    fake_backend.get_supported_kernel_block_sizes.return_value = [transfer_block_size]
+-    fake_backend.get_name.return_value = "DEEPSEEK_V32_INDEXER"
+-    fake_backend.full_cls_name.return_value = "fake.DEEPSEEK_V32_INDEXER"
+-    fake_platform = MagicMock()
+-    fake_platform.device_type = "cuda"
+-    fake_platform.get_nixl_memory_type.return_value = "VRAM"
+ 
+-    caches = [("indexer", indexer_cache), ("tail", tail_cache)]
+-    if tail_first:
+-        caches.reverse()
++@pytest.mark.cpu_test
++def test_host_staging_copies_only_each_cache_group():
++    from types import SimpleNamespace
+ 
+-    with (
+-        patch.object(bw, "NixlWrapper", _RecordingNixl),
+-        patch.object(bw, "get_tensor_model_parallel_rank", return_value=0),
+-        patch.object(bw, "get_tensor_model_parallel_world_size", return_value=1),
+-        patch.object(bw, "get_current_attn_backends", return_value=[fake_backend]),
+-        patch.object(bw, "current_platform", fake_platform),
+-        set_current_vllm_config(vllm_config),
+-    ):
+-        worker = NixlConnectorWorker(vllm_config, "local-engine", kv_cache_config)
+-        worker.use_mla = True
+-        worker.register_kv_caches(dict(caches))
+-
+-    transfer_page_size = transfer_block_size // tokens_per_state * state_content_bytes
+-    num_transfer_blocks = num_logical_blocks * (
+-        logical_block_size // transfer_block_size
+-    )
+-    expected_descs = np.asarray(
+-        [
+-            [
+-                raw.data_ptr() + block_idx * transfer_page_size,
+-                transfer_page_size,
+-                0,
+-            ]
+-            for block_idx in range(num_transfer_blocks)
+-        ],
+-        dtype=np.uint64,
++    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
++        NixlBaseConnectorWorker,
++    )
++
++    worker = object.__new__(NixlBaseConnectorWorker)
++    worker.use_host_buffer = True
++    worker.copy_blocks = MagicMock()
++    worker._physical_blocks_per_logical_kv_block = 1
++    worker.device_kv_caches = {"full": MagicMock(), "sliding": MagicMock()}
++    worker.host_xfer_buffers = {"full": MagicMock(), "sliding": MagicMock()}
++    worker.kv_cache_config = SimpleNamespace(
++        transfer_groups=[
++            SimpleNamespace(layer_names=["full"]),
++            SimpleNamespace(layer_names=["sliding"]),
++        ]
++    )
++
++    block_ids = ([0], [1])
++    worker.sync_recved_kv_to_device(
++        "request", SimpleNamespace(local_physical_block_ids=block_ids)
+     )
++    assert [set(call.args[0]) for call in worker.copy_blocks.call_args_list] == [
++        {"full"},
++        {"sliding"},
++    ]
+ 
+-    assert worker.block_size == transfer_block_size
+-    assert worker.num_regions == 1
+-    assert worker.block_len_per_layer == [transfer_page_size]
+-    assert worker.block_stride_per_layer == [transfer_page_size]
+-    assert worker._region_is_mla == [True]
+-    assert worker.kv_caches_base_addr[worker.engine_id][0] == [raw.data_ptr()]
+-    assert worker._registered_descs[0] == [(raw.data_ptr(), raw.nbytes, 0, "")]
+-    np.testing.assert_array_equal(worker.src_blocks_data, expected_descs)
+-    assert expected_descs[-1, 0] + expected_descs[-1, 1] == (
+-        raw.data_ptr() + raw.nbytes
++    worker.copy_blocks.reset_mock()
++    worker.save_kv_to_host(
++        SimpleNamespace(
++            reqs_to_save={"request": SimpleNamespace(local_block_ids=block_ids)}
++        )
+     )
++    assert [set(call.args[0]) for call in worker.copy_blocks.call_args_list] == [
++        {"full"},
++        {"sliding"},
++    ]
+ 
+ 
+ def _make_remote_meta(
+@@ -1363,6 +1455,8 @@ def group(specs):
+     )
+ 
+     vllm_config = create_vllm_config(block_size=4)
++    # The config is created for the host before the fake CUDA platform is active.
++    vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = False
+     vllm_config.cache_config.enable_prefix_caching = False
+     vllm_config.kv_transfer_config.kv_buffer_device = "cuda"
+     fake_backend = MagicMock()
+@@ -1377,7 +1471,11 @@ def group(specs):
+         patch.object(bw, "NixlWrapper", _RecordingNixl),
+         patch.object(bw, "get_tensor_model_parallel_rank", return_value=0),
+         patch.object(bw, "get_tensor_model_parallel_world_size", return_value=1),
+-        patch.object(bw, "get_current_attn_backends", return_value=[fake_backend]),
++        patch.object(
++            bw,
++            "get_current_attn_backend_layouts",
++            return_value=[(fake_backend, None, False)],
++        ),
+         patch.object(bw, "current_platform", fake_platform),
+         patch(
+             "vllm.model_executor.layers.mamba.mamba_utils.get_conv_state_layout",
+@@ -1588,7 +1686,10 @@ def group(specs):
+     # Both rings overlay the second paged region, so the scratch group must
+     # address only that region while the paged group spans both.
+     tensor_regions = (("paged.0",), ("paged.1", "ring.0", "ring.1"))
+-    region_size, page_size = 512, 256
++    page_size = max(
++        spec.page_size_bytes for spec in (*paged_specs.values(), *ring_specs.values())
++    )
++    region_size = 2 * page_size
+     kv_cache_config = KVCacheConfig(
+         num_blocks=2,
+         kv_cache_tensors=[
+@@ -1620,12 +1721,16 @@ def group(specs):
+         patch.object(bw, "NixlWrapper", _RecordingNixl),
+         patch.object(bw, "get_tensor_model_parallel_rank", return_value=0),
+         patch.object(bw, "get_tensor_model_parallel_world_size", return_value=1),
+-        patch.object(bw, "get_current_attn_backends", return_value=[fake_backend]),
++        patch.object(
++            bw,
++            "get_current_attn_backend_layouts",
++            return_value=[(fake_backend, None, False)],
++        ),
+         patch.object(bw, "current_platform", fake_platform),
+         set_current_vllm_config(vllm_config),
+     ):
+         worker = NixlConnectorWorker(vllm_config, "local-engine", kv_cache_config)
+-        tensors = [torch.zeros((2, 256), dtype=torch.uint8) for _ in range(2)]
++        tensors = [torch.zeros((2, page_size), dtype=torch.uint8) for _ in range(2)]
+         worker.register_kv_caches(
+             {
+                 layer_name: tensors[region_index]
+diff --git a/tests/v1/simple_kv_offload/test_scheduler.py b/tests/v1/simple_kv_offload/test_scheduler.py
+index 3817a15e3ea6..09793c02a8f8 100644
+--- a/tests/v1/simple_kv_offload/test_scheduler.py
++++ b/tests/v1/simple_kv_offload/test_scheduler.py
+@@ -43,7 +43,6 @@
+ from vllm.v1.kv_cache_interface import (
+     CircularBufferSpec,
+     FullAttentionSpec,
+-    KpoolTailSpec,
+     KVCacheConfig,
+     KVCacheGroupSpec,
+     KVCacheTensor,
+@@ -140,13 +139,12 @@ def _make_scratch_kv_cache_config(
+     register_all_kvcache_specs(vllm_config=None)
+     fa_config = _make_kv_cache_config(num_blocks, num_groups=1)
+     scratch_layers = ["layer_scratch"]
+-    scratch_spec = KpoolTailSpec(
++    scratch_spec = CircularBufferSpec(
+         block_size=scratch_block_size,
+         num_kv_heads=2,
+         head_size=HEAD_SIZE,
+         head_size_v=0,
+         dtype=DTYPE,
+-        sliding_window=scratch_block_size,
+     )
+     assert not scratch_spec.prefix_cacheable
+     scratch_bytes = scratch_spec.page_size_bytes * num_blocks
+diff --git a/tests/v1/spec_decode/test_llm_base_proposer.py b/tests/v1/spec_decode/test_llm_base_proposer.py
+index 5510c36e60d2..841a6f4bbf4b 100644
+--- a/tests/v1/spec_decode/test_llm_base_proposer.py
++++ b/tests/v1/spec_decode/test_llm_base_proposer.py
+@@ -20,6 +20,7 @@
+ 
+ SCHEDULER_BLOCK_SIZE = 256
+ KERNEL_BLOCK_SIZE = 64
++BLOCK_STRIDE_BYTES = 4096
+ 
+ 
+ class _FakeAttentionGroup:
+@@ -29,9 +30,17 @@ def __init__(self, backend, layer_names, kv_cache_spec, kv_cache_group_id):
+         self.kv_cache_spec = kv_cache_spec
+         self.kv_cache_group_id = kv_cache_group_id
+         self.kernel_block_size = None
+-
+-    def create_metadata_builders(self, vllm_config, device, kernel_block_size=None):
++        self.block_stride_bytes = None
++
++    def create_metadata_builders(
++        self,
++        vllm_config,
++        device,
++        kernel_block_size=None,
++        block_stride_bytes=None,
++    ):
+         self.kernel_block_size = kernel_block_size
++        self.block_stride_bytes = block_stride_bytes
+ 
+     def get_metadata_builder(self):
+         return SimpleNamespace(kv_cache_spec=self.kv_cache_spec)
+@@ -64,7 +73,8 @@ def _make_proposer(
+ def _make_kv_cache_config(layer_names: set[str]) -> SimpleNamespace:
+     spec = SimpleNamespace(block_size=SCHEDULER_BLOCK_SIZE)
+     group = SimpleNamespace(layer_names=list(layer_names), kv_cache_spec=spec)
+-    return SimpleNamespace(kv_cache_groups=[group])
++    tensor = SimpleNamespace(layers=list(layer_names), block_stride=BLOCK_STRIDE_BYTES)
++    return SimpleNamespace(kv_cache_groups=[group], kv_cache_tensors=[tensor])
+ 
+ 
+ def test_block_size_uses_kernel_block_size(monkeypatch: pytest.MonkeyPatch):
+@@ -82,6 +92,7 @@ def test_block_size_uses_kernel_block_size(monkeypatch: pytest.MonkeyPatch):
+     assert proposer.block_size != SCHEDULER_BLOCK_SIZE
+     # The metadata builder keeps receiving the kernel block size as well.
+     assert proposer.draft_attn_groups[0].kernel_block_size == KERNEL_BLOCK_SIZE
++    assert proposer.draft_attn_groups[0].block_stride_bytes == BLOCK_STRIDE_BYTES
+ 
+ 
+ def test_block_size_falls_back_to_kv_cache_spec(monkeypatch: pytest.MonkeyPatch):
+diff --git a/tests/v1/worker/test_attn_utils.py b/tests/v1/worker/test_attn_utils.py
+index 73a0131915ac..e6eb12e6c716 100644
+--- a/tests/v1/worker/test_attn_utils.py
++++ b/tests/v1/worker/test_attn_utils.py
+@@ -29,6 +29,7 @@
+     KVCacheTensor,
+     MLAAttentionSpec,
+     SparseCacheRole,
++    UniformTypeKVCacheSpecs,
+     compute_layout_strides,
+ )
+ from vllm.v1.worker.gpu import attn_utils
+@@ -42,6 +43,9 @@
+     AttentionGroup,
+     allocate_kv_cache,
+     copy_kv_cache_blocks_inplace,
++    group_block_stride_bytes,
++    prepare_kernel_block_sizes,
++    select_common_block_size_for_layout,
+ )
+ 
+ 
+@@ -79,7 +83,7 @@ def test_get_kv_cache_spec_resolves_hisparse_block_size(
+         backend = SimpleNamespace(
+             get_name=lambda name=name: name,
+             customize_spec=AttentionBackend.customize_spec,
+-            get_supported_kernel_block_sizes=lambda sizes=sizes: sizes,
++            get_supported_kernel_block_sizes=lambda _spec=None, sizes=sizes: sizes,
+         )
+         layers[name] = SimpleNamespace(
+             get_kv_cache_spec=lambda _, spec=specs[name]: spec,
+@@ -451,20 +455,21 @@ def test_reshape_padded_kv_cache_strides_by_padded_page():
+ @pytest.mark.parametrize(
+     (
+         "kernel_block_sizes",
+-        "storage_block_size",
++        "kernel_page_size",
+         "expected_num_blocks",
+         "expected_num_states",
+     ),
+     [
+         (None, None, 4, 64),
+         ([256], None, 4, 64),
++        ([128], 128, 8, 32),
++        ([256], 256, 4, 64),
+         ([64], None, 16, 16),
+-        ([64], 256, 4, 64),
+     ],
+ )
+ def test_allocate_compressed_mla_cache(
+     kernel_block_sizes: list[int] | None,
+-    storage_block_size: int | None,
++    kernel_page_size: int | None,
+     expected_num_blocks: int,
+     expected_num_states: int,
+ ):
+@@ -474,7 +479,7 @@ def test_allocate_compressed_mla_cache(
+         head_size=128,
+         dtype=torch.bfloat16,
+         tokens_per_state=4,
+-        storage_block_size=storage_block_size,
++        kernel_page_size=kernel_page_size,
+     )
+     num_pages = 4
+     config = KVCacheConfig(
+@@ -495,6 +500,157 @@ def test_allocate_compressed_mla_cache(
+     )
+ 
+     assert caches["layer.0"].shape == (expected_num_blocks, 1, expected_num_states, 128)
++    assert group_block_stride_bytes(config, ["layer.0"]) == spec.page_size_bytes
++
++
++def test_group_block_stride_bytes_targets_attention_group_layers():
++    narrow_spec = FullAttentionSpec(
++        block_size=16,
++        num_kv_heads=1,
++        head_size=64,
++        dtype=torch.bfloat16,
++    )
++    wide_spec = FullAttentionSpec(
++        block_size=16,
++        num_kv_heads=1,
++        head_size=128,
++        dtype=torch.bfloat16,
++    )
++    manager_spec = UniformTypeKVCacheSpecs(
++        block_size=16,
++        kv_cache_specs={"narrow": narrow_spec, "wide": wide_spec},
++    )
++    allocation_size = 2 * (narrow_spec.page_size_bytes + wide_spec.page_size_bytes)
++    config = KVCacheConfig(
++        num_blocks=2,
++        kv_cache_tensors=[
++            KVCacheTensor(
++                size=allocation_size,
++                layers=["narrow"],
++                layer_stride=2 * narrow_spec.page_size_bytes,
++                block_stride=narrow_spec.page_size_bytes,
++            ),
++            KVCacheTensor(
++                size=allocation_size,
++                layers=["wide"],
++                layer_stride=2 * wide_spec.page_size_bytes,
++                block_stride=wide_spec.page_size_bytes,
++            ),
++        ],
++        kv_cache_groups=[KVCacheGroupSpec(["narrow", "wide"], manager_spec)],
++    )
++    groups = [
++        AttentionGroup(AttentionBackend, ["narrow"], narrow_spec, 0),
++        AttentionGroup(AttentionBackend, ["wide"], wide_spec, 0),
++    ]
++
++    assert [
++        group_block_stride_bytes(config, group.layer_names) for group in groups
++    ] == [narrow_spec.page_size_bytes, wide_spec.page_size_bytes]
++
++
++@pytest.mark.parametrize(
++    ("stride_pages", "page_rows", "expected"),
++    [(1, 1, 64), (2, None, None), (2, 1, 256)],
++)
++def test_strided_capability_controls_manager_block_retention(
++    stride_pages: int, page_rows: int | None, expected: int | None
++):
++    spec = MLAAttentionSpec(
++        block_size=256,
++        num_kv_heads=1,
++        head_size=128,
++        dtype=torch.bfloat16,
++    )
++    backend = SimpleNamespace(
++        get_supported_kernel_block_sizes=lambda: [64],
++        get_strided_block_page_rows=lambda _spec: page_rows,
++    )
++    page_size = spec.page_size_bytes
++    config = KVCacheConfig(
++        num_blocks=2,
++        kv_cache_tensors=[
++            KVCacheTensor(
++                size=2 * stride_pages * page_size,
++                layers=["layer.0"],
++                layer_stride=2 * stride_pages * page_size,
++                block_stride=stride_pages * page_size,
++            )
++        ],
++        kv_cache_groups=[KVCacheGroupSpec(["layer.0"], spec)],
++    )
++    groups = [[AttentionGroup(backend, ["layer.0"], spec, 0)]]
++
++    if expected is None:
++        with pytest.raises(ValueError, match="strided KV cache cannot share"):
++            prepare_kernel_block_sizes(config, groups)
++    else:
++        assert prepare_kernel_block_sizes(config, groups) == [expected]
++
++
++@pytest.mark.parametrize("other_stride_pages", [1, 2])
++def test_strided_group_rejects_backend_requiring_virtual_split(
++    other_stride_pages: int,
++):
++    spec = MLAAttentionSpec(
++        block_size=256,
++        num_kv_heads=1,
++        head_size=128,
++        dtype=torch.bfloat16,
++    )
++    page_size = spec.page_size_bytes
++    config = KVCacheConfig(
++        num_blocks=2,
++        kv_cache_tensors=[
++            KVCacheTensor(
++                size=4 * page_size,
++                layers=[layer_name],
++                layer_stride=4 * page_size,
++                block_stride=stride_pages * page_size,
++            )
++            for layer_name, stride_pages in (
++                ("layer.0", 2),
++                ("layer.1", other_stride_pages),
++            )
++        ],
++        kv_cache_groups=[KVCacheGroupSpec(["layer.0", "layer.1"], spec)],
++    )
++    capable = SimpleNamespace(
++        get_supported_kernel_block_sizes=lambda: [64],
++        get_strided_block_page_rows=lambda _spec: 1,
++    )
++    incapable = SimpleNamespace(
++        get_supported_kernel_block_sizes=lambda: [64],
++        get_strided_block_page_rows=lambda _spec: None,
++    )
++    groups = [
++        [
++            AttentionGroup(capable, ["layer.0"], spec, 0),
++            AttentionGroup(incapable, ["layer.1"], spec, 0),
++        ]
++    ]
++
++    with pytest.raises(ValueError, match="strided KV cache cannot share"):
++        prepare_kernel_block_sizes(config, groups)
++
++
++def test_strided_backends_need_no_common_native_block_size():
++    spec = MLAAttentionSpec(
++        block_size=256, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
++    )
++    layouts = [
++        (
++            SimpleNamespace(
++                get_supported_kernel_block_sizes=lambda size=size: [size],
++                get_strided_block_page_rows=lambda _spec: 1,
++            ),
++            spec,
++            True,
++        )
++        for size in (32, 64)
++    ]
++
++    assert select_common_block_size_for_layout(256, layouts) == 256
+ 
+ 
+ @pytest.mark.parametrize("layout", list(KVCacheLayout))
+@@ -635,12 +791,12 @@ def test_copy_kv_cache_blocks_with_virtual_block_splitting(
+ 
+ 
+ def test_allocate_hisparse_kv_caches_host_pool_and_view_less_specs():
+-    """Host tensors get their own backing; view-less specs keep the raw one."""
+-    spec = FullAttentionSpec(
+-        block_size=2, num_kv_heads=1, head_size=4, dtype=torch.float32
++    """Host views use kernel blocks; view-less specs keep the raw backing."""
++    spec = MLAAttentionSpec(
++        block_size=4, num_kv_heads=1, head_size=4, dtype=torch.float32
+     )
+     page = spec.page_size_bytes
+-    resident_spec = HiSparseResidentSpec(block_size=2, page_size=page)
++    resident_spec = HiSparseResidentSpec(block_size=4, page_size=page)
+     device_size = 4 * page
+     config = KVCacheConfig(
+         num_blocks=4,
+@@ -688,12 +844,12 @@ def host_allocator(size: int) -> torch.Tensor:
+     assert len(config.kv_cache_tensors) == 3
+ 
+     assert [buf.numel() for buf in host_buffers] == [3 * page]
+-    assert caches["source"].shape[0] == 3
++    assert caches["source"].shape[0] == 6
+     assert (
+         caches["source"].untyped_storage().data_ptr()
+         == host_buffers[0].untyped_storage().data_ptr()
+     )
+-    assert caches["indexer"].shape[0] == 4
++    assert caches["indexer"].shape[0] == 8
+     backing = caches["resident"]
+     assert backing.dtype == torch.int8 and backing.numel() >= device_size
+     assert (
+diff --git a/tests/v1/worker/test_gpu_kpool_tail_slot_mapping.py b/tests/v1/worker/test_gpu_kpool_tail_slot_mapping.py
+index 8a7445f7d49a..3a766e9bee74 100644
+--- a/tests/v1/worker/test_gpu_kpool_tail_slot_mapping.py
++++ b/tests/v1/worker/test_gpu_kpool_tail_slot_mapping.py
+@@ -15,7 +15,7 @@
+ 
+ from vllm.platforms import current_platform
+ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+-from vllm.v1.kv_cache_interface import KpoolTailSpec
++from vllm.v1.kv_cache_interface import CircularBufferSpec
+ from vllm.v1.worker.block_table import get_block_table_width
+ from vllm.v1.worker.gpu.block_table import BlockTables
+ 
+@@ -32,13 +32,12 @@
+ 
+ 
+ def make_tail_spec():
+-    return KpoolTailSpec(
++    return CircularBufferSpec(
+         block_size=KPOOL,
+         num_kv_heads=2,
+         head_size=128,
+         head_size_v=0,
+         dtype=torch.bfloat16,
+-        sliding_window=KPOOL,
+     )
+ 
+ 
+diff --git a/vllm/distributed/kv_transfer/kv_connector/utils.py b/vllm/distributed/kv_transfer/kv_connector/utils.py
+index b645e97c4dd4..b5074e189749 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/utils.py
++++ b/vllm/distributed/kv_transfer/kv_connector/utils.py
+@@ -20,6 +20,12 @@
+ from vllm.platforms import current_platform
+ from vllm.utils.torch_utils import async_tensor_h2d
+ from vllm.v1.attention.backend import AttentionBackend
++from vllm.v1.kv_cache_interface import (
++    AttentionSpec,
++    KVCacheConfig,
++    KVCacheSpec,
++    UniformTypeKVCacheSpecs,
++)
+ from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
+ 
+ if TYPE_CHECKING:
+@@ -371,6 +377,47 @@ def get_current_attn_backends(
+         ]
+ 
+ 
++def get_current_attn_backend_layouts(
++    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
++) -> list[tuple[type[AttentionBackend], AttentionSpec | None, bool]]:
++    """Get attention backends, cache specs, and physical stride flags."""
++    layer_specs: dict[str, KVCacheSpec] = {}
++    layer_strides = {
++        layer_name: tensor.block_stride
++        for tensor in kv_cache_config.kv_cache_tensors
++        for layer_name in tensor.layers
++    }
++    for group in kv_cache_config.transfer_groups:
++        group_spec = group.kv_cache_spec
++        if isinstance(group_spec, UniformTypeKVCacheSpecs):
++            layer_specs.update(group_spec.kv_cache_specs)
++        else:
++            layer_specs.update(dict.fromkeys(group.layer_names, group_spec))
++
++    layer_type = cast(type[Any], AttentionLayerBase)
++    layers = get_layers_from_vllm_config(vllm_config, layer_type, list(layer_specs))
++    if not layers:
++        backends = get_current_attn_backends(vllm_config)
++        return [(backend, None, False) for backend in backends]
++
++    pairs: list[tuple[type[AttentionBackend], AttentionSpec | None, bool]] = []
++    for layer_name, layer in layers.items():
++        backend = layer.get_attn_backend()
++        spec = layer_specs.get(layer_name)
++        attention_spec = spec if isinstance(spec, AttentionSpec) else None
++        is_strided = (
++            attention_spec is not None
++            and layer_strides[layer_name] > attention_spec.page_size_bytes
++        )
++        for index, (existing_backend, existing_spec, any_strided) in enumerate(pairs):
++            if existing_backend is backend and existing_spec == attention_spec:
++                pairs[index] = (backend, attention_spec, any_strided or is_strided)
++                break
++        else:
++            pairs.append((backend, attention_spec, is_strided))
++    return pairs
++
++
+ def get_current_attn_backend(
+     vllm_config: VllmConfig, layer_names: list[str] | None = None
+ ) -> type[AttentionBackend]:
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py
+index 5ef4f8f67054..937d001f27e0 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py
+@@ -24,7 +24,7 @@
+ from vllm.distributed.kv_transfer.kv_connector.utils import (
+     EngineId,
+     TransferTopology,
+-    get_current_attn_backends,
++    get_current_attn_backend_layouts,
+ )
+ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+     KVConnectorBase_V1,
+@@ -59,14 +59,14 @@
+ from vllm.v1.kv_cache_interface import (
+     AttentionSpec,
+     FullAttentionSpec,
+-    KpoolTailSpec,
+     KVCacheSpec,
+     MambaSpec,
++    MLAAttentionSpec,
+     SlidingWindowSpec,
+ )
+ from vllm.v1.request import RequestStatus
+ from vllm.v1.worker.block_table import BlockTable
+-from vllm.v1.worker.utils import select_common_block_size
++from vllm.v1.worker.utils import select_common_block_size_for_layout
+ 
+ logger = init_logger(__name__)
+ 
+@@ -1066,9 +1066,12 @@ def __init__(
+         self.kv_cache_config = kv_cache_config
+         self.use_mla = self.model_config.use_mla
+         self._physical_blocks_per_logical_kv_block = 1
++        self.attn_backend_layouts = get_current_attn_backend_layouts(
++            vllm_config, kv_cache_config
++        )
++        self.attn_backends = [backend for backend, _, _ in self.attn_backend_layouts]
+         self._sync_block_size_with_kernel()
+ 
+-        self.attn_backends = get_current_attn_backends(vllm_config)
+         logger.debug(
+             "Detected attention backends %s",
+             [backend.get_name() for backend in self.attn_backends],
+@@ -1104,8 +1107,9 @@ def _sync_block_size_with_kernel(self) -> None:
+         # and draft model may use different attention backends with different
+         # physical block sizes. Pick the common (smallest) block size so that
+         # KV-cache registration and transfer work correctly for both models.
+-        backends = get_current_attn_backends(self.vllm_config)
+-        kernel_block_size = select_common_block_size(self.block_size, backends)
++        kernel_block_size = select_common_block_size_for_layout(
++            self.block_size, self.attn_backend_layouts
++        )
+         if self.block_size != kernel_block_size:
+             logger.info_once(
+                 "User-specified logical block size (%s) does not match"
+@@ -1767,9 +1771,7 @@ def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+                 block_len = region_cache.stride(0) * region_cache.element_size()
+                 region_base_addresses.append(base_addr)
+ 
+-                if isinstance(layer_spec, KpoolTailSpec):
+-                    kv_block_len = layer_spec.unpadded_page_size_bytes // 2
+-                elif isinstance(layer_spec, AttentionSpec) and block_is_contiguous:
++                if isinstance(layer_spec, AttentionSpec) and block_is_contiguous:
+                     assert (
+                         layer_spec.page_size_bytes
+                         % self._physical_blocks_per_logical_kv_block
+@@ -1779,8 +1781,21 @@ def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+                         layer_spec.page_size_bytes
+                         // self._physical_blocks_per_logical_kv_block
+                     )
++                elif isinstance(layer_spec, MambaSpec) and block_is_contiguous:
++                    kv_block_len = layer_spec.page_size_bytes
+                 else:
+                     kv_block_len = block_len
++                if (
++                    isinstance(layer_spec, MLAAttentionSpec)
++                    and layer_spec.tokens_per_state > 1
++                    and cache.is_contiguous()
++                    and block_len > kv_block_len
++                    and cache.nbytes
++                    == self.kv_cache_config.num_blocks
++                    * self._physical_blocks_per_logical_kv_block
++                    * kv_block_len
++                ):
++                    block_len = kv_block_len
+                 if kv_block_len > block_len:
+                     raise RuntimeError(
+                         "Mooncake transfer length exceeds physical block stride "
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
+index 0cbdd786d8c3..5cb5c2841e43 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
+@@ -28,7 +28,7 @@
+     EngineId,
+     EngineTransferInfo,
+     TransferTopology,
+-    get_current_attn_backends,
++    get_current_attn_backend_layouts,
+     kv_postprocess_blksize_and_layout_on_receive,
+     kv_postprocess_blksize_on_receive,
+     kv_postprocess_layout_on_receive,
+@@ -81,7 +81,6 @@
+ from vllm.v1.kv_cache_interface import (
+     CircularBufferSpec,
+     FullAttentionSpec,
+-    KpoolTailSpec,
+     KVCacheLayout,
+     KVCacheSpec,
+     MambaSpec,
+@@ -91,7 +90,7 @@
+     iter_layer_specs,
+ )
+ from vllm.v1.worker.block_table import BlockTable
+-from vllm.v1.worker.utils import select_common_block_size
++from vllm.v1.worker.utils import select_common_block_size_for_layout
+ 
+ if TYPE_CHECKING:
+     from vllm.config import VllmConfig
+@@ -877,7 +876,10 @@ def __init__(
+ 
+         # Get the attention backend from the first layer
+         # NOTE (NickLucche) models with multiple backends are not supported yet
+-        self.attn_backends = get_current_attn_backends(vllm_config)
++        self.attn_backend_layouts = get_current_attn_backend_layouts(
++            vllm_config, kv_cache_config
++        )
++        self.attn_backends = [backend for backend, _, _ in self.attn_backend_layouts]
+         self.backend_name = self.attn_backends[0].get_name()
+ 
+         self.kv_cache_layout = (
+@@ -967,8 +969,9 @@ def _validate_remote_parallel_config(
+             )
+ 
+     def _sync_block_size_with_kernel(self) -> None:
+-        backends = get_current_attn_backends(self.vllm_config)
+-        kernel_block_size = select_common_block_size(self.block_size, backends)
++        kernel_block_size = select_common_block_size_for_layout(
++            self.block_size, self.attn_backend_layouts
++        )
+         # Number of blocks not accounting for kernel block mismatches
+         self._logical_num_blocks = self.num_blocks
+         if self.block_size != kernel_block_size:
+@@ -1407,7 +1410,7 @@ def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+         if self._supports_pp_hma and self._has_packed_cache:
+             # PP can reorder the same backends across stages of a packed model.
+             backend_name = ",".join(
+-                sorted(backend.get_name() for backend in self.attn_backends)
++                sorted({backend.get_name() for backend in self.attn_backends})
+             )
+         self.compat_hash = compute_nixl_compatibility_hash(
+             self.vllm_config,
+@@ -1568,7 +1571,7 @@ def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+                     region_device_id,
+                 )
+ 
+-            if isinstance(layer_spec, KpoolTailSpec):
++            if isinstance(layer_spec, CircularBufferSpec):
+                 compressed_owner = compressed_region_owners.get(cache.data_ptr())
+                 if compressed_owner is not None:
+                     owner_storage = compressed_owner.untyped_storage()
+@@ -1652,7 +1655,7 @@ def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+                 elif packed_mla_push:
+                     # PP=1 decode or prefill: register whole rows, and advertise where
+                     # this layer's page sits so a PP>1 prefill can write into it.
+-                    storage_block_len = registration_len // num_blocks
++                    storage_block_len = block_stride
+                     region_specs = [
+                         (registration_base, storage_block_len, storage_block_len)
+                     ]
+@@ -2705,10 +2708,15 @@ def sync_recved_kv_to_device(self, req_id: str, meta: ReqMeta):
+         # TODO (NickLucche) D2H<>H2D ops could benefit from coalescing io across groups
+         # The h2d block copies below are intentionally synchronous.
+         with gpu_sync_allowed():
+-            for group_block_ids in local_block_ids:
++            for group, group_block_ids in zip(
++                self.kv_cache_config.transfer_groups,
++                local_block_ids,
++                strict=True,
++            ):
++                layer_names = group.layer_names
+                 self.copy_blocks(
+-                    self.host_xfer_buffers,
+-                    self.device_kv_caches,
++                    {name: self.host_xfer_buffers[name] for name in layer_names},
++                    {name: self.device_kv_caches[name] for name in layer_names},
+                     group_block_ids,
+                     group_block_ids,
+                     "h2d",
+@@ -2740,10 +2748,15 @@ def save_kv_to_host(self, metadata: NixlConnectorMetadata):
+                         ",".join(map(str, meta.local_physical_block_ids)),
+                     )
+                 # blocking
+-                for group_block_ids in meta.local_physical_block_ids:
++                for group, group_block_ids in zip(
++                    self.kv_cache_config.transfer_groups,
++                    meta.local_physical_block_ids,
++                    strict=True,
++                ):
++                    layer_names = group.layer_names
+                     self.copy_blocks(
+-                        self.device_kv_caches,
+-                        self.host_xfer_buffers,
++                        {name: self.device_kv_caches[name] for name in layer_names},
++                        {name: self.host_xfer_buffers[name] for name in layer_names},
+                         group_block_ids,
+                         group_block_ids,
+                         "d2h",
+diff --git a/vllm/model_executor/layers/attention/mla_attention.py b/vllm/model_executor/layers/attention/mla_attention.py
+index 2ae111c1c3a5..e64808349002 100644
+--- a/vllm/model_executor/layers/attention/mla_attention.py
++++ b/vllm/model_executor/layers/attention/mla_attention.py
+@@ -1371,14 +1371,20 @@ def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+             is_index_group_leader=self.indexer is not None,
+             non_causal_multi_token_decode=self.non_causal_multi_token_decode,
+         )
++        page_rows = self.attn_backend.get_strided_block_page_rows(spec)
+         # SM100 FlashMLA paged kernels also express TMA coordinates in token rows.
+         uses_tma_rows = (
+             self.attn_backend.get_name() == "FLASHMLA_SPARSE"
+             and self.kv_cache_dtype in ("fp8_ds_mla", "nvfp4_ds_mla")
+             and current_platform.is_device_capability_family(100)
+         )
+-        if self._uses_flat_kv_cache() or uses_tma_rows:
+-            spec = replace(spec, block_stride_alignment=spec.state_content_size_bytes)
++        if page_rows is None and (self._uses_flat_kv_cache() or uses_tma_rows):
++            page_rows = 1
++        if page_rows is not None:
++            spec = replace(
++                spec,
++                block_stride_alignment=page_rows * spec.state_content_size_bytes,
++            )
+         return spec
+ 
+     def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor):
+diff --git a/vllm/models/glm5next/amd/sparse_indexer.py b/vllm/models/glm5next/amd/sparse_indexer.py
+index 761f79d95de7..7e23dc495544 100644
+--- a/vllm/models/glm5next/amd/sparse_indexer.py
++++ b/vllm/models/glm5next/amd/sparse_indexer.py
+@@ -20,6 +20,7 @@
+     _fill_causal_indices,
+     _fill_short_decode_causal_indices,
+     _gather_workspace_shapes,
++    _kpool_flat_page_view,
+     _scatter_decode_tokens_by_request,
+     kv_cache_as_quant_view,
+ )
+@@ -122,6 +123,7 @@ def sparse_attn_indexer_kpool(
+     attn_metadata = get_forward_context().attn_metadata
+     fp8_dtype = current_platform.fp8_dtype()
+     k_cache_prefix = _resolve_layer_name(k_cache_prefix)
++    kv_cache = _kpool_flat_page_view(kv_cache)
+ 
+     # assert isinstance(attn_metadata, dict)
+     if not isinstance(attn_metadata, dict):
+diff --git a/vllm/models/glm5next/common/attention.py b/vllm/models/glm5next/common/attention.py
+index 25f51117a8d7..0ee68ac76f77 100644
+--- a/vllm/models/glm5next/common/attention.py
++++ b/vllm/models/glm5next/common/attention.py
+@@ -35,7 +35,7 @@
+ from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
+ from vllm.utils.deep_gemm import PAGED_MQA_PAGE_SIZES
+ from vllm.utils.math_utils import cdiv, next_power_of_2
+-from vllm.v1.kv_cache_interface import KpoolTailSpec, MLAAttentionSpec
++from vllm.v1.kv_cache_interface import CircularBufferSpec, MLAAttentionSpec
+ 
+ logger = init_logger(__name__)
+ 
+@@ -91,13 +91,10 @@ class Glm5NextIndexerCache(DeepseekV32IndexerCache):
+     ``MLAAttentionSpec`` / block_table), so ``block_size`` is the model-wide
+     ``cache_config.block_size``. DeepGEMM's paged-MQA kernel
+     (``csrc/apis/attention.hpp``) requires ``block_kv`` to be exactly 32 or
+-    64, so the storage block is virtually split into pool pages of the
+-    largest such size that tiles it (``storage_kernel_block_size``); this
+-    needs ``block_size`` to be a multiple of ``index_kpool * 32`` (512 for
+-    ``index_kpool = 16``). A smaller block (e.g. the default 64) silently
+-    collapses ``storage_block_size`` (64 // 16 = 4) and only fails later at
+-    the opaque C++ assert; ``get_kv_cache_spec`` guards this up front
+-    instead.
++    64, so the metadata builder and the kpool kernels re-page each block into
++    such pages. This needs ``block_size`` to be a multiple of
++    ``index_kpool * 32``, which ``get_kv_cache_spec`` checks up front instead
++    of failing at the opaque C++ assert.
+     """
+ 
+     def __init__(
+@@ -130,30 +127,29 @@ def get_kv_cache_spec(self, vllm_config: VllmConfig):
+         assert isinstance(spec, MLAAttentionSpec)
+         spec = replace(spec, tokens_per_state=self._index_kpool)
+ 
+-        # DeepGEMM paged-MQA takes block_kv in {32, 64}; the storage block
+-        # (= block_size // index_kpool) is virtually split into pool pages of
+-        # the largest such size that tiles it, so it must be a multiple of 32.
+-        storage_block_size = spec.block_size // self._index_kpool
+-        assert (
+-            spec.block_size % self._index_kpool == 0 and storage_block_size % 32 == 0
+-        ), (
++        # DeepGEMM paged-MQA takes block_kv in {32, 64}; the manager block's
++        # compressed states are split into the largest supported pages that
++        # tile it, so the state count must be a multiple of 32.
++        num_states = spec.block_size // self._index_kpool
++        assert spec.block_size % self._index_kpool == 0 and num_states % 32 == 0, (
+             "Glm5NextIndexerCache: kpool indexer requires cache block_size to "
+             f"be a multiple of index_kpool * 32 ({self._index_kpool * 32}) so "
+-            "that DeepGEMM paged-MQA pool pages (32 or 64 entries) tile the "
+-            f"storage block, got block_size={spec.block_size} -> "
+-            f"storage_block_size={storage_block_size}."
++            "that DeepGEMM paged-MQA pool pages (32 or 64 entries) tile its "
++            f"compressed states, got block_size={spec.block_size} -> "
++            f"num_states={num_states}."
+         )
+-        max_page_size = max(PAGED_MQA_PAGE_SIZES)
+         min_page_size = min(PAGED_MQA_PAGE_SIZES)
+-        if storage_block_size <= max_page_size:
+-            page_size = storage_block_size
+-        elif storage_block_size % max_page_size == 0:
+-            page_size = max_page_size
+-        else:
+-            page_size = min_page_size
++        max_page_size = max(PAGED_MQA_PAGE_SIZES)
++        page_size = max_page_size if num_states % max_page_size == 0 else min_page_size
++        pages_per_block = num_states // page_size
+         return replace(
+             spec,
+-            storage_block_size=page_size * self._index_kpool,
++            kernel_page_size=page_size * self._index_kpool,
++            block_stride_alignment=(
++                page_size * spec.state_content_size_bytes
++                if pages_per_block > 1
++                else None
++            ),
+         )
+ 
+ 
+@@ -164,9 +160,9 @@ class Glm5NextTailCache(DeepseekV32IndexerCache):
+     ``ring`` slots per request, overwritten in place by ``pos % ring``
+     as decode/spec-decode advances. Prefill seeds it (instead of discarding the
+     tail raw K+gate); the connector transfers it across PD; decode reads it to
+-    compress the boundary pool correctly. ``KpoolTailSpec`` /
+-    ``KpoolTailManager`` provide the no-prune, 1-block/req allocation that lets
+-    the in-progress pool survive across steps and across transfer.
++    compress the boundary pool correctly. ``CircularBufferSpec`` /
++    ``CircularBufferManager`` provide the no-prune, 1-block/req allocation that
++    lets the in-progress pool survive across steps and across transfer.
+ 
+     Stores raw bf16 K (``head_dim``) as the "K" half of each block and the
+     bf16 gate score (``head_dim``) as the "V" half -- not the fp8-compressed
+@@ -202,13 +198,12 @@ def get_kv_cache_spec(self, vllm_config: VllmConfig):
+             f"({self.cache_config.block_size}) must be a multiple of the "
+             f"tail ring ({ring})"
+         )
+-        return KpoolTailSpec(
++        return CircularBufferSpec(
+             block_size=ring,
+             num_kv_heads=2,
+             head_size=self.head_dim,
+             head_size_v=0,
+             dtype=torch.bfloat16,
+-            sliding_window=ring,
+         )
+ 
+     def get_attn_backend(self):
+@@ -300,7 +295,7 @@ def __init__(
+         # Paged tail cache (in-progress pool's raw K + gate score). Written by
+         # prefill (seeds the boundary pool) and decode (per-step stash); read by
+         # the decode kernel to compress the boundary pool. Transferred across PD
+-        # so the decode side sees the prefill tail. See KpoolTailSpec/Manager.
++        # so the decode side sees the prefill tail. See CircularBufferSpec/Manager.
+         self.tail_cache = Glm5NextTailCache(
+             head_dim=self.head_dim,
+             dtype=torch.bfloat16,
+diff --git a/vllm/models/glm5next/common/sparse_indexer.py b/vllm/models/glm5next/common/sparse_indexer.py
+index ad3845457063..9adf8785b1c5 100644
+--- a/vllm/models/glm5next/common/sparse_indexer.py
++++ b/vllm/models/glm5next/common/sparse_indexer.py
+@@ -4,12 +4,33 @@
+ 
+ import torch
+ 
++from vllm.utils.deep_gemm import PAGED_MQA_PAGE_SIZES
++
+ RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
+ 
+ # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
+ MXFP4_BLOCK_SIZE = 32
+ 
+ 
++def _kpool_flat_page_view(kv_cache: torch.Tensor) -> torch.Tensor:
++    if kv_cache.ndim != 3:
++        return kv_cache
++    num_blocks, num_states, row_width = kv_cache.shape
++    max_page_size = max(PAGED_MQA_PAGE_SIZES)
++    if num_states <= max_page_size:
++        return kv_cache
++    page_states = (
++        max_page_size if num_states % max_page_size == 0 else min(PAGED_MQA_PAGE_SIZES)
++    )
++    pages_per_block = num_states // page_states
++    page_stride = page_states * row_width
++    stride_pages = kv_cache.stride(0) // page_stride
++    num_pages = (num_blocks - 1) * stride_pages + pages_per_block
++    return kv_cache.as_strided(
++        (num_pages, page_states, row_width), (page_stride, row_width, 1)
++    )
++
++
+ def _build_decode_scatter_indices(
+     decode_lens: torch.Tensor,
+     num_requests: int,
+diff --git a/vllm/models/glm5next/nvidia/sparse_indexer.py b/vllm/models/glm5next/nvidia/sparse_indexer.py
+index 00f51cc6a796..6c5a5f665383 100644
+--- a/vllm/models/glm5next/nvidia/sparse_indexer.py
++++ b/vllm/models/glm5next/nvidia/sparse_indexer.py
+@@ -18,6 +18,7 @@
+     _fill_causal_indices,
+     _fill_short_decode_causal_indices,
+     _gather_workspace_shapes,
++    _kpool_flat_page_view,
+     _scatter_decode_tokens_by_request,
+     kv_cache_as_quant_view,
+ )
+@@ -126,6 +127,7 @@ def sparse_attn_indexer_kpool(
+     attn_metadata = get_forward_context().attn_metadata
+     fp8_dtype = current_platform.fp8_dtype()
+     k_cache_prefix = _resolve_layer_name(k_cache_prefix)
++    kv_cache = _kpool_flat_page_view(kv_cache)
+ 
+     # assert isinstance(attn_metadata, dict)
+     if not isinstance(attn_metadata, dict):
+diff --git a/vllm/v1/attention/backend.py b/vllm/v1/attention/backend.py
+index 319b9977f4a0..df707a49a2df 100644
+--- a/vllm/v1/attention/backend.py
++++ b/vllm/v1/attention/backend.py
+@@ -77,6 +77,13 @@ def get_supported_kernel_block_sizes(
+     ) -> list[int | MultipleOf]:
+         return [MultipleOf(1)]
+ 
++    @staticmethod
++    def get_strided_block_page_rows(
++        kv_cache_spec: "KVCacheSpec",
++    ) -> int | None:
++        """Kernel page rows used to view a larger strided manager block."""
++        return None
++
+     @staticmethod
+     @abstractmethod
+     def get_name() -> str:
+@@ -609,6 +616,8 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
+     supports_update_block_table: bool = False
+     # Whether the builder constructor requires the block-table width.
+     requires_block_table_width: ClassVar[bool] = False
++    # Whether the builder constructor requires the cache block stride.
++    requires_block_stride_bytes: ClassVar[bool] = False
+     # Whether all step-dependent draft decode metadata can be updated in place,
+     # allowing one metadata build to be reused across autoregressive draft steps.
+     supports_draft_decode_metadata_update: bool = False
+diff --git a/vllm/v1/attention/backends/mla/flashattn_mla_sparse.py b/vllm/v1/attention/backends/mla/flashattn_mla_sparse.py
+index 0c3f0f42885a..99a6980fa80d 100644
+--- a/vllm/v1/attention/backends/mla/flashattn_mla_sparse.py
++++ b/vllm/v1/attention/backends/mla/flashattn_mla_sparse.py
+@@ -27,7 +27,7 @@
+     flat_kv_row_view,
+     triton_convert_req_index_to_global_index,
+ )
+-from vllm.v1.kv_cache_interface import AttentionSpec
++from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec
+ from vllm.vllm_flash_attn.flash_attn_interface import flash_attn_varlen_func
+ 
+ 
+@@ -43,6 +43,10 @@ class FlashAttnMLASparseBackend(AttentionBackend):
+     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
+         return [64]
+ 
++    @staticmethod
++    def get_strided_block_page_rows(kv_cache_spec: KVCacheSpec) -> int:
++        return 1
++
+     @staticmethod
+     def get_name() -> str:
+         return "FLASH_ATTN_MLA_SPARSE"
+diff --git a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py
+index 5af50ef1bd21..bcaf6452af2e 100644
+--- a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py
++++ b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py
+@@ -34,7 +34,7 @@
+     triton_convert_req_index_to_global_index,
+     triton_filter_and_convert_dcp_index,
+ )
+-from vllm.v1.kv_cache_interface import AttentionSpec
++from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec
+ 
+ if TYPE_CHECKING:
+     from vllm.model_executor.models.deepseek_v2 import Indexer
+@@ -85,6 +85,11 @@ class FlashInferMLASparseTRTLLMBackend(_FlashInferMLASparseBackendBase):
+     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
+         return [32, 64]
+ 
++    @staticmethod
++    def get_strided_block_page_rows(kv_cache_spec: KVCacheSpec) -> int:
++        # The smallest native page reduces packed-stride alignment requirements.
++        return 32
++
+     @staticmethod
+     def get_impl_cls() -> type[MLAAttentionImpl]:
+         return FlashInferMLASparseImpl
+@@ -174,6 +179,10 @@ def get_name() -> str:
+     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
+         return [64, 256]
+ 
++    @staticmethod
++    def get_strided_block_page_rows(kv_cache_spec: KVCacheSpec) -> int:
++        return 64
++
+     @staticmethod
+     def get_impl_cls() -> type[MLAAttentionImpl]:
+         from vllm.v1.attention.backends.mla.flashinfer_mla_sparse_sm120 import (
+@@ -565,9 +574,14 @@ def forward_mqa(
+             assert prefill_lse is not None
+             return output, torch.cat((decode_lse, prefill_lse))
+ 
+-        _, block_stride_rows = flat_kv_row_view(
++        kv_rows, block_stride_rows = flat_kv_row_view(
+             kv_c_and_k_pe_cache, attn_metadata.block_size
+         )
++        kernel_kv_cache = (
++            kv_c_and_k_pe_cache
++            if block_stride_rows == attn_metadata.block_size
++            else kv_rows.view(-1, 32, kv_rows.shape[-1])
++        )
+ 
+         if self.dcp_world_size > 1:
+             topk_indices_physical, seq_lens = triton_filter_and_convert_dcp_index(
+@@ -592,7 +606,7 @@ def forward_mqa(
+ 
+         return self._run_mqa_kernel(
+             q,
+-            kv_c_and_k_pe_cache,
++            kernel_kv_cache,
+             topk_indices_physical,
+             seq_lens,
+         )
+diff --git a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py
+index e59c9ce46db9..052a71b1e3b0 100644
+--- a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py
++++ b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py
+@@ -16,6 +16,7 @@
+ )
+ from vllm.v1.attention.backends.mla.index_group import HiSparseMLAIndexGroup
+ from vllm.v1.attention.backends.mla.sparse_utils import (
++    flat_kv_row_view,
+     triton_convert_req_index_to_global_index,
+ )
+ 
+@@ -183,6 +184,11 @@ def forward_mqa(
+             output = torch.cat(outputs) if len(outputs) > 1 else outputs[0]
+             return output, None
+ 
++        kv_rows, block_stride_rows = flat_kv_row_view(
++            kv_c_and_k_pe_cache, attn_metadata.block_size
++        )
++        kv_rows_bytes = kv_rows.view(torch.uint8)
++        kernel_kv_cache = kv_rows_bytes.view(-1, 64, kv_rows_bytes.shape[-1])
+         topk_indices_physical = cast(
+             torch.Tensor,
+             triton_convert_req_index_to_global_index(
+@@ -190,13 +196,14 @@ def forward_mqa(
+                 attn_metadata.block_table,
+                 topk_indices,
+                 BLOCK_SIZE=attn_metadata.block_size,
++                BLOCK_STRIDE_ROWS=block_stride_rows,
+                 NUM_TOPK_TOKENS=topk_indices.shape[1],
+             ),
+         )
+         return (
+             self._run_mqa_kernel(
+                 q,
+-                kv_c_and_k_pe_cache,
++                kernel_kv_cache,
+                 topk_indices_physical,
+             ),
+             None,
+diff --git a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm90.py b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm90.py
+index a5f7757d3887..3c4c788081e8 100644
+--- a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm90.py
++++ b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm90.py
+@@ -26,7 +26,7 @@
+ reserved buffers by kernels inside the captured forward, and captured runs
+ read the refreshed plan buffers on replay.
+ 
+-KV cache format: plain contiguous E4M3 ``[num_blocks, block_size, 512]``
++KV cache format: E4M3 ``[num_blocks, block_size, 512]`` (any block stride)
+ (uint8 storage) with a per-tensor ``k_scale``; BF16 caches also work. The
+ per-token x 128-channel-group ``ckv_scale_arr`` layout is supported by the
+ kernel but not wired yet (it needs a group-quantizing cache-write op).
+@@ -57,9 +57,10 @@
+     FlashInferMLASparseMetadataBuilder,
+ )
+ from vllm.v1.attention.backends.mla.sparse_utils import (
++    flat_kv_row_view,
+     triton_convert_req_index_to_global_index,
+ )
+-from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayout
++from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec
+ 
+ _FP8_KV_DTYPES = ("fp8", "fp8_e4m3")
+ _WORKSPACE_BYTES = 128 * 1024 * 1024
+@@ -99,7 +100,10 @@ def _pack_topk_indices(
+     end = tl.load(indptr + row + 1)
+     mask = (cols < end - start) & (cols < WIDTH)
+     values = tl.load(slots + row * WIDTH + cols, mask=mask, other=0)
+-    tl.store(indices + start + cols, tl.maximum(values, 0), mask=mask)
++    first_slot = tl.load(slots + row * WIDTH)
++    tl.store(
++        indices + start + cols, tl.where(values >= 0, values, first_slot), mask=mask
++    )
+ 
+ 
+ @triton.jit
+@@ -222,9 +226,10 @@ def get_kv_cache_shape(
+     ) -> tuple[int, ...]:
+         return (num_blocks, block_size, head_size)
+ 
+-    @classmethod
+-    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+-        return (KVCacheLayout.LBHNC,)
++    @staticmethod
++    def get_strided_block_page_rows(kv_cache_spec: KVCacheSpec) -> int:
++        # Rows are the page table; only whole-row block stride alignment is needed.
++        return 1
+ 
+ 
+ class _SM90State:
+@@ -599,11 +604,15 @@ def forward_mqa(
+         # return_valid_counts=True keeps the compacted-prefix layout: valid
+         # entries at [0, valid_count), -1 past it — exactly the prefix the
+         # planned per-row lengths address.
++        kv_rows, block_stride_rows = flat_kv_row_view(
++            kv_c_and_k_pe_cache, attn_metadata.block_size
++        )
+         topk_slots, _ = triton_convert_req_index_to_global_index(
+             attn_metadata.req_id_per_token[:num_tokens],
+             attn_metadata.block_table,
+             topk_indices,
+             BLOCK_SIZE=attn_metadata.block_size,
++            BLOCK_STRIDE_ROWS=block_stride_rows,
+             NUM_TOPK_TOKENS=topk_indices.shape[1],
+             return_valid_counts=True,
+         )
+@@ -612,11 +621,11 @@ def forward_mqa(
+         # Pack valid prefixes at the offsets refreshed by plan() before replay.
+         state.pack_indices(topk_slots)
+ 
++        # Row ids index the flat row view; under packed layouts the rows of
++        # other layers sit between blocks and are never referenced.
+         flat = (
+-            kv_c_and_k_pe_cache.view(torch.float8_e4m3fn)
+-            if self.use_fp8_kv_cache
+-            else kv_c_and_k_pe_cache
+-        ).reshape(-1, 1, self.head_size)
++            kv_rows.view(torch.float8_e4m3fn) if self.use_fp8_kv_cache else kv_rows
++        ).unsqueeze(1)
+         ckv = flat[..., : self.kv_lora_rank]
+         kpe = flat[..., self.kv_lora_rank :]
+ 
+diff --git a/vllm/v1/attention/backends/mla/flashmla_sparse.py b/vllm/v1/attention/backends/mla/flashmla_sparse.py
+index 014358f530e0..217a93d037b8 100644
+--- a/vllm/v1/attention/backends/mla/flashmla_sparse.py
++++ b/vllm/v1/attention/backends/mla/flashmla_sparse.py
+@@ -52,7 +52,7 @@
+     flash_mla_with_kvcache,
+     get_mla_metadata,
+ )
+-from vllm.v1.kv_cache_interface import AttentionSpec
++from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec, KVQuantMode
+ from vllm.v1.worker.workspace import current_workspace_manager
+ 
+ if TYPE_CHECKING:
+@@ -142,6 +142,17 @@ class FlashMLASparseBackend(AttentionBackend):
+     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
+         return [64]
+ 
++    @staticmethod
++    def get_strided_block_page_rows(kv_cache_spec: KVCacheSpec) -> int | None:
++        if (
++            isinstance(kv_cache_spec, AttentionSpec)
++            and kv_cache_spec.head_size == 512
++            and kv_cache_spec.dtype == torch.bfloat16
++            and kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
++        ):
++            return 1
++        return None
++
+     @staticmethod
+     def get_name() -> str:
+         return "FLASHMLA_SPARSE"
+diff --git a/vllm/v1/attention/backends/mla/indexer.py b/vllm/v1/attention/backends/mla/indexer.py
+index e7eb67b61f48..a9030ac4cff8 100644
+--- a/vllm/v1/attention/backends/mla/indexer.py
++++ b/vllm/v1/attention/backends/mla/indexer.py
+@@ -200,9 +200,19 @@ def get_name() -> str:
+         return "DEEPSEEK_V32_INDEXER"
+ 
+     @staticmethod
+-    def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
++    def get_supported_kernel_block_sizes(
++        kv_cache_spec: KVCacheSpec | None = None,
++    ) -> list[int | MultipleOf]:
+         return [1, MultipleOf(16)] if current_platform.is_rocm() else [64]
+ 
++    @staticmethod
++    def get_strided_block_page_rows(kv_cache_spec: KVCacheSpec) -> int | None:
++        if not isinstance(kv_cache_spec, MLAAttentionSpec):
++            return None
++        if kv_cache_spec.kernel_page_size is None:
++            return None
++        return kv_cache_spec.get_num_kernel_states(kv_cache_spec.kernel_page_size)
++
+     @classmethod
+     def get_supported_head_sizes(cls) -> list[int]:
+         return [32, 64, 128]
+@@ -217,7 +227,7 @@ class KpoolTailBackend(DeepseekV32IndexerBackend):
+ 
+     @classmethod
+     def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+-        return (KVCacheLayout.LBHNC,)
++        return (KVCacheLayout.BLHNC,)
+ 
+     @staticmethod
+     def get_name() -> str:
+@@ -858,6 +868,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+     # so this is None; its own split uses self.decode_threshold.
+     reorder_batch_threshold: int | None = None
+     requires_block_table_width = True
++    requires_block_stride_bytes = True
+ 
+     @classmethod
+     def get_cudagraph_support(
+@@ -869,8 +880,15 @@ def get_cudagraph_support(
+             return AttentionCGSupport.ALWAYS
+         return AttentionCGSupport.UNIFORM_BATCH
+ 
+-    def __init__(self, *args, block_table_width: int, **kwargs) -> None:
++    def __init__(
++        self,
++        *args,
++        block_table_width: int,
++        block_stride_bytes: int | None = None,
++        **kwargs,
++    ) -> None:
+         super().__init__(*args, **kwargs)
++        self.block_stride_bytes = block_stride_bytes
+         scheduler_config = self.vllm_config.scheduler_config
+         parallel_config = self.vllm_config.parallel_config
+         self.dcp_world_size = parallel_config.decode_context_parallel_size
+@@ -964,12 +982,14 @@ def __init__(self, *args, block_table_width: int, **kwargs) -> None:
+ 
+         # KV compression. Default to 1 for no compression.
+         self.compress_ratio = 1
++        self._kernel_page_size: int | None = None
+         # Get compress_ratio for DeepseekV4 support
+         if isinstance(self.kv_cache_spec, MLAAttentionSpec):
+             # MLA compression is a whole number of tokens per state (fractions
+             # are whisper block pooling and never reach MLA).
+             assert isinstance(self.kv_cache_spec.tokens_per_state, int)
+             self.compress_ratio = self.kv_cache_spec.tokens_per_state
++            self._kernel_page_size = self.kv_cache_spec.kernel_page_size
+         if self.dcp_world_size > 1 and self.compress_ratio > 1:
+             raise NotImplementedError(
+                 "DCP is not supported with sparse indexer KV compression "
+@@ -994,6 +1014,25 @@ def __init__(self, *args, block_table_width: int, **kwargs) -> None:
+         self.indexer_decode_block_table_buffer: torch.Tensor | None = None
+         self._max_num_batched_tokens = scheduler_config.max_num_batched_tokens
+ 
++    def _expand_kernel_page_table(
++        self, block_table: torch.Tensor
++    ) -> tuple[int, torch.Tensor]:
++        """Expand manager block IDs into physical kernel-page IDs."""
++        spec = self.kv_cache_spec
++        assert self._kernel_page_size is not None
++        page_states = spec.get_num_kernel_states(self._kernel_page_size)
++        pages_per_block = spec.num_states // page_states
++        if pages_per_block == 1:
++            return page_states, block_table
++        block_stride_bytes = self.block_stride_bytes
++        assert block_stride_bytes is not None
++        stride_pages = block_stride_bytes // (
++            page_states * spec.state_content_size_bytes
++        )
++        return page_states, (
++            block_table[..., None] * stride_pages + self.arange_buffer[:pages_per_block]
++        ).flatten(1)
++
+     def _dcp_localize_decode_seq_lens(
+         self,
+         seq_lens: torch.Tensor,
+@@ -1289,10 +1328,16 @@ def build(
+ 
+         compressed_slot_mapping = slot_mapping
+         indexer_block_table = block_table
++        page_states = self.kv_cache_spec.num_states
+         if self.compress_ratio > 1:
++            if self._kernel_page_size is not None:
++                page_states, indexer_block_table = self._expand_kernel_page_table(
++                    block_table
++                )
+             kernel_block_size = self.kernel_block_size
+             if (
+-                kernel_block_size is not None
++                self._kernel_page_size is None
++                and kernel_block_size is not None
+                 and self.kv_cache_spec.block_size != kernel_block_size
+                 and self.kv_cache_spec.block_size % kernel_block_size == 0
+             ):
+@@ -1314,7 +1359,7 @@ def build(
+                 query_start_loc,
+                 seq_lens,
+                 indexer_block_table,
+-                self.kv_cache_spec.num_states,
++                page_states,
+                 self.compress_ratio,
+                 out=self.compressed_slot_mapping_buffer,
+             )
+@@ -1537,16 +1582,24 @@ def build(
+                     )
+                 )
+ 
++            page_states = self.kv_cache_spec.num_states
+             if self.compress_ratio > 1:
+-                kernel_block_size = self.kernel_block_size
+-                if (
+-                    kernel_block_size is not None
+-                    and self.kv_cache_spec.block_size != kernel_block_size
+-                    and self.kv_cache_spec.block_size % kernel_block_size == 0
+-                ):
+-                    factor = self.kv_cache_spec.block_size // kernel_block_size
+-                    compressed = block_table[:, ::factor] // factor
+-                    rows, cols = compressed.shape
++                page_table = block_table
++                if self._kernel_page_size is not None:
++                    page_states, page_table = self._expand_kernel_page_table(
++                        block_table
++                    )
++                else:
++                    kernel_block_size = self.kernel_block_size
++                    if (
++                        kernel_block_size is not None
++                        and self.kv_cache_spec.block_size != kernel_block_size
++                        and self.kv_cache_spec.block_size % kernel_block_size == 0
++                    ):
++                        factor = self.kv_cache_spec.block_size // kernel_block_size
++                        page_table = block_table[:, ::factor] // factor
++                if page_table is not block_table:
++                    rows, cols = page_table.shape
+                     if self.indexer_decode_block_table_buffer is None:
+                         self.indexer_decode_block_table_buffer = torch.zeros(
+                             (self._max_num_batched_tokens, cols),
+@@ -1554,7 +1607,7 @@ def build(
+                             device=self.device,
+                         )
+                     self.indexer_decode_block_table_buffer[:rows, :cols].copy_(
+-                        compressed
++                        page_table
+                     )
+                     block_table = self.indexer_decode_block_table_buffer[:rows, :cols]
+ 
+@@ -1594,7 +1647,7 @@ def build(
+             if current_platform.is_cuda() and has_deep_gemm():
+                 metadata = get_paged_mqa_logits_metadata(
+                     seq_lens,
+-                    self.kv_cache_spec.num_states,
++                    page_states,
+                     self.num_sms,
+                     indices=decode_indices,
+                 )
+diff --git a/vllm/v1/attention/backends/mla/rocm_aiter_mla_sparse.py b/vllm/v1/attention/backends/mla/rocm_aiter_mla_sparse.py
+index c5a672e5d498..73ec86a3a90d 100644
+--- a/vllm/v1/attention/backends/mla/rocm_aiter_mla_sparse.py
++++ b/vllm/v1/attention/backends/mla/rocm_aiter_mla_sparse.py
+@@ -35,11 +35,12 @@
+ from vllm.v1.attention.backends.mla.rocm_aiter_mla import (
+     AiterMLAHelper,
+ )
++from vllm.v1.attention.backends.mla.sparse_utils import flat_kv_row_view
+ from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+ from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+     rocm_sparse_attn_prefill,
+ )
+-from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayout
++from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayout, KVCacheSpec
+ from vllm.v1.worker.workspace import current_workspace_manager
+ 
+ if TYPE_CHECKING:
+@@ -105,6 +106,7 @@ def _convert_req_index_to_global_index_kernel(
+     # shapes (compile-time where possible)
+     max_num_blocks_per_req: tl.constexpr,
+     BLOCK_SIZE: tl.constexpr,
++    BLOCK_STRIDE_ROWS: tl.constexpr,
+     BLOCK_N: tl.constexpr,  # tile width along columns
+     # strides (in elements)
+     bt_stride0,
+@@ -146,9 +148,11 @@ def _convert_req_index_to_global_index_kernel(
+     bt_ptr = block_table_ptr + req * bt_stride0 + block_id * bt_stride1
+     base = tl.load(bt_ptr, mask=valid_block, other=0)
+ 
+-    # # If token == -1 OR block_id OOB, output 0; else base * BLOCK_SIZE + offset
++    # Invalid slots map to zero; valid slots use the physical block stride.
+     out_val = tl.where(
+-        is_invalid_tok | (~valid_block), 0, base * BLOCK_SIZE + inblock_off
++        is_invalid_tok | (~valid_block),
++        0,
++        base * BLOCK_STRIDE_ROWS + inblock_off,
+     )
+     out_ptr_ij = out_ptr + seq_start + indice_id
+     out_ptr_ij_mask = (seq_start + indice_id) < seq_end
+@@ -163,13 +167,15 @@ def triton_convert_req_index_to_global_index(
+     token_indices: torch.Tensor,  # int32 [num_tokens, NUM_TOPK_TOKENS]
+     cu_seqlens: torch.Tensor,  # int32 [num_tokens + 1]
+     paged_kv_indices: torch.Tensor,  # int32 [num_tokens * topk] out_buffer
++    *,
+     BLOCK_SIZE: int = 64,
++    BLOCK_STRIDE_ROWS: int,
+     NUM_TOPK_TOKENS: int = 2048,
+     BLOCK_N: int = 128,  # tile width along columns
+ ):
+     """out[token_id, indice_id] =
+         block_table[req_id[token_id],
+-            token_indices[token_id, indice_id] // BLOCK_SIZE] * BLOCK_SIZE
++            token_indices[token_id, indice_id] // BLOCK_SIZE] * BLOCK_STRIDE_ROWS
+         + token_indices[token_id, indice_id] % BLOCK_SIZE
+ 
+     Only when token_indices[token_id, indice_id] == -1 do we output -1.
+@@ -209,6 +215,7 @@ def triton_convert_req_index_to_global_index(
+         # shapes / constexprs
+         max_num_blocks_per_req,
+         BLOCK_SIZE,
++        BLOCK_STRIDE_ROWS,
+         BLOCK_N,
+         # strides
+         bt_stride0,
+@@ -290,6 +297,10 @@ class ROCMAiterMLASparseBackend(AttentionBackend):
+     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
+         return [1, MultipleOf(16)]
+ 
++    @staticmethod
++    def get_strided_block_page_rows(kv_cache_spec: KVCacheSpec) -> int:
++        return 1
++
+     @staticmethod
+     def get_name() -> str:
+         return "ROCM_AITER_MLA_SPARSE"
+@@ -316,8 +327,7 @@ def is_sparse(cls) -> bool:
+ 
+     @classmethod
+     def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+-        # Global index conversion assumes contiguous pages within each layer.
+-        return (KVCacheLayout.LBNHC, KVCacheLayout.LBHNC)
++        return (KVCacheLayout.LBNHC, KVCacheLayout.LBHNC, KVCacheLayout.BLHNC)
+ 
+     @classmethod
+     def supports_sink(cls) -> bool:
+@@ -1075,6 +1085,10 @@ def forward_mqa(
+             self.topk_indices_buffer[:num_actual_toks], attn_metadata.topk_tokens
+         )
+ 
++        kv_rows, block_stride_rows = flat_kv_row_view(
++            kv_c_and_k_pe_cache, attn_metadata.block_size
++        )
++
+         triton_convert_req_index_to_global_index(
+             attn_metadata.req_id_per_token,
+             attn_metadata.block_table,
+@@ -1082,12 +1096,13 @@ def forward_mqa(
+             attn_metadata.paged_kv_indptr,
+             attn_metadata.paged_kv_indices,
+             BLOCK_SIZE=attn_metadata.block_size,
++            BLOCK_STRIDE_ROWS=block_stride_rows,
+             NUM_TOPK_TOKENS=attn_metadata.topk_tokens,
+         )
+ 
+         # write the latent and rope to kv cache
+         if fp8_attention:
+-            kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.view(current_platform.fp8_dtype())
++            kv_rows = kv_rows.view(current_platform.fp8_dtype())
+             if q.dtype != current_platform.fp8_dtype():
+                 original_q_shape = q.shape
+                 q, _ = ops.scaled_fp8_quant(q.view(q.shape[0], -1), layer._q_scale)
+@@ -1099,5 +1114,5 @@ def forward_mqa(
+             return output, None
+         mla_padded_q = AiterMLAHelper.get_mla_padded_q(self.num_heads, q)
+         return self._forward_mla(
+-            layer, mla_padded_q, kv_c_and_k_pe_cache, attn_metadata
++            layer, mla_padded_q, kv_rows.unsqueeze(1), attn_metadata
+         )
+diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
+index d69b2f5fb348..cba3a5bb6b1e 100644
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -646,8 +646,7 @@ def __init__(
+         self.hash_block_size = hash_block_size
+         self.dcp_world_size = dcp_world_size
+         # Only groups that participate in prefix caching must satisfy the
+-        # divisibility constraint; groups that opt out (e.g. GLM-5.3-Flash kpool
+-        # tail, block_size=kpool) are scratch buffers and excluded.
++        # divisibility constraint; scratch groups are excluded.
+         cacheable_block_sizes = [
+             manager.block_size
+             for manager, group in zip(
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index 3f4f4e7bb164..134792d85854 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -10,7 +10,7 @@
+ from collections.abc import Callable, Iterable, Iterator, Sequence
+ from dataclasses import dataclass, field, replace
+ from functools import partial
+-from typing import TYPE_CHECKING, Any, NamedTuple, NewType, TypeAlias, cast, overload
++from typing import TYPE_CHECKING, Any, NamedTuple, NewType, TypeAlias, overload
+ 
+ from vllm import envs
+ from vllm.config import VllmConfig
+@@ -33,7 +33,6 @@
+     FullAttentionSpec,
+     HiddenStateCacheSpec,
+     HiSparseHotSpec,
+-    KpoolTailSpec,
+     KVCacheConfig,
+     KVCacheGroupSpec,
+     KVCacheLayout,
+@@ -986,7 +985,7 @@ def check_enough_kv_cache_memory(
+         # of the specs since grouping may unify them in-place.
+         groups = get_kv_cache_groups(vllm_config, dict(kv_cache_spec))
+         check_memory = (
+-            available_memory - _pool_bytes_per_block(groups)
++            available_memory - _get_kv_cache_bytes_per_block(groups)
+             if groups
+             else available_memory
+         )
+@@ -1097,15 +1096,6 @@ def may_override_num_blocks(vllm_config: VllmConfig, num_blocks: int) -> int:
+     return num_blocks
+ 
+ 
+-def _pool_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
+-    """Bytes consumed by one block in the worker's shared KV cache pool, mirroring
+-    the divisor used by `get_kv_cache_config_from_groups` to convert
+-    `available_memory` into `num_blocks`. Used to compute the effective KV cache
+-    capacity once `num_gpu_blocks_override` is applied.
+-    """
+-    return _get_kv_cache_bytes_per_block(kv_cache_groups)
+-
+-
+ def get_uniform_page_size(kv_cache_specs: Iterable[KVCacheSpec]) -> int:
+     """Get the page size of the KV cache."""
+     page_sizes = {layer.page_size_bytes for layer in kv_cache_specs}
+@@ -1145,205 +1135,6 @@ def _get_kv_cache_groups_uniform_type(
+     return [KVCacheGroupSpec(list(spec.kv_cache_specs.keys()), spec)]
+ 
+ 
+-def _pp_balanced_mamba_group_count(
+-    vllm_config: VllmConfig,
+-    mamba_layer_names: list[str],
+-    mla_layer_names: list[str],
+-) -> int | None:
+-    """Return a Mamba group count whose PP projections fit the MLA slots."""
+-    num_groups = cdiv(len(mamba_layer_names), len(mla_layer_names))
+-    pp_size = vllm_config.parallel_config.pipeline_parallel_size
+-    if pp_size == 1:
+-        return num_groups
+-
+-    from vllm.distributed.utils import get_pp_indices
+-    from vllm.model_executor.models.utils import extract_layer_index
+-
+-    total_layers = vllm_config.model_config.get_total_num_hidden_layers()
+-    mamba_indices = [extract_layer_index(name) for name in mamba_layer_names]
+-    mla_indices = [extract_layer_index(name) for name in mla_layer_names]
+-    for rank in range(pp_size):
+-        start, end = get_pp_indices(total_layers, rank, pp_size)
+-        num_mamba = sum(start <= index < end for index in mamba_indices)
+-        num_mla = sum(start <= index < end for index in mla_indices)
+-        if not num_mamba:
+-            continue
+-        if not num_mla:
+-            return None
+-        num_groups = max(num_groups, cdiv(num_mamba, num_mla))
+-    return num_groups
+-
+-
+-def _get_kv_cache_groups_glm5_next(
+-    vllm_config: VllmConfig,
+-    kv_cache_spec: dict[str, KVCacheSpec],
+-) -> list[KVCacheGroupSpec] | None:
+-    """Build GLM-5.3-Flash groups with Mamba/MLA and tail/indexer aliasing."""
+-    mamba_specs = {
+-        name: spec
+-        for name, spec in kv_cache_spec.items()
+-        if isinstance(spec, MambaSpec)
+-    }
+-    tail_specs = {
+-        name: spec
+-        for name, spec in kv_cache_spec.items()
+-        if isinstance(spec, KpoolTailSpec)
+-    }
+-    attn_specs = {
+-        name: spec
+-        for name, spec in kv_cache_spec.items()
+-        if not isinstance(spec, (MambaSpec, KpoolTailSpec))
+-    }
+-    if not mamba_specs or not all(
+-        type(spec) is MLAAttentionSpec for spec in attn_specs.values()
+-    ):
+-        return None
+-
+-    mla_specs = cast(dict[str, MLAAttentionSpec], attn_specs)
+-    idx_pages = {
+-        spec.page_size_bytes for spec in mla_specs.values() if spec.tokens_per_state > 1
+-    }
+-    if not idx_pages:
+-        return None
+-
+-    assert all(spec.page_size_padded is None for spec in mla_specs.values())
+-    assert len(idx_pages) == 1
+-    mla_names = [name for name, spec in mla_specs.items() if spec.tokens_per_state == 1]
+-    mla_pages = {mla_specs[name].page_size_bytes for name in mla_names}
+-    assert len(mla_pages) == 1
+-    mla_page = mla_pages.pop()
+-    uniform_spec = UniformTypeKVCacheSpecs.from_specs(attn_specs)
+-    assert uniform_spec is not None
+-
+-    tail_group: KVCacheGroupSpec | None = None
+-    if tail_specs:
+-        idx_page = next(iter(idx_pages))
+-        padded_tail_specs: dict[str, KVCacheSpec] = {
+-            name: replace(spec, page_size_padded=idx_page)
+-            for name, spec in tail_specs.items()
+-        }
+-        tail_uniform = UniformTypeKVCacheSpecs.from_specs(padded_tail_specs)
+-        assert tail_uniform is not None
+-        tail_group = KVCacheGroupSpec(list(padded_tail_specs), tail_uniform)
+-
+-    any_mamba = next(iter(mamba_specs.values()))
+-    assert all(spec == any_mamba for spec in mamba_specs.values())
+-    if any_mamba.real_page_size_bytes > mla_page:
+-        raise ValueError(
+-            f"the mamba state page ({any_mamba.real_page_size_bytes} bytes) "
+-            f"does not fit the MLA page ({mla_page} bytes); increase tensor "
+-            "parallelism or use a wider KV cache dtype"
+-        )
+-    padded_specs: dict[str, KVCacheSpec] = {
+-        name: replace(any_mamba, page_size_padded=mla_page) for name in mamba_specs
+-    }
+-    num_groups = _pp_balanced_mamba_group_count(
+-        vllm_config, list(mamba_specs), mla_names
+-    )
+-    if num_groups is None:
+-        raise ValueError(
+-            "a pipeline stage has mamba layers but no MLA layer to share "
+-            "slots with; realign the stage boundaries (VLLM_PP_LAYER_PARTITION)"
+-        )
+-    mamba_grouped_names: list[list[str]] = [[] for _ in range(num_groups)]
+-    for index, name in enumerate(mamba_specs):
+-        mamba_grouped_names[index % num_groups].append(name)
+-
+-    return (
+-        [KVCacheGroupSpec(list(attn_specs), uniform_spec)]
+-        + ([tail_group] if tail_group is not None else [])
+-        + create_kv_cache_group_specs(padded_specs, mamba_grouped_names)
+-    )
+-
+-
+-def _glm5_next_tensor_layout(
+-    kv_cache_groups: list[KVCacheGroupSpec],
+-) -> (
+-    tuple[
+-        KVCacheGroupSpec,
+-        list[KVCacheGroupSpec],
+-        list[str],
+-        list[str],
+-        int,
+-        int,
+-        list[str],
+-        int,
+-    ]
+-    | None
+-):
+-    """Recognize the GLM-5.3-Flash grouping after optional PP projection."""
+-    uniform_groups = [
+-        group
+-        for group in kv_cache_groups
+-        if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+-    ]
+-    mamba_groups = [
+-        group for group in kv_cache_groups if isinstance(group.kv_cache_spec, MambaSpec)
+-    ]
+-    attn_group: KVCacheGroupSpec | None = None
+-    tail_group: KVCacheGroupSpec | None = None
+-    for group in uniform_groups:
+-        inner = cast(UniformTypeKVCacheSpecs, group.kv_cache_spec).kv_cache_specs
+-        if all(type(spec) is MLAAttentionSpec for spec in inner.values()):
+-            attn_group = group
+-        elif all(isinstance(spec, KpoolTailSpec) for spec in inner.values()):
+-            tail_group = group
+-    if attn_group is None or not mamba_groups:
+-        return None
+-    if len(uniform_groups) + len(mamba_groups) != len(kv_cache_groups):
+-        return None
+-
+-    attn_uniform = cast(UniformTypeKVCacheSpecs, attn_group.kv_cache_spec)
+-    mla_inner = cast(dict[str, MLAAttentionSpec], attn_uniform.kv_cache_specs)
+-    if not all(
+-        type(spec) is MLAAttentionSpec and spec.page_size_padded is None
+-        for spec in mla_inner.values()
+-    ):
+-        return None
+-    mla_names = [
+-        name for name in attn_group.layer_names if mla_inner[name].tokens_per_state == 1
+-    ]
+-    idx_names = [
+-        name for name in attn_group.layer_names if mla_inner[name].tokens_per_state > 1
+-    ]
+-    mla_pages = {mla_inner[name].page_size_bytes for name in mla_names}
+-    idx_pages = {mla_inner[name].page_size_bytes for name in idx_names}
+-    if len(mla_pages) != 1 or len(idx_pages) != 1:
+-        return None
+-    mla_page = mla_pages.pop()
+-    idx_page = idx_pages.pop()
+-    if any(group.kv_cache_spec.page_size_bytes != mla_page for group in mamba_groups):
+-        return None
+-
+-    tail_names: list[str] = []
+-    tail_page = 0
+-    if tail_group is not None:
+-        tail_names = list(tail_group.layer_names)
+-        tail_inner = cast(
+-            UniformTypeKVCacheSpecs, tail_group.kv_cache_spec
+-        ).kv_cache_specs
+-        tail_pages = {
+-            cast(KpoolTailSpec, spec).unpadded_page_size_bytes
+-            for spec in tail_inner.values()
+-        }
+-        if len(tail_pages) != 1 or len(tail_names) != len(idx_names):
+-            return None
+-        tail_page = tail_pages.pop()
+-        if tail_page > idx_page:
+-            return None
+-
+-    return (
+-        attn_group,
+-        mamba_groups,
+-        mla_names,
+-        idx_names,
+-        mla_page,
+-        idx_page,
+-        tail_names,
+-        tail_page,
+-    )
+-
+-
+ def unify_kv_cache_spec_page_size(
+     kv_cache_spec: dict[str, KVCacheSpec],
+ ) -> dict[str, KVCacheSpec]:
+@@ -1570,11 +1361,7 @@ def _get_per_layer_spec(
+ def _get_kv_cache_bytes_per_block(
+     kv_cache_groups: list[KVCacheGroupSpec],
+ ) -> int:
+-    """Return the largest cache group's bytes per block."""
+-    if (glm5_layout := _glm5_next_tensor_layout(kv_cache_groups)) is not None:
+-        _, _, mla_names, idx_names, mla_page, idx_page, _, _ = glm5_layout
+-        return len(mla_names) * mla_page + len(idx_names) * idx_page
+-
++    """Return the largest cache group's aligned bytes per block."""
+     bytes_per_block = max(
+         sum(
+             _get_per_layer_spec(group, layer_name).page_size_bytes
+@@ -1664,69 +1451,6 @@ def get_kv_cache_config_from_groups(
+             vllm_config, kv_cache_groups, available_memory, host_budget
+         )
+ 
+-    if (glm5_layout := _glm5_next_tensor_layout(kv_cache_groups)) is not None:
+-        (
+-            attn_group,
+-            mamba_groups,
+-            mla_names,
+-            idx_names,
+-            mla_page,
+-            idx_page,
+-            tail_names,
+-            _,
+-        ) = glm5_layout
+-        bytes_per_block = len(mla_names) * mla_page + len(idx_names) * idx_page
+-        num_blocks = may_override_num_blocks(
+-            vllm_config, available_memory // bytes_per_block
+-        )
+-        size = bytes_per_block * num_blocks
+-        attn_specs = cast(
+-            UniformTypeKVCacheSpecs, attn_group.kv_cache_spec
+-        ).kv_cache_specs
+-
+-        kv_cache_tensors: list[KVCacheTensor] = []
+-
+-        def add_tensor(layer_name: str, spec: KVCacheSpec, offset: int) -> None:
+-            kv_cache_tensors.append(
+-                KVCacheTensor(
+-                    size=size,
+-                    layers=[layer_name],
+-                    layer_stride=spec.page_size_bytes * num_blocks,
+-                    block_stride=spec.page_size_bytes,
+-                    offset=offset,
+-                )
+-            )
+-
+-        for index, mla_name in enumerate(mla_names):
+-            offset = index * mla_page * num_blocks
+-            add_tensor(mla_name, attn_specs[mla_name], offset)
+-            for group in mamba_groups:
+-                if index < len(group.layer_names):
+-                    add_tensor(group.layer_names[index], group.kv_cache_spec, offset)
+-
+-        idx_base = len(mla_names) * mla_page * num_blocks
+-        for index, idx_name in enumerate(idx_names):
+-            offset = idx_base + index * idx_page * num_blocks
+-            add_tensor(idx_name, attn_specs[idx_name], offset)
+-            if tail_names:
+-                tail_name = tail_names[index]
+-                tail_group = next(
+-                    group for group in kv_cache_groups if tail_name in group.layer_names
+-                )
+-                tail_specs = cast(
+-                    UniformTypeKVCacheSpecs, tail_group.kv_cache_spec
+-                ).kv_cache_specs
+-                add_tensor(tail_name, tail_specs[tail_name], offset)
+-
+-        return KVCacheConfig(
+-            num_blocks=num_blocks,
+-            kv_cache_tensors=kv_cache_tensors,
+-            kv_cache_groups=kv_cache_groups,
+-            prefix_cache_retention_interval=(
+-                vllm_config.cache_config.prefix_cache_retention_interval
+-            ),
+-        )
+-
+     layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
+     validate_kv_cache_layout(layout, kv_cache_groups)
+     bytes_per_block = _get_kv_cache_bytes_per_block(kv_cache_groups)
+@@ -2296,9 +2020,6 @@ def get_kv_cache_groups(
+         # full attention, or all layers are sliding window attention with the
+         # same window size). Put all layers into one group.
+         return _get_kv_cache_groups_uniform_type(uniform_spec)
+-    elif glm5_groups := _get_kv_cache_groups_glm5_next(vllm_config, kv_cache_spec):
+-        return glm5_groups
+-
+     # Hidden-state layers use their own block table and must not be absorbed
+     # into a compatible attention bucket.
+     hidden_specs = {
+@@ -2433,32 +2154,7 @@ def _max_memory_usage_bytes_from_groups(
+ 
+     if vllm_config.attention_config.hisparse_config is not None:
+         return get_hisparse_gpu_memory_usage(vllm_config, kv_cache_groups)
+-
+-    if (glm5_layout := _glm5_next_tensor_layout(kv_cache_groups)) is not None:
+-        (
+-            attn_group,
+-            mamba_groups,
+-            mla_names,
+-            idx_names,
+-            mla_page,
+-            idx_page,
+-            tail_names,
+-            _,
+-        ) = glm5_layout
+-        uniform_spec = cast(UniformTypeKVCacheSpecs, attn_group.kv_cache_spec)
+-        total_blocks = uniform_spec.max_memory_usage_pages(vllm_config)
+-        total_blocks += sum(
+-            cdiv(
+-                group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+-                group.kv_cache_spec.page_size_bytes,
+-            )
+-            for group in mamba_groups
+-        )
+-        if tail_names:
+-            total_blocks += 1
+-        return total_blocks * (len(mla_names) * mla_page + len(idx_names) * idx_page)
+-
+-    bytes_per_block = _pool_bytes_per_block(kv_cache_groups)
++    bytes_per_block = _get_kv_cache_bytes_per_block(kv_cache_groups)
+     total_blocks = 0
+     for group in kv_cache_groups:
+         spec = group.kv_cache_spec
+@@ -2712,7 +2408,7 @@ def get_kv_cache_configs(
+             if not groups:
+                 adjusted_memory.append(avail_mem)
+                 continue
+-            bytes_per_block = _pool_bytes_per_block(groups)
++            bytes_per_block = _get_kv_cache_bytes_per_block(groups)
+             logger.info(
+                 "Overriding num_gpu_blocks=%d with num_gpu_blocks_override=%d",
+                 avail_mem // bytes_per_block,
+@@ -2728,7 +2424,7 @@ def get_kv_cache_configs(
+     # the capacity check both plan against usable blocks. Allocation below
+     # still uses the full memory.
+     check_memory = [
+-        avail_mem - _pool_bytes_per_block(groups) if groups else avail_mem
++        avail_mem - _get_kv_cache_bytes_per_block(groups) if groups else avail_mem
+         for groups, avail_mem in zip(projected_groups_per_worker, available_memory)
+     ]
+ 
+@@ -2772,7 +2468,9 @@ def get_kv_cache_configs(
+         # strides and offsets stay consistent with the shrunken allocation.
+         groups = kv_cache_config.kv_cache_groups
+         kv_cache_configs[i] = get_kv_cache_config_from_groups(
+-            vllm_config, groups, min_num_blocks * _pool_bytes_per_block(groups)
++            vllm_config,
++            groups,
++            min_num_blocks * _get_kv_cache_bytes_per_block(groups),
+         )
+ 
+     return kv_cache_configs
+diff --git a/vllm/v1/hisparse/binding.py b/vllm/v1/hisparse/binding.py
+index 716211fbb30a..9b2cda58abc0 100644
+--- a/vllm/v1/hisparse/binding.py
++++ b/vllm/v1/hisparse/binding.py
+@@ -96,16 +96,13 @@ def allocate_hisparse_kv_caches(
+             if isinstance(host_spec, UniformTypeKVCacheSpecs)
+             else host_spec
+         )
+-        kernel_block_size = kernel_block_sizes[host_group_id]
+-        if isinstance(spec, MLAAttentionSpec) and spec.storage_block_size is not None:
+-            kernel_block_size = spec.storage_block_size
+         views = create_kv_cache_views(
+             backing,
+             spec,
+             kv_cache_config.num_blocks_of(tensor),
+             layout,
+             tensor,
+-            kernel_block_size=kernel_block_size,
++            kernel_block_size=kernel_block_sizes[host_group_id],
+         )
+         kv_caches.update(zip(tensor.layers, views))
+     return kv_caches
+diff --git a/vllm/v1/kv_cache_interface.py b/vllm/v1/kv_cache_interface.py
+index 5791704b2bfd..0fa610a09f79 100644
+--- a/vllm/v1/kv_cache_interface.py
++++ b/vllm/v1/kv_cache_interface.py
+@@ -661,8 +661,8 @@ class MLAAttentionSpec(FullAttentionSpec):
+     model_version: str | None = None
+     cache_role: SparseCacheRole = SparseCacheRole.SPARSE
+     is_index_group_leader: bool = False
+-    storage_block_size: int | None = None
+-    """Token width used to view storage when it differs from the kernel block."""
++    kernel_page_size: int | None = None
++    """Token width of a virtual kernel page inside a manager block."""
+     # Group capability enabled when any member flattens a non-causal query block
+     # into decode rows. Runtime metadata still selects causal vs. non-causal mode.
+     non_causal_multi_token_decode: bool = False
+@@ -673,6 +673,15 @@ def __post_init__(self):
+         super().__post_init__()
+         _apply_alignment_padding(self)
+ 
++    def copy_with_new_block_size(self, block_size: int) -> Self:
++        return replace(
++            self,
++            block_size=block_size,
++            kernel_page_size=(
++                self.kernel_page_size if block_size == self.block_size else None
++            ),
++        )
++
+     @classmethod
+     def merge(cls, specs: list[Self]) -> Self:
+         assert all(isinstance(spec, MLAAttentionSpec) for spec in specs), (
+@@ -683,7 +692,7 @@ def merge(cls, specs: list[Self]) -> Self:
+         model_version_set = set(spec.model_version for spec in specs)
+         cache_role_set = {spec.cache_role for spec in specs}
+         index_group_leader_set = {spec.is_index_group_leader for spec in specs}
+-        storage_block_size_set = set(spec.storage_block_size for spec in specs)
++        kernel_page_size_set = {spec.kernel_page_size for spec in specs}
+         block_stride_alignment_set = {spec.block_stride_alignment for spec in specs}
+         assert (
+             len(cache_dtype_str_set) == 1
+@@ -691,12 +700,12 @@ def merge(cls, specs: list[Self]) -> Self:
+             and len(model_version_set) == 1
+             and len(cache_role_set) == 1
+             and len(index_group_leader_set) == 1
+-            and len(storage_block_size_set) == 1
++            and len(kernel_page_size_set) == 1
+             and len(block_stride_alignment_set) == 1
+         ), (
+             "All attention layers in the same KV cache group must use the same "
+             "quantization method, tokens per state, model version, cache role, "
+-            "index-sharing role, storage block size and block stride alignment."
++            "index-sharing role, kernel page size and block stride alignment."
+         )
+         merged_spec = cls(
+             block_size=specs[0].block_size,
+@@ -713,7 +722,7 @@ def merge(cls, specs: list[Self]) -> Self:
+             model_version=model_version_set.pop(),
+             cache_role=cache_role_set.pop(),
+             is_index_group_leader=index_group_leader_set.pop(),
+-            storage_block_size=storage_block_size_set.pop(),
++            kernel_page_size=kernel_page_size_set.pop(),
+             block_stride_alignment=block_stride_alignment_set.pop(),
+             non_causal_multi_token_decode=any(
+                 spec.non_causal_multi_token_decode for spec in specs
+@@ -728,6 +737,24 @@ def merge(cls, specs: list[Self]) -> Self:
+         return merged_spec
+ 
+ 
++def get_cache_view_spec(
++    spec: KVCacheSpec,
++    kernel_block_size: int | None,
++    block_stride_bytes: int | None,
++) -> KVCacheSpec:
++    """Select the cache view shared by allocation and metadata builders."""
++    if (
++        isinstance(spec, MLAAttentionSpec)
++        and spec.kernel_page_size is not None
++        and block_stride_bytes == spec.page_size_bytes
++        and (kernel_block_size is None or kernel_block_size < spec.block_size)
++    ):
++        return spec.copy_with_new_block_size(spec.kernel_page_size)
++    if kernel_block_size is None:
++        return spec
++    return spec.copy_with_new_block_size(kernel_block_size)
++
++
+ @dataclass(frozen=True, kw_only=True)
+ class HiddenStateCacheSpec(MLAAttentionSpec):
+     """Marker for hidden-state cache layers used by extract_hidden_states."""
+diff --git a/vllm/v1/spec_decode/llm_base_proposer.py b/vllm/v1/spec_decode/llm_base_proposer.py
+index e4718bb3d7d1..3dff91912572 100644
+--- a/vllm/v1/spec_decode/llm_base_proposer.py
++++ b/vllm/v1/spec_decode/llm_base_proposer.py
+@@ -64,7 +64,7 @@
+ from vllm.v1.utils import CpuGpuBuffer
+ from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
+ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
+-from vllm.v1.worker.utils import AttentionGroup
++from vllm.v1.worker.utils import AttentionGroup, group_block_stride_bytes
+ 
+ logger = init_logger(__name__)
+ 
+@@ -1759,6 +1759,9 @@ def initialize_attn_backend(
+                         self.vllm_config,
+                         self.device,
+                         kernel_block_size=kernel_block_size,
++                        block_stride_bytes=group_block_stride_bytes(
++                            kv_cache_config, attn_group.layer_names
++                        ),
+                     )
+                     attention_groups[backend_key] = attn_group
+                 else:
+diff --git a/vllm/v1/worker/gpu/attn_utils.py b/vllm/v1/worker/gpu/attn_utils.py
+index 19de125a9bd6..c00df1eb68a2 100644
+--- a/vllm/v1/worker/gpu/attn_utils.py
++++ b/vllm/v1/worker/gpu/attn_utils.py
+@@ -39,6 +39,7 @@
+     add_kv_sharing_layers_to_kv_cache_groups,
+     allocate_kv_cache,
+     bind_kv_cache_to_layers,
++    group_block_stride_bytes,
+     prepare_kernel_block_sizes,
+ )
+ 
+@@ -266,6 +267,9 @@ def init_attn_backend(
+                 # builders keep the prepared metadata on themselves (MLA stores
+                 # it on the prefill backend), so each ubatch needs its own.
+                 num_metadata_builders=get_num_ubatches(vllm_config.parallel_config),
++                block_stride_bytes=group_block_stride_bytes(
++                    kv_cache_config, group.layer_names
++                ),
+             )
+             # The microbatches' builders share the workspace: they all issue
+             # attention on the one compute stream the threads hand off, so the
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 3dc0524babe2..6208677b7d6a 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -222,6 +222,7 @@
+ )
+ from vllm.v1.worker.utils import (
+     EncoderTimingStats,
++    group_block_stride_bytes,
+     is_residual_scattered_for_sp,
+     raise_if_nan_logits,
+ )
+@@ -7092,6 +7093,9 @@ def initialize_metadata_builders(
+                     num_metadata_builders=1
+                     if not self.parallel_config.use_ubatching
+                     else self.parallel_config.num_ubatches,
++                    block_stride_bytes=group_block_stride_bytes(
++                        kv_cache_config, attn_group.layer_names
++                    ),
+                 )
+         # Calculate reorder batch threshold (if needed)
+         # Note (tdoublep): do this *after* constructing builders,
+diff --git a/vllm/v1/worker/utils.py b/vllm/v1/worker/utils.py
+index a6ef84bbd3d7..fee7d6fc7a04 100644
+--- a/vllm/v1/worker/utils.py
++++ b/vllm/v1/worker/utils.py
+@@ -35,9 +35,9 @@
+     KVCacheLayout,
+     KVCacheSpec,
+     MambaSpec,
+-    MLAAttentionSpec,
+     UniformTypeKVCacheSpecs,
+     create_kv_cache_views,
++    get_cache_view_spec,
+ )
+ from vllm.v1.worker.block_table import get_block_table_width
+ 
+@@ -274,22 +274,13 @@ def create_metadata_builders(
+         device,
+         kernel_block_size: int | None = None,
+         num_metadata_builders: int = 1,
++        block_stride_bytes: int | None = None,
+     ):
+-        if kernel_block_size is None:
+-            kv_cache_spec_builder = self.kv_cache_spec
+-        elif (
+-            isinstance(self.kv_cache_spec, MLAAttentionSpec)
+-            and self.kv_cache_spec.storage_block_size is not None
+-        ):
+-            kv_cache_spec_builder = self.kv_cache_spec.copy_with_new_block_size(
+-                self.kv_cache_spec.storage_block_size
+-            )
+-        else:
+-            kv_cache_spec_builder = self.kv_cache_spec.copy_with_new_block_size(
+-                kernel_block_size
+-            )
++        kv_cache_spec_builder = get_cache_view_spec(
++            self.kv_cache_spec, kernel_block_size, block_stride_bytes
++        )
+         builder_cls = self.backend.get_builder_cls()
+-        builder_kwargs = {}
++        builder_kwargs: dict[str, int | None] = {}
+         if builder_cls.requires_block_table_width:
+             max_num_blocks = self.kv_cache_spec.max_num_blocks_per_req(
+                 vllm_config, vllm_config.model_config.max_model_len
+@@ -297,6 +288,8 @@ def create_metadata_builders(
+             builder_kwargs["block_table_width"] = get_block_table_width(
+                 max_num_blocks, self.kv_cache_spec.block_size, kernel_block_size
+             )
++        if builder_cls.requires_block_stride_bytes:
++            builder_kwargs["block_stride_bytes"] = block_stride_bytes
+         self.metadata_builders = [
+             builder_cls(
+                 kv_cache_spec_builder,
+@@ -392,6 +385,31 @@ def block_size_is_supported(
+     )
+ 
+ 
++def select_common_block_size_for_layout(
++    kv_manager_block_size: int,
++    backend_layouts: Sequence[tuple[type[AttentionBackend], KVCacheSpec | None, bool]],
++) -> int:
++    """Keep manager blocks when every backend supports its cache layout."""
++    native_backends = [
++        backend
++        for backend, spec, is_strided in backend_layouts
++        if not (
++            is_strided
++            and spec is not None
++            and backend.get_strided_block_page_rows(spec) is not None
++        )
++    ]
++    native_size = select_common_block_size(kv_manager_block_size, native_backends)
++    if native_size == kv_manager_block_size:
++        return kv_manager_block_size
++    if any(is_strided for _, _, is_strided in backend_layouts):
++        raise ValueError(
++            "A strided KV cache cannot share a group with a backend that "
++            "requires splitting manager blocks."
++        )
++    return native_size
++
++
+ def allocate_kv_cache(
+     kv_cache_config: KVCacheConfig,
+     device: torch.device,
+@@ -446,21 +464,31 @@ def allocate_kv_cache(
+         kernel_block_size = None
+         if kernel_block_sizes is not None and group_id < len(kernel_block_sizes):
+             kernel_block_size = kernel_block_sizes[group_id]
+-        if isinstance(spec, MLAAttentionSpec) and spec.storage_block_size is not None:
+-            kernel_block_size = spec.storage_block_size
+-
++        cache_view_spec = get_cache_view_spec(
++            spec, kernel_block_size, tensor.block_stride
++        )
+         views = create_kv_cache_views(
+             buf,
+             spec,
+             num_blocks,
+             layout,
+             tensor,
+-            kernel_block_size=kernel_block_size,
++            kernel_block_size=cache_view_spec.block_size,
+         )
+         kv_caches.update(zip(tensor.layers, views))
+     return kv_caches
+ 
+ 
++def group_block_stride_bytes(
++    kv_cache_config: KVCacheConfig, attention_group_layer_names: Iterable[str]
++) -> int | None:
++    layer_names = set(attention_group_layer_names)
++    for tensor in kv_cache_config.kv_cache_tensors:
++        if layer_names.intersection(tensor.layers):
++            return tensor.block_stride
++    return None
++
++
+ def prepare_kernel_block_sizes(
+     kv_cache_config: KVCacheConfig, attn_groups: list[list[AttentionGroup]]
+ ) -> list[int]:
+@@ -478,6 +506,11 @@ def prepare_kernel_block_sizes(
+         List of kernel block sizes for each cache group.
+ 
+     """
++    block_strides = {
++        layer_name: tensor.block_stride
++        for tensor in kv_cache_config.kv_cache_tensors
++        for layer_name in tensor.layers
++    }
+     kernel_block_sizes = []
+     for kv_cache_gid, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
+         kv_cache_spec = kv_cache_group.kv_cache_spec
+@@ -492,9 +525,20 @@ def prepare_kernel_block_sizes(
+         elif isinstance(kv_cache_spec, AttentionSpec):
+             # This is an attention backend that supports virtual block splitting.
+             kv_manager_block_size = kv_cache_group.kv_cache_spec.block_size
+-            group_backends = [g.backend for g in attn_groups[kv_cache_gid]]
+-            selected_kernel_size = select_common_block_size(
+-                kv_manager_block_size, group_backends
++            groups = attn_groups[kv_cache_gid]
++            selected_kernel_size = select_common_block_size_for_layout(
++                kv_manager_block_size,
++                [
++                    (
++                        group.backend,
++                        group.kv_cache_spec,
++                        all(
++                            block_strides[name] > group.kv_cache_spec.page_size_bytes
++                            for name in group.layer_names
++                        ),
++                    )
++                    for group in groups
++                ],
+             )
+             kernel_block_sizes.append(selected_kernel_size)
+         elif isinstance(kv_cache_spec, MambaSpec):

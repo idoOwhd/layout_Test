@@ -1,0 +1,466 @@
+diff --git a/include/triton/Dialect/Triton/IR/Traits.h b/include/triton/Dialect/Triton/IR/Traits.h
+index 392436308b59..abbebb18fc97 100644
+--- a/include/triton/Dialect/Triton/IR/Traits.h
++++ b/include/triton/Dialect/Triton/IR/Traits.h
+@@ -27,6 +27,7 @@ LogicalResult verifyTensorSize(Operation *op);
+ LogicalResult verifyTensorLayouts(Operation *op);
+ 
+ LogicalResult verifySameOperandsEncoding(Operation *op);
++LogicalResult verifySameResultsType(Operation *op);
+ LogicalResult verifyEquivalentTensorType(Type typeA, Type typeB);
+ LogicalResult verifySameOperandsAndResultEncoding(Operation *op);
+ 
+@@ -73,6 +74,14 @@ class SameOperandsEncoding
+   }
+ };
+ 
++template <typename ConcreteType>
++class SameResultsType : public TraitBase<ConcreteType, SameResultsType> {
++public:
++  static LogicalResult verifyTrait(Operation *op) {
++    return impl::verifySameResultsType(op);
++  }
++};
++
+ template <typename ConcreteType>
+ class SameLoadStoreOperandsShape
+     : public TraitBase<ConcreteType, SameLoadStoreOperandsShape> {
+diff --git a/include/triton/Dialect/Triton/IR/TritonInterfaces.td b/include/triton/Dialect/Triton/IR/TritonInterfaces.td
+index 37da4c1d2f49..1804e0f576bd 100644
+--- a/include/triton/Dialect/Triton/IR/TritonInterfaces.td
++++ b/include/triton/Dialect/Triton/IR/TritonInterfaces.td
+@@ -7,6 +7,7 @@ include "mlir/Interfaces/InferTypeOpInterface.td"
+ def TensorSizeTrait : NativeOpTrait<"TensorSizeTrait">;
+ def VerifyTensorLayoutsTrait : NativeOpTrait<"VerifyTensorLayoutsTrait">;
+ def SameOperandsEncoding : NativeOpTrait<"SameOperandsEncoding">;
++def SameResultsType : NativeOpTrait<"SameResultsType">;
+ def SameOperandsAndResultEncoding : NativeOpTrait<"SameOperandsAndResultEncoding">;
+ def SameLoadStoreOperandsShape : NativeOpTrait<"SameLoadStoreOperandsShape">;
+ def SameLoadStoreOperandsAndResultShape : NativeOpTrait<"SameLoadStoreOperandsAndResultShape">;
+diff --git a/include/triton/Dialect/Triton/IR/TritonOps.td b/include/triton/Dialect/Triton/IR/TritonOps.td
+index 9da816e6cf42..6a28be58bdd1 100644
+--- a/include/triton/Dialect/Triton/IR/TritonOps.td
++++ b/include/triton/Dialect/Triton/IR/TritonOps.td
+@@ -604,6 +604,7 @@ def TT_JoinOp : TT_Op<"join", [
+ 
+ def TT_SplitOp : TT_Op<"split", [
+   Pure,
++  SameResultsType,
+   InferTypeOpAdaptorWithIsCompatible,
+   TypesMatchWith<"outLHS and outRHS types match",
+                   "outLHS", "outRHS", "$_self">,
+diff --git a/lib/Dialect/Gluon/Transforms/InferLayoutUtils.cpp b/lib/Dialect/Gluon/Transforms/InferLayoutUtils.cpp
+index cd052bbd1909..5da9e57186b2 100644
+--- a/lib/Dialect/Gluon/Transforms/InferLayoutUtils.cpp
++++ b/lib/Dialect/Gluon/Transforms/InferLayoutUtils.cpp
+@@ -5,6 +5,7 @@
+ #include "mlir/Support/LLVM.h"
+ #include "triton/Dialect/Gluon/IR/Dialect.h"
+ #include "triton/Dialect/Gluon/Transforms/Passes.h"
++#include "triton/Dialect/Triton/IR/Traits.h"
+ #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+ #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+ #include "llvm/ADT/MapVector.h"
+@@ -23,14 +24,18 @@ namespace mlir::triton::gluon {
+ namespace {
+ struct LayoutInfo {
+   Attribute encoding;
+-  // Some operations can infer one of many encodings,
+-  // we model this by setting the mayVary flag on encodings
+-  // derived from these ops.
+-  // If "may vary" is set then we allow conflicts, and when
+-  // resolving conflicts we prefer encodings that are not allowed to vary.
+-  bool mayVary = false;
++  // Some operations can infer one of many encodings, we model this by
++  // incrementing the "distance" each time a fuzzy inference occurs.
++  // We preferrentially resolve to encodings with smallest distance, but ban
++  // ambiguity when there is zero distance, since that implies set_auto_layout
++  // was called on the op.
++  unsigned distance = 0;
+ 
+   operator bool() { return bool(encoding); }
++
++  bool operator==(const LayoutInfo &other) const {
++    return encoding == other.encoding && distance == other.distance;
++  }
+ };
+ 
+ uint64_t hashWithMemo(Attribute attr,
+@@ -60,14 +65,15 @@ bool compare(Attribute a, Attribute b,
+ 
+ LayoutInfo combineInfo(LayoutInfo lhs, LayoutInfo rhs, Operation *op,
+                        llvm::MapVector<Attribute, uint64_t> &hashMemo) {
++  if (lhs.distance != rhs.distance)
++    return lhs.distance < rhs.distance ? lhs : rhs;
++
+   // Sort inputs so this operation is commutative
+   if (compare(lhs.encoding, rhs.encoding, hashMemo)) {
+     std::swap(lhs, rhs);
+   }
+-  if (lhs.mayVary)
++  if (lhs.distance != 0)
+     return rhs;
+-  if (rhs.mayVary)
+-    return lhs;
+   if (lhs.encoding == rhs.encoding)
+     return lhs;
+   op->emitOpError("found conflicting encodings for value:\n  ")
+@@ -80,6 +86,24 @@ bool encodingsMayVary(Operation *op) {
+              triton::TransOp>(op);
+ }
+ 
++bool hasSameOperandsAndResultEncoding(Operation *op) {
++  return op->hasTrait<OpTrait::SameOperandsAndResultType>() ||
++         op->hasTrait<OpTrait::SameOperandsAndResultEncoding>() ||
++         op->hasTrait<OpTrait::SameLoadStoreOperandsAndResultEncoding>();
++}
++
++bool hasSameOperandsEncoding(Operation *op) {
++  return op->hasTrait<OpTrait::SameTypeOperands>() ||
++         op->hasTrait<OpTrait::SameOperandsEncoding>() ||
++         op->hasTrait<OpTrait::SameLoadStoreOperandsEncoding>() ||
++         hasSameOperandsAndResultEncoding(op);
++}
++
++bool hasSameResultsEncoding(Operation *op) {
++  return op->hasTrait<OpTrait::SameResultsType>() ||
++         hasSameOperandsAndResultEncoding(op);
++}
++
+ LogicalResult
+ updateEncoding(ArrayRef<Value> values, LayoutInfo info, FuncOp *func,
+                llvm::MapVector<Value, LayoutInfo> &valueToEncoding,
+@@ -99,7 +123,8 @@ updateEncoding(ArrayRef<Value> values, LayoutInfo info, FuncOp *func,
+     }
+     LLVM_DEBUG({
+       DBGS() << "Setting value:\n\t" << value << "\nto encoding:\n\t"
+-             << it->second.encoding << "\n";
++             << it->second.encoding << " (distance " << it->second.distance
++             << ")\n";
+     });
+     worklist.insert(value);
+   }
+@@ -128,11 +153,21 @@ LogicalResult inferLayout(
+   llvm::PriorityWorklist<Value> worklist;
+   llvm::MapVector<Attribute, uint64_t> hashMemo;
+   for (auto &[value, encoding] : seedEncodings) {
+-    if (failed(updateEncoding({value}, LayoutInfo{encoding, false}, &func,
++    if (failed(updateEncoding({value}, LayoutInfo{encoding, 0}, &func,
+                               valueToEncoding, worklist, hashMemo)))
+       return failure();
+   }
+ 
++  // Equality constraints propagate without introducing an encoding choice.
++  auto propagateSameEncoding = [&](ValueRange values, LayoutInfo info) {
++    SmallVector<Value> inferredValues;
++    for (Value value : values)
++      if (typeCheck(value.getType()))
++        inferredValues.push_back(value);
++    return updateEncoding(inferredValues, info, &func, valueToEncoding,
++                          worklist, hashMemo);
++  };
++
+   // Propagate encodings through the graph until fixed point, or conflict
+   while (!worklist.empty()) {
+     auto val = worklist.pop_back_val();
+@@ -142,6 +177,9 @@ LogicalResult inferLayout(
+     // Propagate to users
+     for (OpOperand &use : val.getUses()) {
+       auto op = use.getOwner();
++      if (hasSameOperandsEncoding(op) &&
++          failed(propagateSameEncoding(op->getOperands(), info)))
++        return failure();
+       if (isa<scf::ForOp, scf::WhileOp>(op)) {
+         auto offset = 3 * isa<scf::ForOp>(op);
+         auto tiedArgs = getTiedArgs(op, use.getOperandNumber() - offset);
+@@ -157,8 +195,8 @@ LogicalResult inferLayout(
+       } else {
+         auto dstEnc = inferDstEncoding(op, info.encoding);
+         if (dstEnc) {
+-          bool mayVary = info.mayVary || encodingsMayVary(op);
+-          LayoutInfo dstInfo{dstEnc, mayVary};
++          unsigned distance = info.distance + encodingsMayVary(op);
++          LayoutInfo dstInfo{dstEnc, distance};
+           if (failed(updateEncoding(llvm::to_vector_of<Value>(op->getResults()),
+                                     dstInfo, &func, valueToEncoding, worklist,
+                                     hashMemo)))
+@@ -170,6 +208,9 @@ LogicalResult inferLayout(
+     // Propagate to defining ops
+     if (auto opResult = dyn_cast<OpResult>(val)) {
+       auto definingOp = opResult.getOwner();
++      if (hasSameResultsEncoding(definingOp) &&
++          failed(propagateSameEncoding(definingOp->getResults(), info)))
++        return failure();
+       if (isa<scf::ForOp, scf::WhileOp, scf::IfOp>(definingOp)) {
+         auto tiedArgs = getTiedArgs(definingOp, opResult.getResultNumber());
+         if (failed(updateEncoding(tiedArgs, info, &func, valueToEncoding,
+@@ -178,8 +219,8 @@ LogicalResult inferLayout(
+       } else {
+         auto srcEncoding = inferSrcEncoding(definingOp, info.encoding);
+         if (srcEncoding) {
+-          bool mayVary = info.mayVary || encodingsMayVary(definingOp);
+-          LayoutInfo srcInfo{srcEncoding, mayVary};
++          unsigned distance = info.distance + encodingsMayVary(definingOp);
++          LayoutInfo srcInfo{srcEncoding, distance};
+           llvm::SmallVector<Value> tensorOperands;
+           for (auto operand : definingOp->getOperands())
+             if (isa<RankedTensorType>(operand.getType()))
+diff --git a/lib/Dialect/Triton/IR/Traits.cpp b/lib/Dialect/Triton/IR/Traits.cpp
+index 4d1d460c12a4..46a08a5f5527 100644
+--- a/lib/Dialect/Triton/IR/Traits.cpp
++++ b/lib/Dialect/Triton/IR/Traits.cpp
+@@ -79,6 +79,18 @@ OpTrait::impl::verifySameOperandsAndResultEncoding(Operation *op) {
+   return verifySameOperandsEncoding(op);
+ }
+ 
++LogicalResult OpTrait::impl::verifySameResultsType(Operation *op) {
++  if (failed(verifyAtLeastNResults(op, 1)))
++    return failure();
++
++  auto type = op->getResult(0).getType();
++  for (auto resultType : llvm::drop_begin(op->getResultTypes()))
++    if (resultType != type)
++      return op->emitOpError() << "requires the same type for all results";
++
++  return success();
++}
++
+ LogicalResult OpTrait::impl::verifyTensorSize(Operation *op) {
+   for (auto opType : op->getOperandTypes()) {
+     if (auto tensorType = dyn_cast<RankedTensorType>(opType)) {
+diff --git a/test/Gluon/auto_encoding.mlir b/test/Gluon/auto_encoding.mlir
+index 68ebcef9598f..03ae50a7a90b 100644
+--- a/test/Gluon/auto_encoding.mlir
++++ b/test/Gluon/auto_encoding.mlir
+@@ -198,4 +198,170 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
+     }) : (tensor<16xi32, #gluon.auto_encoding>) -> i32
+     tt.return %2 : i32
+   }
++
++  // The scalar results cannot propagate a layout between the two operands.
++  // CHECK-LABEL: @infer_reduce_operands_to_scalar
++  // CHECK: arith.constant dense<1> : tensor<16xi32, [[ENC:#.*]]>
++  // CHECK: arith.constant {{.*}} : tensor<16xf32, [[ENC]]>
++  // CHECK: "tt.reduce"
++  // CHECK-NOT: auto_encoding
++  // CHECK: tt.return
++  tt.func public @infer_reduce_operands_to_scalar() -> (i32, f32) {
++    %ints = arith.constant dense<1> : tensor<16xi32, #gluon.auto_encoding>
++    %floats = arith.constant dense<1.0> : tensor<16xf32, #gluon.auto_encoding>
++    %fixed = gluon.set_auto_layout %ints : tensor<16xi32, #gluon.auto_encoding> -> tensor<16xi32, #blocked>
++    %result:2 = "tt.reduce"(%ints, %floats) <{axis = 0 : i32}> ({
++    ^bb0(%lhs_i: i32, %lhs_f: f32, %rhs_i: i32, %rhs_f: f32):
++      %sum_i = arith.addi %lhs_i, %rhs_i : i32
++      %sum_f = arith.addf %lhs_f, %rhs_f : f32
++      tt.reduce.return %sum_i, %sum_f : i32, f32
++    }) : (tensor<16xi32, #gluon.auto_encoding>, tensor<16xf32, #gluon.auto_encoding>) -> (i32, f32)
++    tt.return %result#0, %result#1 : i32, f32
++  }
++}
++
++// -----
++
++// The reshape can provisionally infer a linear encoding for the cast result.
++// The explicit slice seed must refine it so both sides of the cast agree.
++// CHECK-LABEL: @refine_reshape_layout
++// CHECK: %[[POSITIONS:.*]] = tt.make_range {{.*}} : tensor<8xi32, #ttg.slice<{dim = 1, parent = [[BLOCKED:#.*]]}>>
++// CHECK: %[[CAST:.*]] = arith.sitofp %[[POSITIONS]] : tensor<8xi32, #ttg.slice<{dim = 1, parent = [[BLOCKED]]}>> to tensor<8xf32, #ttg.slice<{dim = 1, parent = [[BLOCKED]]}>>
++// CHECK: tt.reshape %[[CAST]]
++// CHECK-NOT: auto_encoding
++// CHECK: tt.return
++#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
++#slice = #ttg.slice<{dim = 1, parent = #blocked}>
++module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:103", "ttg.threads-per-warp" = 32 : i32} {
++  tt.func public @refine_reshape_layout() -> (tensor<8xi32, #slice>, tensor<8x1xf32, #blocked>) {
++    %positions = tt.make_range {end = 8 : i32, start = 0 : i32} : tensor<8xi32, #gluon.auto_encoding>
++    %cast = arith.sitofp %positions : tensor<8xi32, #gluon.auto_encoding> to tensor<8xf32, #gluon.auto_encoding>
++    %expanded = tt.reshape %cast : tensor<8xf32, #gluon.auto_encoding> -> tensor<8x1xf32, #gluon.auto_encoding>
++    %fixed_positions = gluon.set_auto_layout %positions : tensor<8xi32, #gluon.auto_encoding> -> tensor<8xi32, #slice>
++    %fixed_expanded = gluon.set_auto_layout %expanded : tensor<8x1xf32, #gluon.auto_encoding> -> tensor<8x1xf32, #blocked>
++    tt.return %fixed_positions, %fixed_expanded : tensor<8xi32, #slice>, tensor<8x1xf32, #blocked>
++  }
++}
++
++// -----
++
++// Join permits several result register orders. Keep the order inferred
++// backwards from the dot operand instead of replacing it with the default.
++// CHECK-LABEL: @preserve_join_layout
++// CHECK-NOT: auto_encoding
++// CHECK: %[[LHS:.*]] = tt.trans {{.*}} -> tensor<4x128x16xbf16, #ttg.dot_op<
++// CHECK-NEXT: tt.return %[[LHS]]
++#mma = #ttg.nvidia_mma<{versionMajor = 2, versionMinor = 0, warpsPerCTA = [4, 1, 1], instrShape = [1, 16, 8]}>
++#dot = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>
++#auto = #gluon.auto_encoding
++module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:103", "ttg.threads-per-warp" = 32 : i32} {
++  tt.func public @preserve_join_layout(%arg: bf16) -> tensor<4x128x16xbf16, #dot> {
++    %input = tt.splat %arg : bf16 -> tensor<4x8x128xbf16, #auto>
++    %padding = arith.constant dense<0.0> : tensor<4x8x128xbf16, #auto>
++    %joined = tt.join %input, %padding : tensor<4x8x128xbf16, #auto> -> tensor<4x8x128x2xbf16, #auto>
++    %transposed = tt.trans %joined {order = array<i32: 0, 3, 1, 2>} : tensor<4x8x128x2xbf16, #auto> -> tensor<4x2x8x128xbf16, #auto>
++    %reshaped = tt.reshape %transposed : tensor<4x2x8x128xbf16, #auto> -> tensor<4x16x128xbf16, #auto>
++    %lhs = tt.trans %reshaped {order = array<i32: 0, 2, 1>} : tensor<4x16x128xbf16, #auto> -> tensor<4x128x16xbf16, #auto>
++    %result = gluon.set_auto_layout %lhs : tensor<4x128x16xbf16, #auto> -> tensor<4x128x16xbf16, #dot>
++    tt.return %result : tensor<4x128x16xbf16, #dot>
++  }
++}
++
++// -----
++
++// Join operands must reconcile to identical types, even for equivalent layouts.
++// CHECK-LABEL: @equivalent_join_operands
++// CHECK-NOT: auto_encoding
++// CHECK: tt.return
++#q = #ttg.blocked<{sizePerThread = [1, 1, 1, 1], threadsPerWarp = [1, 1, 1, 32], warpsPerCTA = [1, 1, 1, 4], order = [0, 1, 2, 3]}>
++#j = #ttg.blocked<{sizePerThread = [1, 1, 1, 1, 2], threadsPerWarp = [1, 1, 1, 32, 1], warpsPerCTA = [1, 1, 1, 4, 1], order = [4, 0, 2, 1, 3]}>
++#auto = #gluon.auto_encoding
++module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:103", "ttg.threads-per-warp" = 32 : i32} {
++  tt.func public @equivalent_join_operands(%ptr: !tt.ptr<f32>) -> (tensor<1x1x1x128xf32, #q>, tensor<1x1x1x128x2xf32, #j>) {
++    %p = tt.splat %ptr : !tt.ptr<f32> -> tensor<1x1x1x128x!tt.ptr<f32>, #auto>
++    %x = tt.load %p : tensor<1x1x1x128x!tt.ptr<f32>, #auto>
++    %a = tt.trans %x {order = array<i32: 1, 0, 2, 3>} : tensor<1x1x1x128xf32, #auto> -> tensor<1x1x1x128xf32, #auto>
++    %b = tt.trans %x {order = array<i32: 0, 2, 1, 3>} : tensor<1x1x1x128xf32, #auto> -> tensor<1x1x1x128xf32, #auto>
++    %joined = tt.join %a, %b : tensor<1x1x1x128xf32, #auto> -> tensor<1x1x1x128x2xf32, #auto>
++    %anchor = gluon.set_auto_layout %x : tensor<1x1x1x128xf32, #auto> -> tensor<1x1x1x128xf32, #q>
++    %out = ttg.convert_layout %joined : tensor<1x1x1x128x2xf32, #auto> -> tensor<1x1x1x128x2xf32, #j>
++    tt.return %anchor, %out : tensor<1x1x1x128xf32, #q>, tensor<1x1x1x128x2xf32, #j>
++  }
++}
++
++// -----
++
++// Split results must reconcile to identical types.
++// CHECK-LABEL: @split_result_reconciliation
++// CHECK-NOT: auto_encoding
++// CHECK: tt.return
++#parent = #ttg.blocked<{sizePerThread = [1, 2, 2], threadsPerWarp = [32, 1, 1], warpsPerCTA = [4, 1, 1], order = [2, 1, 0]}>
++#slice = #ttg.slice<{dim = 2, parent = #parent}>
++#seed = #ttg.slice<{dim = 1, parent = #slice}>
++#blocked = #ttg.blocked<{sizePerThread = [1, 2], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
++#auto = #gluon.auto_encoding
++module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:103", "ttg.threads-per-warp" = 32 : i32} {
++  tt.func public @split_result_reconciliation(%xptr: !tt.ptr<f32>, %yptr: !tt.ptr<f32>) -> (tensor<128x2xf32, #blocked>, tensor<128xf32, #seed>, tensor<128x2xf32, #blocked>) {
++    %xp = tt.splat %xptr : !tt.ptr<f32> -> tensor<128x2x2x!tt.ptr<f32>, #auto>
++    %x = tt.load %xp : tensor<128x2x2x!tt.ptr<f32>, #auto>
++    %parts:2 = tt.split %x : tensor<128x2x2xf32, #auto> -> tensor<128x2xf32, #auto>
++    %yp = tt.splat %yptr : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #auto>
++    %y = tt.load %yp : tensor<128x!tt.ptr<f32>, #auto>
++    %joined = tt.join %y, %y : tensor<128xf32, #auto> -> tensor<128x2xf32, #auto>
++    %sum = arith.addf %joined, %parts#0 : tensor<128x2xf32, #auto>
++    %part_anchor = gluon.set_auto_layout %parts#1 : tensor<128x2xf32, #auto> -> tensor<128x2xf32, #blocked>
++    %seed_anchor = gluon.set_auto_layout %y : tensor<128xf32, #auto> -> tensor<128xf32, #seed>
++    %out = ttg.convert_layout %sum : tensor<128x2xf32, #auto> -> tensor<128x2xf32, #blocked>
++    tt.return %part_anchor, %seed_anchor, %out : tensor<128x2xf32, #blocked>, tensor<128xf32, #seed>, tensor<128x2xf32, #blocked>
++  }
++}
++
++// -----
++
++// Backward split inference chooses a register order, but the transpose fixes
++// the source layout independently of that choice.
++// CHECK: [[$SOURCE:#.*]] = #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
++// CHECK-LABEL: @preserve_split_source_layout
++// CHECK: %[[INPUT:.*]] = tt.splat {{.*}} -> tensor<128x2xf32, [[$SOURCE]]>
++// CHECK: tt.split %[[INPUT]]
++// CHECK: tt.trans %[[INPUT]]
++// CHECK-NOT: auto_encoding
++// CHECK: tt.return
++#transposed = #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
++#part = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
++#auto = #gluon.auto_encoding
++module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:103", "ttg.threads-per-warp" = 32 : i32} {
++  tt.func public @preserve_split_source_layout(%arg: f32) -> (tensor<128xf32, #part>, tensor<2x128xf32, #transposed>) {
++    %input = tt.splat %arg : f32 -> tensor<128x2xf32, #auto>
++    %parts:2 = tt.split %input : tensor<128x2xf32, #auto> -> tensor<128xf32, #auto>
++    %transposed = tt.trans %input {order = array<i32: 1, 0>} : tensor<128x2xf32, #auto> -> tensor<2x128xf32, #auto>
++    %fixed_part = gluon.set_auto_layout %parts#0 : tensor<128xf32, #auto> -> tensor<128xf32, #part>
++    %fixed_transposed = gluon.set_auto_layout %transposed : tensor<2x128xf32, #auto> -> tensor<2x128xf32, #transposed>
++    tt.return %fixed_part, %fixed_transposed : tensor<128xf32, #part>, tensor<2x128xf32, #transposed>
++  }
++}
++
++// -----
++
++// Backward inference from the split gives the join result distance 5. A round
++// trip through the join operands proposes another register order at distance 7.
++// CHECK-LABEL: @prefer_fewer_layout_choices
++// CHECK: tt.join
++// CHECK: %[[PART:.*]], %{{.*}} = tt.split
++// CHECK-NEXT: tt.return %[[PART]]
++#part = #ttg.linear<{register = [[0, 8, 0], [0, 0, 4], [0, 16, 0], [0, 32, 0], [0, 64, 0]], lane = [[0, 0, 1], [0, 0, 2], [0, 1, 0], [0, 2, 0], [0, 4, 0]], warp = [[1, 0, 0], [2, 0, 0]], block = []}>
++#auto = #gluon.auto_encoding
++module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:103", "ttg.threads-per-warp" = 32 : i32} {
++  tt.func public @prefer_fewer_layout_choices(%arg: bf16) -> tensor<4x128x8xbf16, #part> {
++    %input = tt.splat %arg : bf16 -> tensor<4x8x128xbf16, #auto>
++    %padding = arith.constant dense<0.0> : tensor<4x8x128xbf16, #auto>
++    %joined = tt.join %input, %padding : tensor<4x8x128xbf16, #auto> -> tensor<4x8x128x2xbf16, #auto>
++    %transposed = tt.trans %joined {order = array<i32: 0, 3, 1, 2>} : tensor<4x8x128x2xbf16, #auto> -> tensor<4x2x8x128xbf16, #auto>
++    %reshaped = tt.reshape %transposed : tensor<4x2x8x128xbf16, #auto> -> tensor<4x16x128xbf16, #auto>
++    %lhs = tt.trans %reshaped {order = array<i32: 0, 2, 1>} : tensor<4x16x128xbf16, #auto> -> tensor<4x128x16xbf16, #auto>
++    %paired = tt.reshape %lhs : tensor<4x128x16xbf16, #auto> -> tensor<4x128x8x2xbf16, #auto>
++    %parts:2 = tt.split %paired : tensor<4x128x8x2xbf16, #auto> -> tensor<4x128x8xbf16, #auto>
++    %result = gluon.set_auto_layout %parts#0 : tensor<4x128x8xbf16, #auto> -> tensor<4x128x8xbf16, #part>
++    tt.return %result : tensor<4x128x8xbf16, #part>
++  }
+ }
+diff --git a/test/Gluon/invalid_auto_encoding.mlir b/test/Gluon/invalid_auto_encoding.mlir
+index bda36307099a..321359637ea0 100644
+--- a/test/Gluon/invalid_auto_encoding.mlir
++++ b/test/Gluon/invalid_auto_encoding.mlir
+@@ -47,3 +47,36 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
+     tt.return %0 : tensor<32xi32, #gluon.auto_encoding>
+   }
+ }
++
++// -----
++
++#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
++#blocked1 = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
++#auto = #gluon.auto_encoding
++module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
++  tt.func public @infer_join_operand_conflict(%arg: f32) {
++    // expected-error @+1 {{found conflicting encodings for value:}}
++    %lhs = tt.splat %arg : f32 -> tensor<128xf32, #auto>
++    %rhs = tt.splat %arg : f32 -> tensor<128xf32, #auto>
++    %joined = tt.join %lhs, %rhs : tensor<128xf32, #auto> -> tensor<128x2xf32, #auto>
++    %fixed_lhs = gluon.set_auto_layout %lhs : tensor<128xf32, #auto> -> tensor<128xf32, #blocked>
++    %fixed_rhs = gluon.set_auto_layout %rhs : tensor<128xf32, #auto> -> tensor<128xf32, #blocked1>
++    tt.return
++  }
++}
++
++// -----
++
++#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
++#blocked1 = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
++#auto = #gluon.auto_encoding
++module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
++  tt.func public @infer_split_result_conflict(%arg: f32) {
++    %input = tt.splat %arg : f32 -> tensor<128x2xf32, #auto>
++    // expected-error @+1 {{found conflicting encodings for value:}}
++    %parts:2 = tt.split %input : tensor<128x2xf32, #auto> -> tensor<128xf32, #auto>
++    %fixed_lhs = gluon.set_auto_layout %parts#0 : tensor<128xf32, #auto> -> tensor<128xf32, #blocked>
++    %fixed_rhs = gluon.set_auto_layout %parts#1 : tensor<128xf32, #auto> -> tensor<128xf32, #blocked1>
++    tt.return
++  }
++}
+diff --git a/test/Triton/invalid.mlir b/test/Triton/invalid.mlir
+index 2a84d369aa5b..c802b00d7846 100644
+--- a/test/Triton/invalid.mlir
++++ b/test/Triton/invalid.mlir
+@@ -331,6 +331,15 @@ tt.func public @fn(%arg0: f32) {
+     %a, %b = tt.split %arg0 : f32 -> f16
+     tt.return
+ }
++
++// -----
++
++tt.func public @split_result_type_mismatch(%arg0: tensor<32x2xf32>) {
++    // expected-error @+1 {{outLHS and outRHS types match}}
++    %parts:2 = "tt.split"(%arg0) : (tensor<32x2xf32>) -> (tensor<32xf32>, tensor<32xf16>)
++    tt.return
++}
++
+ // -----
+ 
+ tt.func public @fn(%arg0: tensor<2xf32>) {

@@ -1,0 +1,490 @@
+diff --git a/tests/kernels/test_engram.py b/tests/kernels/test_engram.py
+index c2a7607cbac0..8b3f10ddb603 100644
+--- a/tests/kernels/test_engram.py
++++ b/tests/kernels/test_engram.py
+@@ -599,6 +599,54 @@ def test_engram_rejects_empty_head_shards(tp_size, dp_size, n_heads, monkeypatch
+         ParallelEngramEmbedding(n_heads * 17, 64, (17,) * n_heads)
+ 
+ 
++def test_engram_packed_exchange_respects_small_batch_fallback(monkeypatch):
++    """Only eligible token counts use byte transport; WKV still sees BF16."""
++    routes = []
++    exchanged_dtypes = []
++
++    class FakeEmbedding(torch.nn.Module):
++        tp_size = 2
++        dp_size = 1
++        part_n_hash_cols = 1
++        n_hash_cols = 2
++        dim = 32
++        block_size = 32
++
++        def lookup(self, ids, out, background=False, packed=False):
++            routes.append(packed)
++            out.fill_(1 if packed else 5)
++
++    module = Engram.__new__(Engram)
++    torch.nn.Module.__init__(module)
++    module.embed_tokens = FakeEmbedding()
++    module.use_sequence_parallel = False
++    module.staged_rows = torch.empty(3, 1, 32, dtype=torch.bfloat16)
++    module.staged_packed_rows = torch.empty(3, 1, 33, dtype=torch.uint8)
++    module._packed_min_tokens = 2
++    module._prefetch_stream = None
++
++    def gather(rows, dim):
++        exchanged_dtypes.append(rows.dtype)
++        return torch.cat((rows, rows), dim=dim)
++
++    def reconstruct(packed, out, block_size):
++        assert packed.dtype == torch.uint8 and block_size == 32
++        out.fill_(5)
++
++    monkeypatch.setattr(engram_ops, "tensor_model_parallel_all_gather", gather)
++    monkeypatch.setattr(nvidia_engram_ops, "tensor_model_parallel_all_gather", gather)
++    monkeypatch.setattr(nvidia_engram_ops, "dequantize_packed_engram_rows", reconstruct)
++
++    for num_tokens in (1, 2):
++        hashes = torch.zeros(num_tokens, 2, dtype=torch.int32)
++        module.prepare_embeddings(hashes)
++        rows = module.embed(hashes)
++        assert rows.dtype == torch.bfloat16
++        assert torch.all(rows == 5)
++    assert routes == [False, True]
++    assert exchanged_dtypes == [torch.bfloat16, torch.uint8]
++
++
+ @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
+ @pytest.mark.parametrize("cpu_offload", [False, True])
+ @pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
+@@ -622,6 +670,7 @@ def test_engram_head_shards_reconstruct_checkpoint(cpu_offload, tp_size, monkeyp
+         engram_ops, "get_tensor_model_parallel_world_size", lambda: tp_size
+     )
+     shards = []
++    packed_shards = []
+     layers = []
+     for rank in range(tp_size):
+         monkeypatch.setattr(
+@@ -644,10 +693,26 @@ def test_engram_head_shards_reconstruct_checkpoint(cpu_offload, tp_size, monkeyp
+         )
+         layer.lookup(ids, out)
+         shards.append(out)
++        packed = torch.empty(
++            len(ids),
++            layer.part_n_hash_cols,
++            dim + dim // layer.block_size,
++            device="cuda",
++            dtype=torch.uint8,
++        )
++        layer.lookup(ids, packed, packed=True)
++        packed_shards.append(packed)
+         layers.append(layer)
+     gathered = torch.cat(shards, dim=1)
+     torch.testing.assert_close(gathered[:, : len(head_sizes)], expected, rtol=0, atol=0)
+     assert torch.count_nonzero(gathered[:, len(head_sizes) :]) == 0
++    gathered_packed = torch.cat(packed_shards, dim=1)
++    reconstructed = torch.empty_like(expected)
++    engram_ops.dequantize_packed_engram_rows(
++        gathered_packed[:, : len(head_sizes)], reconstructed, 32
++    )
++    torch.testing.assert_close(reconstructed, expected, rtol=0, atol=0)
++    assert torch.count_nonzero(gathered_packed[:, len(head_sizes) :]) == 0
+     assert sum(layer.part_num_embeddings for layer in layers) == num_rows
+ 
+     def gather(local, dim):
+@@ -663,6 +728,20 @@ def gather(local, dim):
+     module.staged_rows = torch.empty_like(shards[0])
+     module.prepare_embeddings(ids)
+     torch.testing.assert_close(module.embed(ids), expected, rtol=0, atol=0)
++    module.staged_packed_rows = torch.empty_like(packed_shards[0])
++    module._packed_min_tokens = 1
++
++    def gather_packed(local, dim):
++        torch.testing.assert_close(local, packed_shards[0], rtol=0, atol=0)
++        return torch.cat(packed_shards, dim=dim)
++
++    monkeypatch.setattr(
++        nvidia_engram_ops, "tensor_model_parallel_all_gather", gather_packed
++    )
++    module.prepare_embeddings(ids)
++    torch.testing.assert_close(module.embed(ids), expected, rtol=0, atol=0)
++    module.staged_packed_rows = None
++    module._packed_current = False
+     # Slicing before head reordering must preserve padded heads and tokens.
+     module.use_sequence_parallel = True
+     chunk = (len(ids) + tp_size - 1) // tp_size
+@@ -850,7 +929,13 @@ def finish(self, stream):
+ 
+ 
+ def _run_engram_prepared_rows(
+-    cpu_offload, capture, tp_size=1, rank=0, use_sequence_parallel=False, delay=None
++    cpu_offload,
++    capture,
++    tp_size=1,
++    rank=0,
++    use_sequence_parallel=False,
++    delay=None,
++    packed_exchange=False,
+ ):
+     from vllm.compilation.breakable_cudagraph import (
+         BreakableCUDAGraphCapture,
+@@ -893,6 +978,16 @@ def delayed_lookup(indices, out, background=False):
+         dtype=torch.bfloat16,
+         device="cuda",
+     )
++    if packed_exchange:
++        assert cpu_offload and tp_size > 1 and not use_sequence_parallel
++        engram.staged_packed_rows = torch.empty(
++            num_tokens,
++            layer.part_n_hash_cols,
++            layer.dim + layer.dim // layer.block_size,
++            dtype=torch.uint8,
++            device="cuda",
++        )
++        engram._packed_min_tokens = 1
+     # Match the non-contiguous per-layer slice of the model hash tensor.
+     hashes = torch.randint(
+         0,
+@@ -988,3 +1083,29 @@ def test_engram_head_collectives_survive_graph_breaks():
+     if torch.accelerator.device_count() < 2:
+         pytest.skip("Requires two GPUs")
+     torch.multiprocessing.spawn(_engram_tp_worker, args=(2, get_open_port()), nprocs=2)
++
++
++def _engram_packed_tp_worker(rank, port):
++    from tests.utils import init_test_distributed_environment
++    from vllm.distributed import cleanup_dist_env_and_memory
++
++    torch.accelerator.set_device_index(rank)
++    init_test_distributed_environment(2, 1, rank, str(port), local_rank=rank)
++    try:
++        for capture in ("eager", "full", "breakable"):
++            _run_engram_prepared_rows(True, capture, 2, rank, packed_exchange=True)
++    finally:
++        cleanup_dist_env_and_memory()
++
++
++@pytest.mark.distributed(num_gpus=2)
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
++def test_engram_packed_head_exchange_survives_graph_breaks():
++    """FP8 transport reconstructs the same BF16 rows on each replay."""
++    from vllm.utils.network_utils import get_open_port
++
++    if torch.accelerator.device_count() < 2:
++        pytest.skip("Requires two GPUs")
++    torch.multiprocessing.spawn(
++        _engram_packed_tp_worker, args=(get_open_port(),), nprocs=2
++    )
+diff --git a/vllm/config/engram.py b/vllm/config/engram.py
+index 5abb2bd34a5e..6ba9ac0c6fee 100644
+--- a/vllm/config/engram.py
++++ b/vllm/config/engram.py
+@@ -56,6 +56,14 @@ class EngramConfig:
+     memory without per-step Engram DP collectives. Requires sufficient
+     /dev/shm capacity and a shared IPC namespace."""
+ 
++    packed_fp8_exchange: bool = False
++    """Keep CPU-offloaded Engram rows in checkpoint FP8 format through the
++    TP head exchange, then reconstruct the existing BF16 WKV input."""
++
++    packed_fp8_exchange_min_tokens: int = Field(default=256, ge=1)
++    """Minimum token count for packed exchange. Tune this crossover on the
++    serving hardware; smaller batches use BF16 staging."""
++
+     @model_validator(mode="after")
+     def _validate_shared_memory(self) -> Self:
+         if self.dp_shared_memory and not self.cpu_offload:
+diff --git a/vllm/models/deepseek_v41/common/engram.py b/vllm/models/deepseek_v41/common/engram.py
+index c415bbaa6e42..3423dba681ae 100644
+--- a/vllm/models/deepseek_v41/common/engram.py
++++ b/vllm/models/deepseek_v41/common/engram.py
+@@ -602,14 +602,14 @@ def _engram_lookup_kernel(
+     QUANT_BLOCK: tl.constexpr,
+     BLOCK_R: tl.constexpr,
+     GRID,
++    PACKED: tl.constexpr,
+ ):
+-    """Gather fp8 rows, apply their ue8m0 block scales, write bf16.
++    """Gather fp8 rows, writing packed bytes or dequantized bf16.
+ 
+     Only this rank's heads are read; padded heads write zeros for all-gather.
+     `weight`/`scales` may address pinned host memory through UVA.
+     """
+     cols = tl.arange(0, DIM)
+-    scale_cols = cols // QUANT_BLOCK
+     for base in tl.range(tl.program_id(0) * BLOCK_R, num_rows, GRID * BLOCK_R):
+         rows = base + tl.arange(0, BLOCK_R)
+         valid = rows < num_rows
+@@ -628,20 +628,120 @@ def _engram_lookup_kernel(
+             mask=owned[:, None],
+             other=0.0,
+         )
+-        scale = tl.load(
+-            scales + local[:, None] * (DIM // QUANT_BLOCK) + scale_cols[None, :],
+-            mask=owned[:, None],
++        if PACKED:
++            packed_dim = DIM + DIM // QUANT_BLOCK
++            scale_cols = tl.arange(0, DIM // QUANT_BLOCK)
++            scale_bytes = tl.load(
++                scales + local[:, None] * (DIM // QUANT_BLOCK) + scale_cols[None, :],
++                mask=owned[:, None],
++                other=0,
++            )
++            tl.store(
++                out + rows[:, None] * packed_dim + cols[None, :],
++                values.to(tl.uint8, bitcast=True),
++                mask=valid[:, None],
++            )
++            tl.store(
++                out + rows[:, None] * packed_dim + DIM + scale_cols[None, :],
++                scale_bytes,
++                mask=valid[:, None],
++            )
++        else:
++            scale_cols = cols // QUANT_BLOCK
++            scale = tl.load(
++                scales + local[:, None] * (DIM // QUANT_BLOCK) + scale_cols[None, :],
++                mask=owned[:, None],
++                other=0,
++            )
++            # ue8m0 is a power of two, so its byte *is* the fp32 exponent field.
++            scale = (scale.to(tl.int32) << 23).to(tl.float32, bitcast=True)
++            tl.store(
++                out + rows[:, None] * DIM + cols[None, :],
++                (values.to(tl.float32) * scale).to(tl.bfloat16),
++                mask=valid[:, None],
++            )
++
++
++@triton.jit(
++    do_not_specialize=[
++        "num_rows",
++        "packed_stride_t",
++        "packed_stride_h",
++        "out_stride_t",
++        "out_stride_h",
++        "GRID",
++    ]
++)
++def _engram_dequant_packed_kernel(
++    packed,
++    out,
++    num_rows,
++    packed_stride_t,
++    packed_stride_h,
++    out_stride_t,
++    out_stride_h,
++    NUM_HEADS: tl.constexpr,
++    DIM: tl.constexpr,
++    QUANT_BLOCK: tl.constexpr,
++    BLOCK_R: tl.constexpr,
++    GRID,
++):
++    cols = tl.arange(0, DIM)
++    scale_cols = cols // QUANT_BLOCK
++    for base in tl.range(tl.program_id(0) * BLOCK_R, num_rows, GRID * BLOCK_R):
++        rows = base + tl.arange(0, BLOCK_R)
++        valid = rows < num_rows
++        token = (rows // NUM_HEADS).to(tl.int64)
++        head = rows % NUM_HEADS
++        src = packed + token * packed_stride_t + head * packed_stride_h
++        values = tl.load(src[:, None] + cols[None, :], mask=valid[:, None], other=0)
++        scales = tl.load(
++            src[:, None] + DIM + scale_cols[None, :],
++            mask=valid[:, None],
+             other=0,
+         )
+-        # ue8m0 is a power of two, so its byte *is* the fp32 exponent field.
+-        scale = (scale.to(tl.int32) << 23).to(tl.float32, bitcast=True)
++        scale = (scales.to(tl.int32) << 23).to(tl.float32, bitcast=True)
++        values = values.to(tl.float8e4nv, bitcast=True).to(tl.float32)
++        dst = out + token * out_stride_t + head * out_stride_h
+         tl.store(
+-            out + rows[:, None] * DIM + cols[None, :],
+-            (values.to(tl.float32) * scale).to(tl.bfloat16),
++            dst[:, None] + cols[None, :],
++            (values * scale).to(tl.bfloat16),
+             mask=valid[:, None],
+         )
+ 
+ 
++def dequantize_packed_engram_rows(
++    packed: torch.Tensor, out: torch.Tensor, block_size: int
++) -> None:
++    """Reconstruct the same BF16 rows produced by the ordinary lookup."""
++    assert packed.dtype == torch.uint8 and out.dtype == torch.bfloat16
++    assert packed.shape[:2] == out.shape[:2]
++    assert packed.shape[2] == out.shape[2] + out.shape[2] // block_size
++    assert packed.stride(2) == out.stride(2) == 1
++    num_rows = out.shape[0] * out.shape[1]
++    if not num_rows:
++        return
++    tiles = triton.cdiv(num_rows, 16)
++    num_sms = torch.cuda.get_device_properties(
++        torch.accelerator.current_device_index()
++    ).multi_processor_count
++    grid = min(tiles, num_sms * 4)
++    _engram_dequant_packed_kernel[(grid,)](
++        packed,
++        out,
++        num_rows,
++        packed.stride(0),
++        packed.stride(1),
++        out.stride(0),
++        out.stride(1),
++        NUM_HEADS=out.shape[1],
++        DIM=out.shape[2],
++        QUANT_BLOCK=block_size,
++        BLOCK_R=16,
++        GRID=grid,
++    )
++
++
+ class ParallelEngramEmbedding(nn.Module):
+     """TP-sharded hash heads with FP8 rows and per-block E8M0 scales."""
+ 
+@@ -704,12 +804,23 @@ def _storage(self) -> tuple[torch.Tensor, torch.Tensor]:
+         return self.weight.data, self.weight_scale_inv.data
+ 
+     def lookup(
+-        self, indices: torch.Tensor, out: torch.Tensor, background: bool = False
++        self,
++        indices: torch.Tensor,
++        out: torch.Tensor,
++        background: bool = False,
++        packed: bool = False,
+     ) -> None:
+-        """Look up local heads of [T, heads] into [T, local_heads, dim] bf16.
++        """Look up local heads into BF16 rows or FP8 values/scales bytes.
+ 
+         `background` limits the grid to leave SMs for concurrent work.
+         """
++        expected_dim = self.dim + self.dim // self.block_size if packed else self.dim
++        assert out.shape == (
++            indices.shape[0],
++            self.part_n_hash_cols,
++            expected_dim,
++        )
++        assert out.dtype == (torch.uint8 if packed else torch.bfloat16)
+         rows = indices.shape[0] * self.part_n_hash_cols
+         if not rows:
+             return
+@@ -735,6 +846,7 @@ def lookup(
+             QUANT_BLOCK=self.block_size,
+             BLOCK_R=16,
+             GRID=grid,
++            PACKED=packed,
+         )
+ 
+     def forward(self, indices: torch.Tensor) -> torch.Tensor:
+diff --git a/vllm/models/deepseek_v41/nvidia/engram.py b/vllm/models/deepseek_v41/nvidia/engram.py
+index 624a36c214fc..080af5a6f515 100644
+--- a/vllm/models/deepseek_v41/nvidia/engram.py
++++ b/vllm/models/deepseek_v41/nvidia/engram.py
+@@ -28,6 +28,7 @@
+     EngramLayout,
+     _engram_head_shard_weight_loader,
+     _engram_select_rows,
++    dequantize_packed_engram_rows,
+ )
+ from vllm.models.deepseek_v41.common.engram import (
+     Engram as BaseEngram,
+@@ -369,9 +370,49 @@ def _init_staging(self, max_tokens: int, head_dim: int) -> None:
+         super()._init_staging(max_tokens * self.embed_tokens.dp_size, head_dim)
+         if self.embed_tokens.cpu_offload:
+             self._prefetch_stream = torch.cuda.Stream(device=self.staged_rows.device)
++        vllm_config = get_current_vllm_config()
++        engram_config = vllm_config.engram_config
++        assert engram_config is not None
++        self._packed_min_tokens = engram_config.packed_fp8_exchange_min_tokens
++        self._packed_current = False
++        self.staged_packed_rows: torch.Tensor | None = None
++        if not engram_config.packed_fp8_exchange:
++            return
++        parallel_config = vllm_config.parallel_config
++        if not (
++            self.embed_tokens.cpu_offload
++            and self.embed_tokens.dp_size == 1
++            and self.embed_tokens.tp_size > 1
++            and not self.use_sequence_parallel
++            and not parallel_config.use_ubatching
++            and parallel_config.prefill_context_parallel_size == 1
++            and parallel_config.decode_context_parallel_size == 1
++            and head_dim % self.embed_tokens.block_size == 0
++        ):
++            return
++        packed_dim = head_dim + head_dim // self.embed_tokens.block_size
++        self.staged_packed_rows = torch.empty(
++            max_tokens,
++            self.embed_tokens.part_n_hash_cols,
++            packed_dim,
++            dtype=torch.uint8,
++            device=self.staged_rows.device,
++        )
+ 
+     def prepare_embeddings(self, hash_ids: torch.Tensor) -> None:
+         """Prefetch local shared rows or the DP group's gathered hash IDs."""
++        packed_rows = getattr(self, "staged_packed_rows", None)
++        self._packed_current = packed_rows is not None and hash_ids.shape[0] >= getattr(
++            self, "_packed_min_tokens", 256
++        )
++        if self._packed_current:
++            assert packed_rows is not None
++            rows = packed_rows[: hash_ids.shape[0]]
++            if self._prefetch_stream is None:
++                self.embed_tokens.lookup(hash_ids, rows, packed=True)
++            else:
++                self._start_prefetch(hash_ids, rows, self._prefetch_stream, packed=True)
++            return
+         if self._prefetch_stream is None:
+             return super().prepare_embeddings(hash_ids)
+         rows = self.staged_rows[: hash_ids.shape[0]]
+@@ -380,14 +421,21 @@ def prepare_embeddings(self, hash_ids: torch.Tensor) -> None:
+ 
+     @eager_break_during_capture
+     def _start_prefetch(
+-        self, hash_ids: torch.Tensor, rows: torch.Tensor, stream: torch.cuda.Stream
++        self,
++        hash_ids: torch.Tensor,
++        rows: torch.Tensor,
++        stream: torch.cuda.Stream,
++        packed: bool = False,
+     ) -> None:
+         # Eager boundaries let the lookup span piecewise graph segments.
+         stream.wait_stream(torch.cuda.current_stream())
+         # Keep temporary hash storage alive until lookup finishes reading it.
+         hash_ids.record_stream(stream)
+         with torch.cuda.stream(stream):
+-            self.embed_tokens.lookup(hash_ids, rows, background=True)
++            if packed:
++                self.embed_tokens.lookup(hash_ids, rows, background=True, packed=True)
++            else:
++                self.embed_tokens.lookup(hash_ids, rows, background=True)
+ 
+     @eager_break_during_capture
+     def _finish_prefetch(self, stream: torch.cuda.Stream) -> None:
+@@ -401,3 +449,24 @@ def _ready_rows(self, num_tokens: int) -> torch.Tensor:
+             staged = self.staged_rows[: slot * self.embed_tokens.dp_size]
+             return _gather_engram_rows(staged, num_tokens)
+         return super()._ready_rows(num_tokens)
++
++    def embed(self, hash_ids: torch.Tensor) -> torch.Tensor:
++        if not getattr(self, "_packed_current", False):
++            return super().embed(hash_ids)
++        assert self.staged_packed_rows is not None
++        if self._prefetch_stream is not None:
++            self._finish_prefetch(self._prefetch_stream)
++        packed = self.staged_packed_rows[: hash_ids.shape[0]]
++        gathered = tensor_model_parallel_all_gather(packed, dim=1)
++        num_tokens = hash_ids.shape[0]
++        out = torch.empty(
++            (num_tokens, self.embed_tokens.n_hash_cols, self.embed_tokens.dim),
++            dtype=torch.bfloat16,
++            device=packed.device,
++        )
++        dequantize_packed_engram_rows(
++            gathered[:, : self.embed_tokens.n_hash_cols],
++            out,
++            self.embed_tokens.block_size,
++        )
++        return out

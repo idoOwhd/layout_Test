@@ -1,0 +1,79 @@
+diff --git a/testing/python/language/test_tilelang_language_nvf4_mma_block_scale.py b/testing/python/language/test_tilelang_language_nvf4_mma_block_scale.py
+index 74616c7ca7..3faee53889 100644
+--- a/testing/python/language/test_tilelang_language_nvf4_mma_block_scale.py
++++ b/testing/python/language/test_tilelang_language_nvf4_mma_block_scale.py
+@@ -874,6 +874,53 @@ def test_nvf4_mma_block_scale_compact_fragment_diagnostic(fragment_a, fragment_s
+         tilelang.lower(program, target=target, enable_device_compile=False)
+ 
+ 
++@tilelang.testing.requires_cuda
++@pytest.mark.parametrize("policy", [T.GemmWarpPolicy.FullRow, T.GemmWarpPolicy.FullCol, T.GemmWarpPolicy.Square])
++@pytest.mark.parametrize("fragment_a", [False, True])
++@pytest.mark.parametrize("fragment_scales, alias_scales", [(True, True), (True, False), (False, True)])
++def test_nvf4_mma_block_scale_scale_buffer_aliasing(policy, fragment_a, fragment_scales, alias_scales):
++    @T.prim_func
++    def main(O: T.Tensor((128, 128), T.float32)):
++        with T.Kernel(1, threads=256):
++            A = T.alloc_fragment((128, 128), T.float4_e2m1fn) if fragment_a else T.alloc_shared((128, 128), T.float4_e2m1fn)
++            B = T.alloc_shared((128, 128), T.float4_e2m1fn)
++            SFA = T.alloc_fragment((128, 2), T.uint32) if fragment_scales else T.alloc_shared((128, 2), T.uint32)
++            SFB = SFA if alias_scales else T.alloc_fragment((128, 2), T.uint32)
++            C = T.alloc_fragment((128, 128), T.float32)
++            T.fill(A, 1)
++            T.fill(B, 1)
++            for i, k in T.Parallel(128, 2):
++                SFA[i, k] = T.uint32(0x38383838) + T.cast(i // 16 % 2, T.uint32) * T.uint32(0x08080808)
++            if not alias_scales:
++                for i, k in T.Parallel(128, 2):
++                    SFB[i, k] = T.uint32(0x38383838) + T.cast(i // 16 % 2, T.uint32) * T.uint32(0x08080808)
++            T.gemm_blockscaled(
++                A,
++                B,
++                C,
++                SFA,
++                SFB,
++                transpose_B=True,
++                clear_accum=True,
++                policy=policy,
++                k_start=0,
++                sf_a_granularity_k=16,
++                sf_b_granularity_k=16,
++                sf_layout="rowmajor",
++            )
++            T.copy(C, O)
++
++    target = tvm.target.Target({"kind": "cuda", "arch": "sm_120a"})
++    if fragment_scales and alias_scales:
++        diagnostic = "cannot reuse fragment buffer '[^']+' as SFB:.*different fragment layouts.*Use separate SFA and SFB fragment buffers"
++        with target, pytest.raises(ValueError, match=diagnostic):
++            tilelang.lower(main, target=target, enable_device_compile=False)
++    else:
++        with target:
++            result = tilelang.lower(main, target=target, enable_device_compile=False)
++        assert "tl::sm120_mma_sync_blockscaled<" in result.kernel_source
++
++
+ # ---------------------------------------------------------------------------
+ # Example tail-tile behavior (moved from test_tilelang_sm120_nvfp4_example_cli).
+ # ---------------------------------------------------------------------------
+diff --git a/tilelang/cuda/op/gemm/gemm_mma_sm120.py b/tilelang/cuda/op/gemm/gemm_mma_sm120.py
+index 73fc41f187..3ce6d82419 100644
+--- a/tilelang/cuda/op/gemm/gemm_mma_sm120.py
++++ b/tilelang/cuda/op/gemm/gemm_mma_sm120.py
+@@ -88,7 +88,15 @@ def infer_layout(self, target: Target, thread_nums: int):
+                     raise ValueError("SM120 fragment scales currently require sf_layout='rowmajor'")
+                 if not is_full_region(region) or len(buffer.shape) != 2 or int(buffer.shape[0]) != int(rows):
+                     raise ValueError(f"SM120 fragment SF{matrix} must be a full 2D region with {rows} rows")
+-                layouts[buffer] = emitter.make_scale_load_layout(buffer, matrix)
++                scale_layout = emitter.make_scale_load_layout(buffer, matrix)
++                # Preserve both operand requirements when SFA and SFB alias.
++                if buffer in layouts and not layouts[buffer].is_equal(scale_layout):
++                    raise ValueError(
++                        f"SM120 block-scaled GEMM cannot reuse fragment buffer '{buffer.name}' as SF{matrix}: "
++                        "its operands require different fragment layouts. "
++                        "Use separate SFA and SFB fragment buffers, or shared-memory scales."
++                    )
++                layouts[buffer] = scale_layout
+         return layouts
+ 
+     def lower(

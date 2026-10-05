@@ -1,0 +1,608 @@
+diff --git a/tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md b/tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md
+index f3edabe84827..d0d0f3f11301 100644
+--- a/tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md
++++ b/tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md
+@@ -118,7 +118,8 @@ comprehensive early-validation layer for every incompatible feature.
+ ```text
+ [EPLB start_wait_gpu] → routing → [EPLB done_wait_gpu + update_statistic + route]
+   → [comm.prepare_dispatch (NVLink2-sided)] → quantize/dispatch (adaptive order)
+-  → backend.run_moe → [EPLB start_set_cpu] → comm.combine → [EPLB done_set_cpu]
++  → backend.run_moe → [EPLB start_set_cpu] → [unfinalized_combine_fn]
++  → comm.combine → [EPLB done_set_cpu]
+ 
+ Adaptive quantize/dispatch order (gated by comm.supports_post_quant_dispatch()):
+   Post-quant flow: quantize_input() → comm.dispatch()   (send quantized data)
+@@ -127,6 +128,8 @@ Adaptive quantize/dispatch order (gated by comm.supports_post_quant_dispatch()):
+ 
+ EPLB hooks fire only at the first/last chunk of the first/last `repeat_idx`. Multi-stream chunk overlap is enabled when `not enable_alltoall and aux_stream is not None`.
+ 
++`unfinalized_combine_fn` runs only when `do_finalize=False` **and** a comm strategy is active. Every `Communication.combine` is typed for a dense per-token tensor, so the backend's unfinalized `(gemm2_output, expert_weights, expanded_idx_to_permuted_idx)` triple cannot cross one. A model that needs a per-`(token, expert)` transform applied to each expert output *before* the top-k sum registers its finalize on `ConfigurableMoE`; the scheduler runs it on the dispatched rows, and the combine then reduces already-finalized partials — equal to finalizing after the combine, because each term depends on one row alone and non-local slots contribute exact zeros. Leaving the attribute unset turns that combination into a named refusal instead of a crash inside the comm layer.
++
+ ### Fused-comm execution flow (MegaMoE-style)
+ 
+ `FusedCommMoEScheduler._forward_chunk` runs per chunk:
+diff --git a/tensorrt_llm/_torch/moe/fused_moe/configurable_moe.py b/tensorrt_llm/_torch/moe/fused_moe/configurable_moe.py
+index b5a20606580a..4c6536e4711d 100644
+--- a/tensorrt_llm/_torch/moe/fused_moe/configurable_moe.py
++++ b/tensorrt_llm/_torch/moe/fused_moe/configurable_moe.py
+@@ -207,6 +207,26 @@ def __init__(
+         # ========== Create Communication Strategy ==========
+         self.comm = self._create_comm_strategy_auto()
+ 
++        # ========== Model-owned finalize for do_finalize=False + comm ==========
++        # A model that needs a per-(token, expert) transform applied to each
++        # expert output before the top-k sum calls this layer with
++        # ``do_finalize=False`` and finalizes the returned triple itself. That
++        # works only while ``self.comm is None``: no ``Communication.combine``
++        # accepts an unfinalized output. A model that must also run under
++        # attention DP assigns its finalize here, and
++        # ``ExternalCommMoEScheduler`` runs it on the dispatched rows just
++        # before the combine. Signature:
++        #
++        #     fn(*, gemm2_output, expanded_idx_to_permuted_idx,
++        #        routing_weights, num_tokens) -> [num_tokens, hidden_size]
++        #
++        # It must be a per-row function, so that combining the per-rank
++        # finalized partials equals finalizing after the combine. ``None`` for
++        # every model that does not need it, which makes the unsupported
++        # combination a named refusal in the scheduler rather than an
++        # ``AttributeError`` several frames deeper, inside the comm layer.
++        self.unfinalized_combine_fn = None
++
+         # ========== Chunking Configuration ==========
+         # moe_max_num_tokens is set in ModelConfig.__post_init__ if not specified
+         # The default value is max_num_tokens * dp_size
+diff --git a/tensorrt_llm/_torch/moe/fused_moe/moe_op_backend.py b/tensorrt_llm/_torch/moe/fused_moe/moe_op_backend.py
+index 19ecceae36a4..cd812e4a4276 100644
+--- a/tensorrt_llm/_torch/moe/fused_moe/moe_op_backend.py
++++ b/tensorrt_llm/_torch/moe/fused_moe/moe_op_backend.py
+@@ -579,6 +579,9 @@ def __init__(self):
+         self._activation_type = _flashinfer_activation_type
+         self._routing_method_type = _flashinfer_routing_method_type
+         self._fused_moe = _flashinfer_fused_moe
++        # Resolve once before warmup/capture; the legacy provider contract is
++        # retained unless the shared fix is explicitly enabled.
++        self._fp4_contract_fix_enabled = os.getenv("TRTLLM_FLASHINFER_FP4_CONTRACT_FIX", "0") == "1"
+         self._fp4_quantize = _flashinfer_fp4_quantize
+         self._mxfp8_quantize = _flashinfer_mxfp8_quantize
+ 
+@@ -626,6 +629,16 @@ def fp4_quantize(
+         is_sf_8x4_layout: bool = False,
+         enable_pdl: Optional[bool] = None,
+     ):
++        if self._fp4_contract_fix_enabled:
++            return self._fp4_quantize(
++                input,
++                global_scale=global_scale,
++                sf_vec_size=sf_vec_size,
++                sf_use_ue8m0=sf_use_ue8m0,
++                is_sf_swizzled_layout=is_sf_swizzled_layout,
++                is_sf_8x4_layout=is_sf_8x4_layout,
++                enable_pdl=enable_pdl,
++            )
+         return self._fp4_quantize(
+             input,
+             global_scale,
+@@ -777,6 +790,17 @@ def run_fp4_block_scale_moe(
+         tune_max_num_tokens=8192,
+         use_dp=False,
+     ):
++        # The native provider accepts flattened linear scale factors. The
++        # FlashInfer API requires their leading dimension to be num_tokens.
++        if (
++            self._fp4_contract_fix_enabled
++            and hidden_states_scale is not None
++            and hidden_states_scale.ndim == 1
++        ):
++            hidden_states_scale = hidden_states_scale.view(torch.float8_e4m3fn)
++            tokens = hidden_states.shape[0]
++            if tokens > 0:
++                hidden_states_scale = hidden_states_scale.view(tokens, -1)
+         if router_logits is not None:
+             outputs = self._fused_moe.trtllm_fp4_block_scale_moe(
+                 router_logits,
+diff --git a/tensorrt_llm/_torch/moe/fused_moe/moe_scheduler.py b/tensorrt_llm/_torch/moe/fused_moe/moe_scheduler.py
+index 2fc0e28356f1..486b5c816293 100644
+--- a/tensorrt_llm/_torch/moe/fused_moe/moe_scheduler.py
++++ b/tensorrt_llm/_torch/moe/fused_moe/moe_scheduler.py
+@@ -601,6 +601,24 @@ def _forward_chunk_impl(
+         # ========== Step 7: EPLB - Start CPU stage ==========
+         moe._load_balancer_start_set_cpu_stage(is_last_call)
+ 
++        # ========== Step 7b: Model-owned finalize, before the combine ==========
++        # ``do_finalize=False`` means the backend hands back the unfinalized
++        # ``(gemm2_output, expert_weights, expanded_idx_to_permuted_idx)``
++        # triple so the model can apply its own per-expert transform to each
++        # expert row. No ``Communication.combine`` can carry that: every
++        # strategy is typed for a dense per-token tensor. So when a comm
++        # strategy is active the model's finalize has to run HERE, on the
++        # dispatched rows, and the combine then reduces already-finalized
++        # partials. That reordering is valid only for a finalize computed from
++        # one ``(token, expert)`` row at a time, which is the contract a model
++        # accepts by setting ``unfinalized_combine_fn``.
++        if not do_finalize and moe.comm is not None:
++            final_hidden_states = self._finalize_before_combine(
++                final_hidden_states,
++                token_final_scales=token_final_scales,
++                output_dtype=output_dtype,
++            )
++
+         # ========== Step 8: Communication combine ==========
+         if moe.comm is not None:
+             if moe.enable_dummy_allreduce:
+@@ -620,6 +638,68 @@ def _forward_chunk_impl(
+ 
+         return final_hidden_states
+ 
++    def _finalize_before_combine(
++        self,
++        unfinalized: Union[List[torch.Tensor], Tuple[torch.Tensor, ...]],
++        *,
++        token_final_scales: Optional[torch.Tensor],
++        output_dtype: Optional[torch.dtype],
++    ) -> torch.Tensor:
++        """Run the model's own finalize on the dispatched rows.
++
++        Turns the backend's unfinalized triple into the dense per-dispatched-row
++        tensor ``Communication.combine`` is typed for. The row count is the
++        dispatched one (``ep_size * max_tokens_per_rank``), taken from the routing
++        weights. The index map may flatten token and top-k dimensions, while a
++        quantized layout is free to reinterpret ``x``'s leading dimension.
++
++        ``token_final_scales`` must be the POST-dispatch copy: under attention
++        DP this rank holds rows for tokens it does not own, and only the
++        dispatched weights cover them.
++        """
++        moe = self.moe
++        # ``ConfigurableMoE`` declares the attribute; the default keeps the
++        # unit tests that stub ``moe`` with a minimal namespace working, the
++        # same way the zero-token DP-pad guard above does.
++        finalize_fn = getattr(moe, "unfinalized_combine_fn", None)
++        if finalize_fn is None:
++            raise NotImplementedError(
++                f"{type(moe.backend).__name__} was asked for do_finalize=False while "
++                f"{type(moe.comm).__name__} is active, but the model registered no "
++                "ConfigurableMoE.unfinalized_combine_fn. An unfinalized expert output "
++                "cannot cross a communication combine: every strategy takes a dense "
++                "per-token tensor. Either finalize in the backend (do_finalize=True) "
++                "or register a finalize the scheduler can run before the combine."
++            )
++        if not isinstance(unfinalized, (list, tuple)) or len(unfinalized) != 3:
++            raise NotImplementedError(
++                f"unfinalized_combine_fn is registered but {type(moe.backend).__name__} "
++                f"returned {type(unfinalized).__name__} for do_finalize=False instead of "
++                "the (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) triple."
++            )
++        if token_final_scales is None:
++            raise NotImplementedError(
++                "unfinalized_combine_fn needs the dispatched routing weights, but "
++                "token_final_scales is None (apply_router_weight_on_input folds them "
++                "into the activations). The two are not combinable."
++            )
++        gemm2_output, _expert_weights, expanded_idx_to_permuted_idx = unfinalized
++        num_tokens = token_final_scales.shape[0]
++        assert expanded_idx_to_permuted_idx.numel() == token_final_scales.numel(), (
++            f"dispatched routing weights cover {token_final_scales.numel()} token-expert "
++            f"slots but the index map covers {expanded_idx_to_permuted_idx.numel()}"
++        )
++        combined = finalize_fn(
++            gemm2_output=gemm2_output,
++            expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
++            routing_weights=token_final_scales,
++            num_tokens=num_tokens,
++        )
++        # Cast BEFORE the combine, not after: the one-sided workspace's combine
++        # region is sized from (hidden_size, act_dtype), so handing it a wider
++        # payload than the model output dtype would overrun that region.
++        return combined if output_dtype is None else combined.to(output_dtype)
++
+     def _forward_multiple_chunks(
+         self,
+         x: Union[torch.Tensor, Fp4QuantizedTensor],
+@@ -797,6 +877,7 @@ def _plan_onesided_workspace(
+         self,
+         all_rank_num_tokens: Optional[List[int]],
+         output_dtype: Optional[torch.dtype],
++        do_finalize: bool,
+     ) -> Tuple[Optional[torch.Tensor], bool]:
+         """Decide the NVLinkOneSided combine payload buffer for this forward.
+ 
+@@ -808,6 +889,17 @@ def _plan_onesided_workspace(
+         if not isinstance(moe.comm, NVLinkOneSided):
+             return None, False
+ 
++        if not do_finalize:
++            # The backend returns the unfinalized triple and writes nothing
++            # into the combine payload buffer, so the payload is NOT in the
++            # workspace however capable the backend is. Claiming otherwise
++            # makes moe_a2a_combine read an unwritten workspace region and
++            # reduce garbage silently, because the flag -- not the tensor
++            # argument -- is what combine() believes. The finalize that runs
++            # before the combine produces a fresh tensor, which has to be
++            # staged like any other caller-owned payload.
++            return None, False
++
+         if not moe.backend.supports_moe_output_in_alltoall_workspace():
+             # Backend emits its own output tensor; a workspace buffer would be
+             # left unfilled while combine() read from it.
+@@ -860,6 +952,7 @@ def _build_run_context(
+             comm_plan=self._build_comm_plan(
+                 all_rank_num_tokens,
+                 output_dtype,
++                do_finalize,
+                 use_deep_ep_direct_metadata=use_deep_ep_direct_metadata,
+             ),
+         )
+@@ -868,6 +961,7 @@ def _build_comm_plan(
+         self,
+         all_rank_num_tokens: Optional[List[int]],
+         output_dtype: Optional[torch.dtype],
++        do_finalize: bool,
+         use_deep_ep_direct_metadata: bool = False,
+     ) -> MoECommPlan:
+         """The comm-layer facts for this forward, derived once for every backend.
+@@ -880,7 +974,9 @@ def _build_comm_plan(
+         # arrive unswizzled. Backends use this to skip a re-swizzle.
+         supports_post_quant = moe.comm is not None and moe.comm.supports_post_quant_dispatch()
+         moe_output, payload_in_workspace = self._plan_onesided_workspace(
+-            all_rank_num_tokens=all_rank_num_tokens, output_dtype=output_dtype
++            all_rank_num_tokens=all_rank_num_tokens,
++            output_dtype=output_dtype,
++            do_finalize=do_finalize,
+         )
+         if isinstance(moe.comm, NVLinkOneSided):
+             # combine() still reads the flag off the strategy; the plan stays
+diff --git a/tests/unittest/_torch/moe/test_flashinfer_moe_scale_layout.py b/tests/unittest/_torch/moe/test_flashinfer_moe_scale_layout.py
+new file mode 100644
+index 000000000000..925ce80936af
+--- /dev/null
++++ b/tests/unittest/_torch/moe/test_flashinfer_moe_scale_layout.py
+@@ -0,0 +1,127 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++"""FlashInfer's linear FP4 activation scales retain the token dimension."""
++
++import inspect
++from types import SimpleNamespace
++
++import pytest
++import torch
++from utils.util import skip_pre_blackwell
++
++from tensorrt_llm._torch.moe.fused_moe.moe_op_backend import FlashinferOpBackend
++
++
++@pytest.mark.parametrize("flag", [None, "0", "1"])
++@pytest.mark.parametrize("enable_pdl", [None, False, True])
++def test_fp4_quantize_provider_options_are_keyword_arguments(enable_pdl, flag, monkeypatch):
++    if flag is None:
++        monkeypatch.delenv("TRTLLM_FLASHINFER_FP4_CONTRACT_FIX", raising=False)
++    else:
++        monkeypatch.setenv("TRTLLM_FLASHINFER_FP4_CONTRACT_FIX", flag)
++    backend = FlashinferOpBackend()
++    input = torch.zeros(2, 128)
++    scale = torch.ones(1)
++    requested_pdl = enable_pdl
++
++    def quantize(
++        tensor,
++        global_scale,
++        sf_vec_size,
++        sf_use_ue8m0,
++        is_sf_swizzled_layout,
++        is_sf_8x4_layout,
++        per_token_activation=False,
++        enable_pdl=None,
++    ):
++        # New provider options may precede PDL in the positional signature.
++        assert tensor is input
++        assert global_scale is scale
++        assert sf_vec_size == 16
++        assert not sf_use_ue8m0
++        assert not is_sf_swizzled_layout
++        assert not is_sf_8x4_layout
++        assert per_token_activation is (False if flag == "1" else requested_pdl)
++        return enable_pdl
++
++    backend._fp4_quantize = quantize
++    assert backend.fp4_quantize(
++        input, scale, is_sf_swizzled_layout=False, enable_pdl=enable_pdl
++    ) is (enable_pdl if flag == "1" else None)
++
++
++@pytest.mark.parametrize("flag", [None, "0", "1"])
++@pytest.mark.parametrize("tokens", [0, 1, 2, 16])
++@pytest.mark.parametrize("routed", [False, True])
++@pytest.mark.parametrize("flattened", [False, True])
++def test_fp4_input_scales_are_token_major(tokens, routed, flattened, flag, monkeypatch):
++    if flag is None:
++        monkeypatch.delenv("TRTLLM_FLASHINFER_FP4_CONTRACT_FIX", raising=False)
++    else:
++        monkeypatch.setenv("TRTLLM_FLASHINFER_FP4_CONTRACT_FIX", flag)
++    backend = FlashinferOpBackend()
++    observed = []
++
++    def run(*args, **kwargs):
++        scales = args[3]
++        observed.append(scales)
++        return [torch.zeros(tokens, 4096)]
++
++    backend._fused_moe = SimpleNamespace(
++        trtllm_fp4_block_scale_moe=run,
++        trtllm_fp4_block_scale_routed_moe=run,
++    )
++    backend.cvt_routing_method_type = lambda _: 1
++    backend.cvt_activation_type = lambda _: 3
++    params = {
++        name: None
++        for name, value in inspect.signature(backend.run_fp4_block_scale_moe).parameters.items()
++        if value.default is inspect.Parameter.empty
++    }
++    scales = torch.zeros(tokens, 256, dtype=torch.uint8)
++    params.update(
++        hidden_states=torch.zeros(tokens, 2048, dtype=torch.uint8),
++        hidden_states_scale=scales.flatten() if flattened else scales,
++        router_logits=None if routed else torch.zeros(tokens, 256),
++        topk_ids=torch.zeros(tokens, 8, dtype=torch.int32),
++        topk_weights=torch.ones(tokens, 8, dtype=torch.float32) / 8,
++        gemm1_weights_scale=torch.zeros(1, dtype=torch.uint8),
++        gemm2_weights_scale=torch.zeros(1, dtype=torch.uint8),
++    )
++    backend.run_fp4_block_scale_moe(**params)
++    assert len(observed) == 1
++    expected_shape = (tokens, 256)
++    if flattened and (flag != "1" or tokens == 0):
++        expected_shape = (tokens * 256,)
++    assert observed[0].shape == expected_shape
++    assert observed[0].dtype == torch.float8_e4m3fn
++    assert observed[0].data_ptr() == scales.data_ptr()
++
++
++# The real provider is exercised here: FlashInfer's FP4 quantization has no
++# backend for pre-Blackwell architectures, so CUDA availability alone is not
++# enough to run it.
++@skip_pre_blackwell
++@pytest.mark.parametrize("enable_pdl", [None, False, True])
++def test_opt_in_real_fp4_provider_and_graph(enable_pdl, monkeypatch):
++    monkeypatch.setenv("TRTLLM_FLASHINFER_FP4_CONTRACT_FIX", "1")
++    backend = FlashinferOpBackend()
++    x = torch.randn(2, 128, device="cuda", dtype=torch.bfloat16)
++    scale = torch.ones(1, device="cuda")
++
++    def quantize():
++        return backend.fp4_quantize(x, scale, is_sf_swizzled_layout=False, enable_pdl=enable_pdl)
++
++    quantize()
++    torch.cuda.synchronize()
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        actual = quantize()
++    x.normal_()
++    expected = quantize()
++    graph.replay()
++    torch.cuda.synchronize()
++    assert actual[0].shape == (2, 64)
++    assert actual[1].numel() == 16
++    for got, want in zip(actual, expected):
++        torch.testing.assert_close(got, want, rtol=0, atol=0)
+diff --git a/tests/unittest/_torch/moe/test_moe_scheduler_finalize_before_combine.py b/tests/unittest/_torch/moe/test_moe_scheduler_finalize_before_combine.py
+new file mode 100644
+index 000000000000..e10073e539ca
+--- /dev/null
++++ b/tests/unittest/_torch/moe/test_moe_scheduler_finalize_before_combine.py
+@@ -0,0 +1,215 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++"""The model-owned finalize that ``ExternalCommMoEScheduler`` runs before the combine.
++
++``do_finalize=False`` asks the backend for the unfinalized ``(gemm2_output,
++expert_weights, expanded_idx_to_permuted_idx)`` triple so the model can apply a
++per-``(token, expert)`` transform to each expert output before the top-k sum.
++Every ``Communication.combine`` in the tree is typed for a dense per-token
++tensor, so the triple cannot cross one -- it reaches ``.dim()`` on a ``list``
++and dies. When a comm strategy is active the model's finalize therefore has to
++run on the dispatched rows instead, and the combine reduces already-finalized
++partials.
++
++These tests run on CPU with a stubbed ``moe``: the seam is host-side control
++flow, and the point is which object is handed to whom, in what dtype, with what
++row count -- none of which needs a device. The four refusals matter as much as
++the happy path, because each one guards a combination that would otherwise
++produce a plausible-looking wrong answer rather than an error.
++"""
++
++import types
++from unittest.mock import MagicMock
++
++import pytest
++import torch
++
++from tensorrt_llm._torch.moe.fused_moe.communication import NVLinkOneSided
++from tensorrt_llm._torch.moe.fused_moe.moe_scheduler import ExternalCommMoEScheduler
++
++HIDDEN = 5
++TOP_K = 4
++DISPATCHED_ROWS = 12
++
++
++class _Backend:
++    """Named only so the refusal messages have something to report."""
++
++
++class _Comm:
++    pass
++
++
++def _scheduler(*, finalize_fn, register=True):
++    moe = types.SimpleNamespace(backend=_Backend(), comm=_Comm())
++    if register:
++        moe.unfinalized_combine_fn = finalize_fn
++    return ExternalCommMoEScheduler(moe)
++
++
++def _triple(*, rows: int = DISPATCHED_ROWS, flattened: bool = False) -> list[torch.Tensor]:
++    """What ``run_moe`` returns for ``do_finalize=False``.
++
++    ``expanded_idx_to_permuted_idx`` covers ``num_tokens * top_k`` slots.
++    FlashInfer returns it flattened; neither its leading dimension nor the
++    expert-major ``gemm2_output`` height is necessarily the token count.
++    """
++    return [
++        torch.randn(rows * TOP_K, HIDDEN),
++        torch.empty(rows, TOP_K),  # the kernel leaves this buffer uninitialized
++        torch.zeros((rows * TOP_K,) if flattened else (rows, TOP_K), dtype=torch.int32),
++    ]
++
++
++@pytest.mark.parametrize("flattened", [False, True], ids=["matrix", "flat-flashinfer"])
++@pytest.mark.parametrize("rows", [0, 8, DISPATCHED_ROWS])
++def test_the_finalize_runs_on_the_dispatched_rows(flattened: bool, rows: int) -> None:
++    seen = {}
++
++    def finalize(*, gemm2_output, expanded_idx_to_permuted_idx, routing_weights, num_tokens):
++        seen.update(
++            gemm2=gemm2_output,
++            index=expanded_idx_to_permuted_idx,
++            weights=routing_weights,
++            num_tokens=num_tokens,
++        )
++        return torch.ones(num_tokens, HIDDEN, dtype=torch.float32)
++
++    triple = _triple(rows=rows, flattened=flattened)
++    scales = torch.rand(rows, TOP_K, dtype=torch.bfloat16)
++
++    out = _scheduler(finalize_fn=finalize)._finalize_before_combine(
++        triple, token_final_scales=scales, output_dtype=torch.bfloat16
++    )
++
++    assert seen["gemm2"] is triple[0]
++    assert seen["index"] is triple[2]
++    # The POST-dispatch weights, not the model's own: under attention DP this
++    # rank holds rows for tokens it does not own, and only the dispatched copy
++    # covers them.
++    assert seen["weights"] is scales
++    assert seen["num_tokens"] == rows
++    assert out.shape == (rows, HIDDEN)
++
++
++def test_the_result_is_cast_down_before_the_combine_not_after():
++    """The one-sided combine region is sized from ``(hidden_size, act_dtype)``.
++
++    The finalize accumulates in FP32; handing that to ``combine`` would need
++    twice the symmetric-memory region the workspace reserved.
++    """
++    scheduler = _scheduler(
++        finalize_fn=lambda **kwargs: torch.ones(kwargs["num_tokens"], HIDDEN, dtype=torch.float32)
++    )
++    out = scheduler._finalize_before_combine(
++        _triple(),
++        token_final_scales=torch.rand(DISPATCHED_ROWS, TOP_K),
++        output_dtype=torch.bfloat16,
++    )
++    assert out.dtype == torch.bfloat16
++
++
++@pytest.mark.parametrize("register", [True, False], ids=["set-to-None", "never-declared"])
++def test_a_model_that_registered_no_finalize_is_refused_by_name(register):
++    """Not an ``AttributeError`` four frames down inside the comm layer.
++
++    Every other model in the tree keeps ``do_finalize=False`` and a comm
++    strategy apart, so this combination is unreachable for them today. If one
++    ever reaches it, the message has to say which layer and which strategy.
++    """
++    scheduler = _scheduler(finalize_fn=None, register=register)
++    with pytest.raises(NotImplementedError, match="unfinalized_combine_fn"):
++        scheduler._finalize_before_combine(
++            _triple(),
++            token_final_scales=torch.rand(DISPATCHED_ROWS, TOP_K),
++            output_dtype=torch.bfloat16,
++        )
++
++
++def test_a_backend_that_ignored_do_finalize_is_refused():
++    """A dense tensor here means the backend already ran its own finalize.
++
++    That finalize is the weighted sum *without* the model's per-expert
++    transform. Running the model's finalize on top of it would apply the
++    transform to the combined result, which is a different function.
++    """
++    scheduler = _scheduler(finalize_fn=lambda **kwargs: None)
++    with pytest.raises(NotImplementedError, match="triple"):
++        scheduler._finalize_before_combine(
++            torch.randn(DISPATCHED_ROWS, HIDDEN),
++            token_final_scales=torch.rand(DISPATCHED_ROWS, TOP_K),
++            output_dtype=torch.bfloat16,
++        )
++
++
++def test_router_weights_folded_into_the_activations_are_refused():
++    """``apply_router_weight_on_input`` leaves ``token_final_scales`` as ``None``.
++
++    The weights are then already inside the expert inputs, so the finalize
++    cannot apply them a second time and cannot recover them either.
++    """
++    scheduler = _scheduler(finalize_fn=lambda **kwargs: None)
++    with pytest.raises(NotImplementedError, match="token_final_scales"):
++        scheduler._finalize_before_combine(
++            _triple(), token_final_scales=None, output_dtype=torch.bfloat16
++        )
++
++
++@pytest.mark.parametrize("flattened", [False, True], ids=["matrix", "flat-flashinfer"])
++@pytest.mark.parametrize("shape", [(DISPATCHED_ROWS - 1, TOP_K), (DISPATCHED_ROWS, TOP_K - 1)])
++def test_the_weights_and_the_index_map_have_to_cover_the_same_rows(
++    flattened: bool, shape: tuple[int, int]
++) -> None:
++    """The two come from different places and must agree.
++
++    ``token_final_scales`` comes back from ``comm.dispatch``; the index map
++    comes out of the MoE kernel. A mismatch means one of them is the
++    pre-dispatch copy, which would weight each token's experts with another
++    token's routing weights.
++    """
++    scheduler = _scheduler(finalize_fn=lambda **kwargs: None)
++    with pytest.raises(AssertionError, match="index map"):
++        scheduler._finalize_before_combine(
++            _triple(flattened=flattened),
++            token_final_scales=torch.rand(shape),
++            output_dtype=torch.bfloat16,
++        )
++
++
++def _onesided_scheduler(*, workspace_tensor=None):
++    comm = MagicMock(spec=NVLinkOneSided)
++    comm.get_combine_payload_tensor_in_workspace.return_value = workspace_tensor
++    backend = MagicMock()
++    backend.supports_moe_output_in_alltoall_workspace.return_value = True
++    backend.input_requirement.onesided_workspace_dtype = None
++    moe = types.SimpleNamespace(comm=comm, backend=backend, hidden_size=HIDDEN)
++    return ExternalCommMoEScheduler(moe), comm
++
++
++def test_the_combine_payload_is_not_claimed_to_be_in_the_workspace():
++    """``do_finalize=False`` means the backend writes no combine payload.
++
++    ``combine()`` passes ``payload_in_workspace`` to ``moe_a2a_combine`` as a
++    flag, independent of the tensor argument, so a stale ``True`` makes the
++    kernel reduce an unwritten workspace region and return garbage without
++    raising. The finalize that runs before the combine produces a fresh
++    tensor, which is staged like any other caller-owned payload.
++    """
++    scheduler, comm = _onesided_scheduler()
++    moe_output, payload_in_workspace = scheduler._plan_onesided_workspace(
++        all_rank_num_tokens=[4, 4], output_dtype=torch.bfloat16, do_finalize=False
++    )
++    assert moe_output is None
++    assert payload_in_workspace is False
++    assert not comm.get_combine_payload_tensor_in_workspace.called
++
++
++def test_a_backend_that_does_finalize_still_gets_the_workspace_payload():
++    """The opposite case, so the guard above cannot quietly disable the fast path."""
++    sentinel = torch.zeros(8, HIDDEN)
++    scheduler, _ = _onesided_scheduler(workspace_tensor=sentinel)
++    moe_output, payload_in_workspace = scheduler._plan_onesided_workspace(
++        all_rank_num_tokens=[4, 4], output_dtype=torch.bfloat16, do_finalize=True
++    )
++    assert moe_output is sentinel
++    assert payload_in_workspace is True

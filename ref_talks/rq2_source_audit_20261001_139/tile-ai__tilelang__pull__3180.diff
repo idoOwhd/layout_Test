@@ -1,0 +1,2600 @@
+diff --git a/examples/flash_decoding/example_mha_inference.py b/examples/flash_decoding/example_mha_inference.py
+index 91a2c709c0..2a5ac5868a 100644
+--- a/examples/flash_decoding/example_mha_inference.py
++++ b/examples/flash_decoding/example_mha_inference.py
+@@ -122,6 +122,14 @@ def flashattn_mha_inference(
+             lse_logsum_local = T.alloc_fragment([block_M], accum_dtype)
+             lse_max_local = T.alloc_fragment([block_M], accum_dtype)
+             scale_local = T.alloc_fragment([block_M], accum_dtype)
++            T.annotate_layout(
++                {
++                    lse_local: T.Fragment(
++                        [num_split, block_M],
++                        forward_fn=lambda split, row: (row, split),
++                    )
++                }
++            )
+ 
+             T.clear(lse_logsum_local)
+             T.clear(o_accum_local)
+diff --git a/maint/layout_inference/cases/parallel_fragment_slice.py b/maint/layout_inference/cases/parallel_fragment_slice.py
+new file mode 100644
+index 0000000000..5239c37be4
+--- /dev/null
++++ b/maint/layout_inference/cases/parallel_fragment_slice.py
+@@ -0,0 +1,44 @@
++"""A pointwise fragment slice must not seed an invalid full-buffer layout.
++
++The partial ``T.Parallel`` write is exact and may remain legal when another
++operator supplies a complete fragment layout.  Free inference must discard the
++cheap slice-derived candidate whose forward thread map escapes the block, then
++fall back to the full-copy layout.
++
++The non-rectangular ``f[8:24, :]`` boundary is covered by the issue regression
++test because this harness records successful inference results only.
++"""
++
++import tilelang.language as T
++
++
++M, N, THREADS = 32, 64, 128
++
++
++def _overlay(off, rows):
++    @T.prim_func
++    def main(
++        A: T.Tensor((M, N), T.float16),
++        Patch: T.Tensor((rows, N), T.float16),
++        B: T.Tensor((M, N), T.float16),
++    ):
++        with T.Kernel(1, threads=THREADS):
++            frag = T.alloc_fragment((M, N), T.float32)
++            T.copy(A, frag, coalesced_width=8)
++            for i, j in T.Parallel(rows, N):
++                frag[i + off, j] = Patch[i, j]
++            T.copy(frag, B, coalesced_width=8)
++
++    return main
++
++
++VARIANTS = {
++    "offset3_rows8": lambda: _overlay(3, 8),
++    "offset16_rows8": lambda: _overlay(16, 8),
++}
++
++
++def check(variant, model, result):
++    frag = result["buffers"]["frag"]
++    assert frag["threads"] <= THREADS, f"fragment escapes the thread range: {frag}"
++    assert frag["thread_range"] == [0, THREADS]
+diff --git a/maint/layout_inference/expected/parallel_fragment_slice.json b/maint/layout_inference/expected/parallel_fragment_slice.json
+new file mode 100644
+index 0000000000..262c0d5b9d
+--- /dev/null
++++ b/maint/layout_inference/expected/parallel_fragment_slice.json
+@@ -0,0 +1,190 @@
++{
++  "offset16_rows8": {
++    "io-aware": {
++      "buffers": {
++        "frag": {
++          "forward_index": [
++            "_i // 16 * 8 + _j % 8"
++          ],
++          "forward_thread": "_i % 16 * 8 + _j // 8",
++          "input_shape": [
++            32,
++            64
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            16
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      },
++      "loops": {
++        "i,j[8x64]": {
++          "forward_index": [
++            "_j % 8"
++          ],
++          "forward_thread": "_i * 8 + _j // 8",
++          "input_shape": [
++            8,
++            64
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            8
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            64
++          ],
++          "threads": 64
++        }
++      }
++    },
++    "register-count": {
++      "buffers": {
++        "frag": {
++          "forward_index": [
++            "_i // 16 * 8 + _j % 8"
++          ],
++          "forward_thread": "_i % 16 * 8 + _j // 8",
++          "input_shape": [
++            32,
++            64
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            16
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      },
++      "loops": {
++        "i,j[8x64]": {
++          "forward_index": [
++            "_j % 8"
++          ],
++          "forward_thread": "_i * 8 + _j // 8",
++          "input_shape": [
++            8,
++            64
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            8
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            64
++          ],
++          "threads": 64
++        }
++      }
++    }
++  },
++  "offset3_rows8": {
++    "io-aware": {
++      "buffers": {
++        "frag": {
++          "forward_index": [
++            "_i // 16 * 8 + _j % 8"
++          ],
++          "forward_thread": "_i % 16 * 8 + _j // 8",
++          "input_shape": [
++            32,
++            64
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            16
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      },
++      "loops": {
++        "i,j[8x64]": {
++          "forward_index": [
++            "_j % 8"
++          ],
++          "forward_thread": "_i * 8 + _j // 8",
++          "input_shape": [
++            8,
++            64
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            8
++          ],
++          "replicate": 1,
++          "thread_range": [
++            24,
++            64
++          ],
++          "threads": 64
++        }
++      }
++    },
++    "register-count": {
++      "buffers": {
++        "frag": {
++          "forward_index": [
++            "_i // 16 * 8 + _j % 8"
++          ],
++          "forward_thread": "_i % 16 * 8 + _j // 8",
++          "input_shape": [
++            32,
++            64
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            16
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      },
++      "loops": {
++        "i,j[8x64]": {
++          "forward_index": [
++            "_j % 8"
++          ],
++          "forward_thread": "_i * 8 + _j // 8",
++          "input_shape": [
++            8,
++            64
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            8
++          ],
++          "replicate": 1,
++          "thread_range": [
++            24,
++            64
++          ],
++          "threads": 64
++        }
++      }
++    }
++  }
++}
+diff --git a/src/layout/utils.cc b/src/layout/utils.cc
+index ca0a6a3992..fe6fb9e3bc 100644
+--- a/src/layout/utils.cc
++++ b/src/layout/utils.cc
+@@ -9,10 +9,17 @@
+ #include "tvm/arith/iter_affine_map.h"
+ #include <tvm/ffi/extra/structural_equal.h>
+ #include <tvm/ffi/extra/structural_hash.h>
++#include <tvm/runtime/logging.h>
++#include <tvm/tirx/expr_functor.h>
+ 
++#include <limits>
+ #include <sstream>
++#include <string>
+ #include <tvm/tirx/op.h>
+ #include <tvm/tirx/stmt_functor.h>
++#include <vector>
++
++#include "arith/const_fold.h"
+ 
+ namespace tvm {
+ namespace tl {
+@@ -21,82 +28,275 @@ using namespace tirx;
+ using namespace ffi;
+ using namespace arith;
+ 
+-std::optional<int64_t> EvaluateConstantInteger(const PrimExpr &expr) {
+-  if (const int64_t *constant = as_const_int(expr)) {
+-    return *constant;
++namespace {
++
++class IntegerExpressionEvaluator final
++    : public ExprFunctor<std::optional<int64_t>(const PrimExpr &)> {
++public:
++  IntegerExpressionEvaluator() = default;
++
++  IntegerExpressionEvaluator(const std::vector<Var> *variables,
++                             const std::vector<int64_t> *values)
++      : variables_(variables), values_(values) {
++    ICHECK_EQ(variables_->size(), values_->size());
+   }
+ 
++private:
++  using Result = std::optional<int64_t>;
++
+   // Floored division/modulo (rounds toward -inf), matching FloorDiv/FloorMod.
+-  auto floor_div = [](int64_t lhs, int64_t rhs) {
++  static int64_t FloorDiv(int64_t lhs, int64_t rhs) {
+     int64_t quotient = lhs / rhs;
+     int64_t remainder = lhs % rhs;
+     return quotient -
+            ((remainder != 0) && ((remainder < 0) != (rhs < 0)) ? 1 : 0);
+-  };
+-  auto floor_mod = [&](int64_t lhs, int64_t rhs) {
+-    return lhs - floor_div(lhs, rhs) * rhs;
+-  };
++  }
++
++  static int64_t FloorMod(int64_t lhs, int64_t rhs) {
++    int64_t remainder = lhs % rhs;
++    return remainder != 0 && ((remainder < 0) != (rhs < 0)) ? remainder + rhs
++                                                            : remainder;
++  }
++
++  static bool IsInvalidDivision(int64_t lhs, int64_t rhs) {
++    return rhs == 0 ||
++           (lhs == std::numeric_limits<int64_t>::min() && rhs == -1);
++  }
++
++  static Result ExactCast(int64_t value, DataType dtype) {
++    if (!dtype.is_scalar()) {
++      return std::nullopt;
++    }
++    if (dtype.is_bool()) {
++      return value != 0;
++    }
++    if (dtype.is_int()) {
++      int bits = dtype.bits();
++      if (bits <= 0 || bits > 64) {
++        return std::nullopt;
++      }
++      if (bits == 64) {
++        return value;
++      }
++      int64_t limit = int64_t{1} << (bits - 1);
++      if (value < -limit || value >= limit) {
++        return std::nullopt;
++      }
++      return value;
++    }
++    if (dtype.is_uint()) {
++      int bits = dtype.bits();
++      if (bits <= 0 || bits > 64 || value < 0) {
++        return std::nullopt;
++      }
++      if (bits < 63 && value >= (int64_t{1} << bits)) {
++        return std::nullopt;
++      }
++      return value;
++    }
++    return std::nullopt;
++  }
+ 
+-  if (const auto *op = expr.as<AddNode>()) {
+-    auto lhs = EvaluateConstantInteger(op->a);
+-    auto rhs = EvaluateConstantInteger(op->b);
+-    if (lhs && rhs) {
+-      return *lhs + *rhs;
+-    }
+-  } else if (const auto *op = expr.as<SubNode>()) {
+-    auto lhs = EvaluateConstantInteger(op->a);
+-    auto rhs = EvaluateConstantInteger(op->b);
+-    if (lhs && rhs) {
+-      return *lhs - *rhs;
+-    }
+-  } else if (const auto *op = expr.as<MulNode>()) {
+-    auto lhs = EvaluateConstantInteger(op->a);
+-    auto rhs = EvaluateConstantInteger(op->b);
+-    if (lhs && rhs) {
+-      return *lhs * *rhs;
+-    }
+-  } else if (const auto *op = expr.as<FloorDivNode>()) {
+-    auto lhs = EvaluateConstantInteger(op->a);
+-    auto rhs = EvaluateConstantInteger(op->b);
+-    if (lhs && rhs && *rhs != 0) {
+-      return floor_div(*lhs, *rhs);
+-    }
+-  } else if (const auto *op = expr.as<FloorModNode>()) {
+-    auto lhs = EvaluateConstantInteger(op->a);
+-    auto rhs = EvaluateConstantInteger(op->b);
+-    if (lhs && rhs && *rhs != 0) {
+-      return floor_mod(*lhs, *rhs);
+-    }
+-  } else if (const auto *op = expr.as<CallNode>()) {
++  template <typename Node, typename F>
++  Result EvaluateBinary(const Node *op, F &&combine) {
++    Result lhs = VisitExpr(op->a);
++    Result rhs = VisitExpr(op->b);
++    if (!lhs || !rhs) {
++      return std::nullopt;
++    }
++    return combine(*lhs, *rhs);
++  }
++
++  Result VisitExpr_(const IntImmNode *op) final { return op->value; }
++
++  Result VisitExpr_(const VarNode *op) final {
++    if (variables_ == nullptr || values_ == nullptr) {
++      return std::nullopt;
++    }
++    Var var = GetRef<Var>(op);
++    for (size_t i = 0; i < variables_->size(); ++i) {
++      if ((*variables_)[i].same_as(var)) {
++        return (*values_)[i];
++      }
++    }
++    return std::nullopt;
++  }
++
++  Result VisitExpr_(const AddNode *op) final {
++    return EvaluateBinary(op,
++                          [](int64_t lhs, int64_t rhs) { return lhs + rhs; });
++  }
++
++  Result VisitExpr_(const SubNode *op) final {
++    return EvaluateBinary(op,
++                          [](int64_t lhs, int64_t rhs) { return lhs - rhs; });
++  }
++
++  Result VisitExpr_(const MulNode *op) final {
++    return EvaluateBinary(op,
++                          [](int64_t lhs, int64_t rhs) { return lhs * rhs; });
++  }
++
++  Result VisitExpr_(const DivNode *op) final {
++    return EvaluateBinary(op, [](int64_t lhs, int64_t rhs) -> Result {
++      if (IsInvalidDivision(lhs, rhs)) {
++        return std::nullopt;
++      }
++      return lhs / rhs;
++    });
++  }
++
++  Result VisitExpr_(const ModNode *op) final {
++    return EvaluateBinary(op, [](int64_t lhs, int64_t rhs) -> Result {
++      if (IsInvalidDivision(lhs, rhs)) {
++        return std::nullopt;
++      }
++      return lhs % rhs;
++    });
++  }
++
++  Result VisitExpr_(const FloorDivNode *op) final {
++    return EvaluateBinary(op, [](int64_t lhs, int64_t rhs) -> Result {
++      if (IsInvalidDivision(lhs, rhs)) {
++        return std::nullopt;
++      }
++      return FloorDiv(lhs, rhs);
++    });
++  }
++
++  Result VisitExpr_(const FloorModNode *op) final {
++    return EvaluateBinary(op, [](int64_t lhs, int64_t rhs) -> Result {
++      if (IsInvalidDivision(lhs, rhs)) {
++        return std::nullopt;
++      }
++      return FloorMod(lhs, rhs);
++    });
++  }
++
++  Result VisitExpr_(const MinNode *op) final {
++    return EvaluateBinary(
++        op, [](int64_t lhs, int64_t rhs) { return lhs < rhs ? lhs : rhs; });
++  }
++
++  Result VisitExpr_(const MaxNode *op) final {
++    return EvaluateBinary(
++        op, [](int64_t lhs, int64_t rhs) { return lhs > rhs ? lhs : rhs; });
++  }
++
++  Result VisitExpr_(const EQNode *op) final {
++    return EvaluateBinary(op,
++                          [](int64_t lhs, int64_t rhs) { return lhs == rhs; });
++  }
++
++  Result VisitExpr_(const NENode *op) final {
++    return EvaluateBinary(op,
++                          [](int64_t lhs, int64_t rhs) { return lhs != rhs; });
++  }
++
++  Result VisitExpr_(const LTNode *op) final {
++    return EvaluateBinary(op,
++                          [](int64_t lhs, int64_t rhs) { return lhs < rhs; });
++  }
++
++  Result VisitExpr_(const LENode *op) final {
++    return EvaluateBinary(op,
++                          [](int64_t lhs, int64_t rhs) { return lhs <= rhs; });
++  }
++
++  Result VisitExpr_(const GTNode *op) final {
++    return EvaluateBinary(op,
++                          [](int64_t lhs, int64_t rhs) { return lhs > rhs; });
++  }
++
++  Result VisitExpr_(const GENode *op) final {
++    return EvaluateBinary(op,
++                          [](int64_t lhs, int64_t rhs) { return lhs >= rhs; });
++  }
++
++  Result VisitExpr_(const AndNode *op) final {
++    return EvaluateBinary(op, [](int64_t lhs, int64_t rhs) {
++      return static_cast<bool>(lhs) && static_cast<bool>(rhs);
++    });
++  }
++
++  Result VisitExpr_(const OrNode *op) final {
++    return EvaluateBinary(op, [](int64_t lhs, int64_t rhs) {
++      return static_cast<bool>(lhs) || static_cast<bool>(rhs);
++    });
++  }
++
++  Result VisitExpr_(const CastNode *op) final {
++    Result value = VisitExpr(op->value);
++    return value ? ExactCast(*value, op->dtype) : std::nullopt;
++  }
++
++  Result VisitExpr_(const NotNode *op) final {
++    Result value = VisitExpr(op->a);
++    return value ? Result(!static_cast<bool>(*value)) : std::nullopt;
++  }
++
++  Result VisitExpr_(const SelectNode *op) final {
++    Result condition = VisitExpr(op->condition);
++    if (!condition) {
++      return std::nullopt;
++    }
++    return VisitExpr(*condition ? op->true_value : op->false_value);
++  }
++
++  Result VisitExpr_(const CallNode *op) final {
+     if (op->args.size() == 2) {
+-      auto lhs = EvaluateConstantInteger(op->args[0]);
+-      auto rhs = EvaluateConstantInteger(op->args[1]);
+-      if (lhs && rhs) {
+-        if (op->op.same_as(builtin::bitwise_xor())) {
+-          return *lhs ^ *rhs;
+-        }
+-        if (op->op.same_as(builtin::bitwise_and())) {
+-          return *lhs & *rhs;
+-        }
+-        if (op->op.same_as(builtin::bitwise_or())) {
+-          return *lhs | *rhs;
+-        }
+-        if (op->op.same_as(builtin::shift_left())) {
+-          ICHECK(*rhs >= 0 && *rhs < 64);
+-          return *lhs << *rhs;
++      Result lhs = VisitExpr(op->args[0]);
++      Result rhs = VisitExpr(op->args[1]);
++      if (!lhs || !rhs) {
++        return std::nullopt;
++      }
++      if (op->op.same_as(builtin::bitwise_xor())) {
++        return *lhs ^ *rhs;
++      }
++      if (op->op.same_as(builtin::bitwise_and())) {
++        return *lhs & *rhs;
++      }
++      if (op->op.same_as(builtin::bitwise_or())) {
++        return *lhs | *rhs;
++      }
++      if (op->op.same_as(builtin::shift_left())) {
++        if (*lhs < 0 || *rhs < 0 || *rhs >= 64 ||
++            *lhs > (std::numeric_limits<int64_t>::max() >> *rhs)) {
++          return std::nullopt;
+         }
+-        if (op->op.same_as(builtin::shift_right())) {
+-          ICHECK(*rhs >= 0 && *rhs < 64);
+-          return *lhs >> *rhs;
++        return *lhs << *rhs;
++      }
++      if (op->op.same_as(builtin::shift_right())) {
++        if (*lhs < 0 || *rhs < 0 || *rhs >= 64) {
++          return std::nullopt;
+         }
++        return *lhs >> *rhs;
+       }
+     } else if (op->args.size() == 1 && op->op.same_as(builtin::bitwise_not())) {
+-      if (auto value = EvaluateConstantInteger(op->args[0])) {
++      if (Result value = VisitExpr(op->args[0])) {
+         return ~*value;
+       }
+     }
++    return std::nullopt;
+   }
+-  return std::nullopt;
++
++  Result VisitExprDefault_(const ffi::Object *op) final { return std::nullopt; }
++
++  const std::vector<Var> *variables_{nullptr};
++  const std::vector<int64_t> *values_{nullptr};
++};
++
++} // namespace
++
++std::optional<int64_t> EvaluateConstantInteger(const PrimExpr &expr) {
++  return IntegerExpressionEvaluator()(expr);
++}
++
++std::optional<int64_t>
++EvaluateIntegerExpression(const PrimExpr &expr,
++                          const std::vector<Var> &variables,
++                          const std::vector<int64_t> &values) {
++  return IntegerExpressionEvaluator(&variables, &values)(expr);
+ }
+ 
+ bool CanProveDivisible(const PrimExpr &lhs, const PrimExpr &rhs) {
+@@ -440,6 +640,447 @@ Map<Var, Range> ToVMap(const Array<IterVar> &ivs) {
+   return result;
+ }
+ 
++std::optional<std::string> GetForwardMapBijectionError(
++    const Array<PrimExpr> &physical_coordinates,
++    const Array<IterVar> &logical_domain, arith::Analyzer *analyzer,
++    const std::string &description, bool require_zero_based) {
++  ICHECK(analyzer != nullptr);
++
++  // Only variables in logical_domain vary during this check.  Other symbols
++  // (for example an enclosing serial-loop iterator) are parameters fixed for
++  // one invocation of the Parallel operation.
++  auto scoped_analyzer = analyzer->Clone();
++  PrimExpr domain_volume = Integer(1);
++  for (const IterVar &iter_var : logical_domain) {
++    scoped_analyzer->Bind(iter_var->var, iter_var->dom, true);
++    PrimExpr extent = analyzer->Simplify(iter_var->dom->extent);
++    if (!analyzer->CanProve(extent > 0)) {
++      std::ostringstream os;
++      os << description << " has a logical dimension whose positive extent "
++         << "cannot be proved: " << iter_var->dom;
++      return os.str();
++    }
++    domain_volume = analyzer->Simplify(domain_volume * extent);
++  }
++
++  PrimExpr bounding_volume = Integer(1);
++  std::ostringstream ranges;
++  for (size_t i = 0; i < physical_coordinates.size(); ++i) {
++    PrimExpr coordinate = analyzer->Simplify(physical_coordinates[i]);
++    arith::IntSet coordinate_set = scoped_analyzer->int_set(coordinate);
++    if (coordinate_set.IsNothing() || arith::is_neg_inf(coordinate_set.min()) ||
++        arith::is_pos_inf(coordinate_set.max())) {
++      std::ostringstream os;
++      os << description << " does not form a rectangle: physical coordinate "
++         << i << " has an unbounded range " << coordinate_set;
++      return os.str();
++    }
++    PrimExpr min_value = analyzer->Simplify(coordinate_set.min());
++    PrimExpr max_value = analyzer->Simplify(coordinate_set.max());
++    if (require_zero_based && !analyzer->CanProveEqual(min_value, 0)) {
++      std::ostringstream os;
++      os << description << " is not zero-based in physical dimension " << i
++         << ": minimum is " << min_value;
++      return os.str();
++    }
++    PrimExpr extent = analyzer->Simplify(max_value - min_value + 1);
++    bounding_volume = analyzer->Simplify(bounding_volume * extent);
++    if (i != 0) {
++      ranges << ", ";
++    }
++    ranges << '[' << min_value << ", " << max_value << ']';
++  }
++
++  domain_volume = analyzer->Simplify(domain_volume);
++  bounding_volume = analyzer->Simplify(bounding_volume);
++  if (!analyzer->CanProveEqual(domain_volume, bounding_volume)) {
++    std::ostringstream os;
++    os << description << " does not form a rectangle: " << domain_volume
++       << " logical points map inside bounding ranges " << ranges.str()
++       << " with volume " << bounding_volume;
++    return os.str();
++  }
++
++  // Layout's constructor requires zero-based domains.  Normalize nonzero loop
++  // minima before using the common injectivity checker; foreign symbols remain
++  // untouched and therefore act as fixed parameters.
++  Array<IterVar> normalized_domain;
++  Map<Var, PrimExpr> normalization;
++  for (size_t i = 0; i < logical_domain.size(); ++i) {
++    const IterVar &iter_var = logical_domain[i];
++    Var normalized_var("__tl_bijection_i" + std::to_string(i),
++                       iter_var->var.dtype());
++    normalized_domain.push_back(IterVar(Range(0, iter_var->dom->extent),
++                                        normalized_var, IterVarType::kDataPar));
++    normalization.Set(iter_var->var, normalized_var + iter_var->dom->min);
++  }
++  Array<PrimExpr> normalized_coordinates =
++      Substitute(physical_coordinates, normalization);
++  arith::IterMapResult injectivity =
++      Layout(normalized_domain, normalized_coordinates)->DetectInjective();
++  if (!injectivity->errors.empty()) {
++    std::ostringstream os;
++    os << description
++       << " does not form a rectangle: the forward map is not provably "
++          "one-to-one. Details: "
++       << injectivity->errors;
++    return os.str();
++  }
++  return std::nullopt;
++}
++
++namespace {
++
++constexpr int64_t kMaxEnumeratedFragmentPoints = int64_t{1} << 22;
++constexpr int64_t kMaxEnumeratedContainmentChecks = int64_t{1} << 20;
++
++enum class FragmentBijectionStatus { kValid, kInvalid, kUnavailable };
++
++struct FragmentBijectionResult {
++  FragmentBijectionStatus status;
++  std::string detail;
++};
++
++FragmentBijectionResult EnumerateFragmentBijection(const Fragment &fragment,
++                                                   arith::Analyzer *analyzer) {
++  Array<PrimExpr> logical_shape = fragment->InputShape();
++  logical_shape.push_back(fragment->ReplicateExtent());
++  auto scoped_analyzer = analyzer->Clone();
++  for (size_t i = 0; i < fragment->InputDim(); ++i) {
++    scoped_analyzer->Bind(InputPlaceholder(i),
++                          Range(0, fragment->InputShape()[i]), true);
++  }
++  scoped_analyzer->Bind(ReplicationPlaceholder(),
++                        Range(0, fragment->ReplicateExtent()), true);
++  arith::IntSet thread_set =
++      scoped_analyzer->int_set(fragment->GetForwardThread());
++  if (thread_set.IsNothing() || arith::is_neg_inf(thread_set.min()) ||
++      arith::is_pos_inf(thread_set.max())) {
++    return {FragmentBijectionStatus::kUnavailable, ""};
++  }
++  PrimExpr thread_min = analyzer->Simplify(thread_set.min());
++  PrimExpr thread_extent =
++      analyzer->Simplify(thread_set.max() - thread_min + 1);
++  Array<PrimExpr> physical_shape{thread_extent};
++  Array<PrimExpr> output_shape = fragment->OutputShape();
++  physical_shape.insert(physical_shape.end(), output_shape.begin(),
++                        output_shape.end());
++
++  bool unavailable = false;
++  bool exceeds_limit = false;
++  std::string invalid_extent;
++  auto collect_extents = [&](const Array<PrimExpr> &shape,
++                             const char *domain_name,
++                             std::vector<int64_t> *extents, int64_t *volume) {
++    *volume = 1;
++    extents->reserve(shape.size());
++    for (size_t i = 0; i < shape.size(); ++i) {
++      PrimExpr simplified = analyzer->Simplify(shape[i]);
++      std::optional<int64_t> extent = EvaluateConstantInteger(simplified);
++      if (!extent) {
++        unavailable = true;
++        return;
++      }
++      if (*extent <= 0) {
++        std::ostringstream os;
++        os << "the fragment forward map has a non-positive " << domain_name
++           << " extent in dimension " << i << ": " << *extent;
++        invalid_extent = os.str();
++        return;
++      }
++      if (*extent > kMaxEnumeratedFragmentPoints / *volume) {
++        exceeds_limit = true;
++        return;
++      }
++      *volume *= *extent;
++      extents->push_back(*extent);
++    }
++  };
++
++  std::vector<int64_t> logical_extents;
++  std::vector<int64_t> physical_extents;
++  int64_t logical_volume = 1;
++  int64_t physical_volume = 1;
++  collect_extents(logical_shape, "logical", &logical_extents, &logical_volume);
++  if (!invalid_extent.empty()) {
++    return {FragmentBijectionStatus::kInvalid, invalid_extent};
++  }
++  if (!unavailable && !exceeds_limit) {
++    collect_extents(physical_shape, "physical", &physical_extents,
++                    &physical_volume);
++  }
++  if (!invalid_extent.empty()) {
++    return {FragmentBijectionStatus::kInvalid, invalid_extent};
++  }
++  if (exceeds_limit) {
++    LOG(WARNING) << "Skipping exhaustive fragment-bijection enumeration above "
++                    "the limit of "
++                 << kMaxEnumeratedFragmentPoints
++                 << " points; falling back to symbolic proof. Fragment: "
++                 << fragment->DebugOutput();
++    return {FragmentBijectionStatus::kUnavailable, ""};
++  }
++  if (unavailable) {
++    return {FragmentBijectionStatus::kUnavailable, ""};
++  }
++  if (logical_volume != physical_volume) {
++    std::ostringstream os;
++    os << "the fragment forward map does not form a rectangle: "
++       << logical_volume << " logical points map into a physical rectangle "
++       << "with volume " << physical_volume;
++    return {FragmentBijectionStatus::kInvalid, os.str()};
++  }
++  std::optional<int64_t> thread_min_value =
++      EvaluateConstantInteger(analyzer->Simplify(thread_min));
++  if (!thread_min_value) {
++    return {FragmentBijectionStatus::kUnavailable, ""};
++  }
++
++  Array<PrimExpr> forward_coordinates{fragment->GetForwardThread()};
++  Array<PrimExpr> forward_indices = fragment->GetForwardIndex();
++  forward_coordinates.insert(forward_coordinates.end(), forward_indices.begin(),
++                             forward_indices.end());
++  std::vector<uint64_t> occupied(
++      static_cast<size_t>((physical_volume + 63) / 64), uint64_t{0});
++  std::vector<int64_t> logical_coordinate(logical_extents.size());
++  std::vector<Var> logical_variables;
++  logical_variables.reserve(logical_extents.size());
++  for (size_t i = 0; i < fragment->InputDim(); ++i) {
++    logical_variables.push_back(InputPlaceholder(i));
++  }
++  logical_variables.push_back(ReplicationPlaceholder());
++  IntegerExpressionEvaluator evaluator(&logical_variables, &logical_coordinate);
++
++  for (int64_t linear = 0; linear < logical_volume; ++linear) {
++    int64_t residual = linear;
++    for (size_t rev = logical_extents.size(); rev > 0; --rev) {
++      size_t i = rev - 1;
++      logical_coordinate[i] = residual % logical_extents[i];
++      residual /= logical_extents[i];
++    }
++
++    int64_t physical_linear = 0;
++    for (size_t i = 0; i < forward_coordinates.size(); ++i) {
++      std::optional<int64_t> coordinate = evaluator(forward_coordinates[i]);
++      if (!coordinate) {
++        return {FragmentBijectionStatus::kUnavailable, ""};
++      }
++      if (i == 0) {
++        *coordinate -= *thread_min_value;
++      }
++      if (*coordinate < 0 || *coordinate >= physical_extents[i]) {
++        std::ostringstream os;
++        os << "the fragment forward map does not form a rectangle: physical "
++              "coordinate "
++           << i << " evaluates to " << *coordinate << " outside [0, "
++           << physical_extents[i] << ')';
++        return {FragmentBijectionStatus::kInvalid, os.str()};
++      }
++      physical_linear = physical_linear * physical_extents[i] + *coordinate;
++    }
++
++    uint64_t mask = uint64_t{1} << (physical_linear % 64);
++    uint64_t &word = occupied[static_cast<size_t>(physical_linear / 64)];
++    if ((word & mask) != 0) {
++      std::ostringstream os;
++      os << "the fragment forward map does not form a rectangle: multiple "
++            "logical points map to physical cell "
++         << physical_linear;
++      return {FragmentBijectionStatus::kInvalid, os.str()};
++    }
++    word |= mask;
++  }
++  // The logical and physical volumes are equal, so an injective in-bounds map
++  // also visits every cell in the physical rectangle exactly once.
++  return {FragmentBijectionStatus::kValid, ""};
++}
++
++enum class FragmentContainmentStatus { kValid, kInvalid, kUnavailable };
++
++FragmentContainmentStatus
++EnumerateFragmentContains(const Fragment &small_frag,
++                          const Fragment &large_frag,
++                          const Array<PrimExpr> &small_frag_indices,
++                          const Array<PrimExpr> &large_frag_indices,
++                          arith::Analyzer *analyzer, bool check_forward_index) {
++  ICHECK(analyzer != nullptr);
++  if (small_frag_indices.size() != small_frag->InputDim() ||
++      large_frag_indices.size() != large_frag->InputDim()) {
++    return FragmentContainmentStatus::kUnavailable;
++  }
++
++  std::vector<Var> logical_variables;
++  std::vector<int64_t> logical_extents;
++  logical_variables.reserve(small_frag_indices.size() + 2);
++  logical_extents.reserve(small_frag_indices.size());
++  int64_t logical_volume = 1;
++  for (size_t i = 0; i < small_frag_indices.size(); ++i) {
++    const auto *var_node = small_frag_indices[i].as<VarNode>();
++    std::optional<int64_t> extent = EvaluateConstantInteger(
++        analyzer->Simplify(small_frag->InputShape()[i]));
++    if (var_node == nullptr || !extent || *extent <= 0 ||
++        *extent > kMaxEnumeratedContainmentChecks / logical_volume) {
++      return FragmentContainmentStatus::kUnavailable;
++    }
++    Var var = GetRef<Var>(var_node);
++    if (std::any_of(logical_variables.begin(), logical_variables.end(),
++                    [&](const Var &other) { return other.same_as(var); })) {
++      return FragmentContainmentStatus::kUnavailable;
++    }
++    logical_variables.push_back(var);
++    logical_extents.push_back(*extent);
++    logical_volume *= *extent;
++  }
++
++  std::optional<int64_t> small_replicas = EvaluateConstantInteger(
++      analyzer->Simplify(small_frag->ReplicateExtent()));
++  std::optional<int64_t> large_replicas = EvaluateConstantInteger(
++      analyzer->Simplify(large_frag->ReplicateExtent()));
++  if (!small_replicas || !large_replicas || *small_replicas <= 0 ||
++      *large_replicas <= 0 ||
++      *small_replicas > kMaxEnumeratedContainmentChecks / logical_volume ||
++      *large_replicas > kMaxEnumeratedContainmentChecks /
++                            (logical_volume * *small_replicas)) {
++    return FragmentContainmentStatus::kUnavailable;
++  }
++
++  std::vector<int64_t> large_shape;
++  large_shape.reserve(large_frag->InputDim());
++  for (const PrimExpr &extent_expr : large_frag->InputShape()) {
++    std::optional<int64_t> extent =
++        EvaluateConstantInteger(analyzer->Simplify(extent_expr));
++    if (!extent || *extent <= 0) {
++      return FragmentContainmentStatus::kUnavailable;
++    }
++    large_shape.push_back(*extent);
++  }
++
++  Var small_rep("__tl_contains_small_rep",
++                small_frag->ReplicateExtent()->dtype);
++  Var large_rep("__tl_contains_large_rep",
++                large_frag->ReplicateExtent()->dtype);
++  PrimExpr small_thread =
++      small_frag->ForwardThread(small_frag_indices, small_rep);
++  PrimExpr large_thread =
++      large_frag->ForwardThread(large_frag_indices, large_rep);
++  Array<PrimExpr> small_physical = small_frag->Forward(small_frag_indices);
++  Array<PrimExpr> large_physical = large_frag->Forward(large_frag_indices);
++  if (check_forward_index && small_physical.size() != large_physical.size()) {
++    return FragmentContainmentStatus::kInvalid;
++  }
++
++  logical_variables.push_back(small_rep);
++  logical_variables.push_back(large_rep);
++  std::vector<int64_t> values(logical_variables.size(), 0);
++  IntegerExpressionEvaluator evaluator(&logical_variables, &values);
++
++  for (int64_t linear = 0; linear < logical_volume; ++linear) {
++    int64_t residual = linear;
++    for (size_t rev = logical_extents.size(); rev > 0; --rev) {
++      size_t i = rev - 1;
++      values[i] = residual % logical_extents[i];
++      residual /= logical_extents[i];
++    }
++
++    for (size_t i = 0; i < large_frag_indices.size(); ++i) {
++      std::optional<int64_t> index = evaluator(large_frag_indices[i]);
++      if (!index) {
++        return FragmentContainmentStatus::kUnavailable;
++      }
++      if (*index < 0 || *index >= large_shape[i]) {
++        return FragmentContainmentStatus::kInvalid;
++      }
++    }
++    if (check_forward_index) {
++      for (size_t i = 0; i < small_physical.size(); ++i) {
++        std::optional<int64_t> small_index = evaluator(small_physical[i]);
++        std::optional<int64_t> large_index = evaluator(large_physical[i]);
++        if (!small_index || !large_index) {
++          return FragmentContainmentStatus::kUnavailable;
++        }
++        if (*small_index != *large_index) {
++          return FragmentContainmentStatus::kInvalid;
++        }
++      }
++    }
++
++    for (int64_t small_replica = 0; small_replica < *small_replicas;
++         ++small_replica) {
++      values[logical_extents.size()] = small_replica;
++      std::optional<int64_t> expected_thread = evaluator(small_thread);
++      if (!expected_thread) {
++        return FragmentContainmentStatus::kUnavailable;
++      }
++      bool found_owner = false;
++      for (int64_t large_replica = 0; large_replica < *large_replicas;
++           ++large_replica) {
++        values[logical_extents.size() + 1] = large_replica;
++        std::optional<int64_t> owner_thread = evaluator(large_thread);
++        if (!owner_thread) {
++          return FragmentContainmentStatus::kUnavailable;
++        }
++        if (*owner_thread == *expected_thread) {
++          found_owner = true;
++          break;
++        }
++      }
++      if (!found_owner) {
++        return FragmentContainmentStatus::kInvalid;
++      }
++    }
++  }
++  return FragmentContainmentStatus::kValid;
++}
++
++} // namespace
++
++std::optional<std::string>
++GetFragmentBijectionError(const Fragment &fragment, arith::Analyzer *analyzer) {
++  ICHECK(fragment.defined());
++  ICHECK(analyzer != nullptr);
++
++  FragmentBijectionResult enumeration =
++      EnumerateFragmentBijection(fragment, analyzer);
++  if (enumeration.status == FragmentBijectionStatus::kValid) {
++    return std::nullopt;
++  }
++  if (enumeration.status == FragmentBijectionStatus::kInvalid) {
++    return enumeration.detail;
++  }
++
++  Array<IterVar> logical_domain;
++  for (size_t i = 0; i < fragment->InputDim(); ++i) {
++    Range domain(0, fragment->InputShape()[i]);
++    logical_domain.push_back(
++        IterVar(domain, InputPlaceholder(i), IterVarType::kDataPar));
++  }
++  Range replicate_domain(0, fragment->ReplicateExtent());
++  logical_domain.push_back(IterVar(replicate_domain, ReplicationPlaceholder(),
++                                   IterVarType::kDataPar));
++
++  Array<PrimExpr> physical_coordinates{fragment->GetForwardThread()};
++  Array<PrimExpr> forward_indices = fragment->GetForwardIndex();
++  physical_coordinates.insert(physical_coordinates.end(),
++                              forward_indices.begin(), forward_indices.end());
++
++  auto scoped_analyzer = analyzer->Clone();
++  for (const IterVar &iter_var : logical_domain) {
++    scoped_analyzer->Bind(iter_var->var, iter_var->dom, true);
++  }
++  arith::IntSet thread_set =
++      scoped_analyzer->int_set(fragment->GetForwardThread());
++  if (thread_set.IsNothing() || arith::is_neg_inf(thread_set.min()) ||
++      arith::is_pos_inf(thread_set.max())) {
++    return "the fragment forward map has an unbounded thread range";
++  }
++  physical_coordinates.Set(
++      0, analyzer->Simplify(fragment->GetForwardThread() - thread_set.min()));
++
++  return GetForwardMapBijectionError(physical_coordinates, logical_domain,
++                                     analyzer, "the fragment forward map",
++                                     /*require_zero_based=*/true);
++}
++
+ // ProveFragmentContains checks whether the threads that access elements of a
+ // smaller fragment (small_frag) are a subset of the threads that access
+ // elements of a larger fragment (large_frag) for any given loop index. This
+@@ -495,31 +1136,65 @@ bool ProveFragmentContains(Fragment small_frag, Fragment large_frag,
+                 Range(IntImm(small_frag->ReplicateExtent()->dtype, 0),
+                       small_frag->ReplicateExtent()),
+                 true); // Bind the replicate extent of small_frag.
+-  // Derive thread for small_frag.
+-  auto thread = small_frag->ForwardThread(small_frag_indices, rep_small);
+-
+-  // Get physical index and thread for large_frag.
+-  auto large_frag_physical_and_thread = large_frag->Forward(large_frag_indices);
+-  // Add small_frag's thread to the large fragment's thread info.
+-  large_frag_physical_and_thread.push_back(thread);
+-  // Get the inverse of the large fragment.
+-  auto inv_large_frag = large_frag->Inverse();
+-  // Compute logical index and replicate index using inverse layout.
+-  auto inv_large_frag_logical_and_rep =
+-      inv_large_frag->Forward(large_frag_physical_and_thread);
+-
+-  // Extract replicate index from the result.
+-  auto inv_large_frag_rep =
+-      inv_large_frag_logical_and_rep[inv_large_frag_logical_and_rep.size() - 1];
+-
+-  // Calculate thread based on the logical index and replicate index.
+-  auto check_thread =
+-      large_frag->ForwardThread(large_frag_indices, inv_large_frag_rep);
+-
+-  // Simplify the difference between the threads.
+-  auto diff = analyzer.Simplify(thread - check_thread);
+-  // If the difference is zero, the threads match and the access is valid.
+-  return analyzer.CanProve(diff == 0);
++  PrimExpr small_thread_base =
++      small_frag->ThreadRange().defined()
++          ? small_frag->ThreadRange()->min
++          : make_zero(small_frag->GetForwardThread()->dtype);
++  PrimExpr large_thread_base =
++      large_frag->ThreadRange().defined()
++          ? large_frag->ThreadRange()->min
++          : make_zero(large_frag->GetForwardThread()->dtype);
++  // Compare physical participant ids.  Fragment forward-thread expressions are
++  // normalized to their own ThreadRange, whose minimum may differ for a sliced
++  // Parallel operation.
++  auto thread = small_frag->ForwardThread(small_frag_indices, rep_small) +
++                small_thread_base;
++
++  try {
++    // Get physical index and thread for large_frag.
++    auto large_frag_physical_and_thread =
++        large_frag->Forward(large_frag_indices);
++    // The large fragment inverse consumes a thread coordinate normalized to
++    // its own participant range.
++    large_frag_physical_and_thread.push_back(thread - large_thread_base);
++    // Get the inverse of the large fragment.
++    auto inv_large_frag = large_frag->Inverse();
++    // Compute logical index and replicate index using inverse layout.
++    auto inv_large_frag_logical_and_rep =
++        inv_large_frag->Forward(large_frag_physical_and_thread);
++
++    // Extract replicate index from the result.
++    auto inv_large_frag_rep =
++        inv_large_frag_logical_and_rep[inv_large_frag_logical_and_rep.size() -
++                                       1];
++
++    // Calculate thread based on the logical index and replicate index.
++    auto check_thread =
++        large_frag->ForwardThread(large_frag_indices, inv_large_frag_rep) +
++        large_thread_base;
++
++    // Simplify the difference between the threads.
++    auto diff = analyzer.Simplify(thread - check_thread);
++    // If the difference is zero, the threads match and the access is valid.
++    if (analyzer.CanProve(diff == 0)) {
++      return true;
++    }
++  } catch (const NormalizeIterException &) {
++    // Some valid floor-div/mod layouts do not have an inverse expressible by
++    // TVM's iter-map solver.  The bounded forward check below does not need
++    // that inverse.
++  }
++
++  // Symbolic inversion can be inconclusive for valid many-to-one accesses,
++  // such as `fragment[i, j // 32]`. Check the ownership relation directly:
++  // every thread selected by the small fragment must appear in the forward
++  // thread image of the accessed large-fragment element. Keep this fallback
++  // deliberately bounded because it evaluates every logical point and pair of
++  // replica coordinates.
++  return EnumerateFragmentContains(small_frag, large_frag, small_frag_indices,
++                                   large_frag_indices, &analyzer,
++                                   check_forward_index) ==
++         FragmentContainmentStatus::kValid;
+ }
+ 
+ } // namespace tl
+diff --git a/src/layout/utils.h b/src/layout/utils.h
+index 39b013057d..62a260f849 100644
+--- a/src/layout/utils.h
++++ b/src/layout/utils.h
+@@ -9,6 +9,7 @@
+ 
+ #include <cstdint>
+ #include <optional>
++#include <vector>
+ 
+ #include "support/check.h"
+ #include <tvm/arith/iter_affine_map.h>
+@@ -40,6 +41,21 @@ class NormalizeIterException : public std::exception {
+  */
+ std::optional<int64_t> EvaluateConstantInteger(const PrimExpr &expr);
+ 
++/*!
++ * \brief Evaluate an integer expression after assigning concrete values to
++ *        its variables.
++ *
++ * This uses the same layout-expression evaluator as
++ * EvaluateConstantInteger, including floor division/modulo and bitwise
++ * operators.
++ *
++ * \return The integer value, or std::nullopt for an unsupported expression.
++ */
++std::optional<int64_t>
++EvaluateIntegerExpression(const PrimExpr &expr,
++                          const std::vector<Var> &variables,
++                          const std::vector<int64_t> &values);
++
+ /*!
+  * \brief Collect the IterSplit that is not used in expr.
+  *
+@@ -75,6 +91,31 @@ PrimExpr MakeFlattenedExpression(const Array<arith::IterSplitExpr> &splits);
+  */
+ Map<Var, Range> ToVMap(const Array<IterVar> &ivs);
+ 
++/*!
++ * \brief Check whether a forward map is a bijection onto one rectangular
++ *        physical image.
++ *
++ * The logical domain may contain parameters that are not listed in
++ * `logical_domain`; those are treated as fixed for one invocation.  The
++ * returned string describes the first failed proof, while std::nullopt means
++ * that rectangularity and injectivity were both proved.
++ */
++std::optional<std::string> GetForwardMapBijectionError(
++    const Array<PrimExpr> &physical_coordinates,
++    const Array<IterVar> &logical_domain, arith::Analyzer *analyzer,
++    const std::string &description, bool require_zero_based = false);
++
++/*!
++ * \brief Check the canonical Fragment mapping
++ *        `(logical coordinates, replica) -> (thread, local indices)`.
++ *
++ * A valid freely inferred fragment must be a bijection onto a zero-based
++ * physical rectangle.  ThreadRange is an external participant-range offset
++ * and is intentionally not part of this normalized mapping.
++ */
++std::optional<std::string> GetFragmentBijectionError(const Fragment &fragment,
++                                                     arith::Analyzer *analyzer);
++
+ /*!
+  * \brief Convert a Map object to an Array of IterVar
+  *
+diff --git a/src/op/operator.h b/src/op/operator.h
+index aed41be715..1644534620 100644
+--- a/src/op/operator.h
++++ b/src/op/operator.h
+@@ -176,6 +176,10 @@ struct LayoutInferArgs {
+   // the vectorizer's width; scalar reducer-root attempts pass one. This is
+   // a search option, not operator state or a constraint on inferred layouts.
+   int candidate_vector_size_limit = 0;
++  // Fragment buffers created by an allocation site in the source SBlock.
++  // Derived Buffer views may share their storage and layout, but their
++  // partial physical image is not required to form a dense rectangle.
++  ffi::Map<tirx::Buffer, Bool> allocated_fragment_buffers;
+ };
+ 
+ class TileOperator;
+diff --git a/src/op/parallel.cc b/src/op/parallel.cc
+index 6ca485b14e..35861f9145 100644
+--- a/src/op/parallel.cc
++++ b/src/op/parallel.cc
+@@ -10,6 +10,10 @@
+ #include <tvm/runtime/logging.h>
+ 
+ #include <algorithm>
++#include <optional>
++#include <set>
++#include <sstream>
++#include <string>
+ #include <tvm/tirx/analysis.h>
+ #include <tvm/tirx/op.h>
+ #include <unordered_set>
+@@ -18,6 +22,7 @@
+ #include "../layout/utils.h"
+ #include "../transform/loop_partition.h"
+ #include "../transform/loop_vectorize.h"
++#include "arith/const_fold.h"
+ #include "arith/int_operator.h"
+ #include "backend/common/target_utils.h"
+ #include "builtin.h"
+@@ -33,6 +38,190 @@ using namespace ffi;
+ 
+ namespace {
+ 
++constexpr int64_t kMaxEnumeratedParallelAccessChecks = int64_t{1} << 20;
++
++enum class ParallelFragmentAccessStatus { kValid, kInvalid, kUnavailable };
++
++struct ParallelFragmentAccessResult {
++  ParallelFragmentAccessStatus status;
++  std::string detail;
++};
++
++PrimExpr PhysicalThread(const Fragment &fragment,
++                        const Array<PrimExpr> &indices,
++                        const PrimExpr &replicate) {
++  PrimExpr thread_base = fragment->ThreadRange().defined()
++                             ? fragment->ThreadRange()->min
++                             : make_zero(fragment->GetForwardThread()->dtype);
++  return fragment->ForwardThread(indices, replicate) + thread_base;
++}
++
++ParallelFragmentAccessResult EnumerateParallelFragmentAccess(
++    const Fragment &loop_layout, const Fragment &fragment,
++    const Array<IterVar> &loop_vars, const Map<Var, IterVar> &inner_vars,
++    const Array<PrimExpr> &access_indices, bool is_write,
++    bool check_forward_index, arith::Analyzer *analyzer) {
++  ICHECK(loop_layout.defined());
++  ICHECK(fragment.defined());
++  ICHECK(analyzer != nullptr);
++  if (loop_layout->InputDim() != loop_vars.size() ||
++      fragment->InputDim() != access_indices.size()) {
++    return {ParallelFragmentAccessStatus::kUnavailable, ""};
++  }
++
++  Array<IterVar> logical_domain = loop_vars;
++  for (const auto &[var, iter_var] : inner_vars) {
++    bool is_used = false;
++    for (const PrimExpr &index : access_indices) {
++      if (tirx::UsesVar(index, [&](const VarNode *node) {
++            return GetRef<Var>(node).same_as(var);
++          })) {
++        is_used = true;
++        break;
++      }
++    }
++    if (is_used) {
++      logical_domain.push_back(iter_var);
++    }
++  }
++
++  std::vector<Var> variables;
++  std::vector<int64_t> domain_mins;
++  std::vector<int64_t> domain_extents;
++  variables.reserve(logical_domain.size() + 2);
++  domain_mins.reserve(logical_domain.size());
++  domain_extents.reserve(logical_domain.size());
++  int64_t logical_volume = 1;
++  for (const IterVar &iter_var : logical_domain) {
++    std::optional<int64_t> min =
++        EvaluateConstantInteger(analyzer->Simplify(iter_var->dom->min));
++    std::optional<int64_t> extent =
++        EvaluateConstantInteger(analyzer->Simplify(iter_var->dom->extent));
++    if (!min || !extent || *extent <= 0 ||
++        *extent > kMaxEnumeratedParallelAccessChecks / logical_volume) {
++      return {ParallelFragmentAccessStatus::kUnavailable, ""};
++    }
++    variables.push_back(iter_var->var);
++    domain_mins.push_back(*min);
++    domain_extents.push_back(*extent);
++    logical_volume *= *extent;
++  }
++
++  std::optional<int64_t> loop_replicas = EvaluateConstantInteger(
++      analyzer->Simplify(loop_layout->ReplicateExtent()));
++  std::optional<int64_t> fragment_replicas =
++      EvaluateConstantInteger(analyzer->Simplify(fragment->ReplicateExtent()));
++  if (!loop_replicas || !fragment_replicas || *loop_replicas <= 0 ||
++      *fragment_replicas <= 0 ||
++      *loop_replicas > kMaxEnumeratedParallelAccessChecks / logical_volume ||
++      *fragment_replicas >
++          kMaxEnumeratedParallelAccessChecks / logical_volume ||
++      *loop_replicas + *fragment_replicas >
++          kMaxEnumeratedParallelAccessChecks / logical_volume) {
++    return {ParallelFragmentAccessStatus::kUnavailable, ""};
++  }
++
++  Var loop_rep("__tl_parallel_access_loop_rep",
++               loop_layout->ReplicateExtent()->dtype);
++  Var fragment_rep("__tl_parallel_access_fragment_rep",
++                   fragment->ReplicateExtent()->dtype);
++  Array<PrimExpr> loop_indices = loop_vars.Map(
++      [](const IterVar &iter_var) { return PrimExpr(iter_var->var); });
++  PrimExpr loop_thread = PhysicalThread(loop_layout, loop_indices, loop_rep);
++  PrimExpr fragment_thread =
++      PhysicalThread(fragment, access_indices, fragment_rep);
++  Array<PrimExpr> loop_physical = loop_layout->Forward(loop_indices);
++  Array<PrimExpr> fragment_physical = fragment->Forward(access_indices);
++  if (check_forward_index && loop_physical.size() != fragment_physical.size()) {
++    return {ParallelFragmentAccessStatus::kInvalid,
++            "the loop and fragment have different physical-index ranks"};
++  }
++
++  variables.push_back(loop_rep);
++  variables.push_back(fragment_rep);
++  std::vector<int64_t> values(variables.size(), 0);
++  const size_t loop_rep_position = logical_domain.size();
++  const size_t fragment_rep_position = logical_domain.size() + 1;
++
++  using OwnerSet = std::set<int64_t>;
++  std::set<std::vector<int64_t>> written_logical_elements;
++
++  for (int64_t linear = 0; linear < logical_volume; ++linear) {
++    int64_t residual = linear;
++    for (size_t rev = domain_extents.size(); rev > 0; --rev) {
++      size_t i = rev - 1;
++      values[i] = domain_mins[i] + residual % domain_extents[i];
++      residual /= domain_extents[i];
++    }
++
++    std::vector<int64_t> logical_access;
++    logical_access.reserve(access_indices.size());
++    for (const PrimExpr &index : access_indices) {
++      std::optional<int64_t> value =
++          EvaluateIntegerExpression(index, variables, values);
++      if (!value) {
++        return {ParallelFragmentAccessStatus::kUnavailable, ""};
++      }
++      logical_access.push_back(*value);
++    }
++    if (is_write && !written_logical_elements.insert(logical_access).second) {
++      return {ParallelFragmentAccessStatus::kInvalid,
++              "the fragment write is not one-to-one: multiple logical "
++              "executions address the same fragment element"};
++    }
++
++    if (check_forward_index) {
++      for (size_t i = 0; i < loop_physical.size(); ++i) {
++        std::optional<int64_t> loop_index =
++            EvaluateIntegerExpression(loop_physical[i], variables, values);
++        std::optional<int64_t> fragment_index =
++            EvaluateIntegerExpression(fragment_physical[i], variables, values);
++        if (!loop_index || !fragment_index) {
++          return {ParallelFragmentAccessStatus::kUnavailable, ""};
++        }
++        if (*loop_index != *fragment_index) {
++          return {ParallelFragmentAccessStatus::kInvalid,
++                  "the loop and fragment physical indices differ"};
++        }
++      }
++    }
++
++    OwnerSet fragment_owners;
++    for (int64_t rep = 0; rep < *fragment_replicas; ++rep) {
++      values[fragment_rep_position] = rep;
++      std::optional<int64_t> thread =
++          EvaluateIntegerExpression(fragment_thread, variables, values);
++      if (!thread) {
++        return {ParallelFragmentAccessStatus::kUnavailable, ""};
++      }
++      fragment_owners.insert(*thread);
++    }
++
++    OwnerSet loop_owners;
++    for (int64_t rep = 0; rep < *loop_replicas; ++rep) {
++      values[loop_rep_position] = rep;
++      std::optional<int64_t> thread =
++          EvaluateIntegerExpression(loop_thread, variables, values);
++      if (!thread) {
++        return {ParallelFragmentAccessStatus::kUnavailable, ""};
++      }
++      loop_owners.insert(*thread);
++    }
++
++    if (!std::includes(fragment_owners.begin(), fragment_owners.end(),
++                       loop_owners.begin(), loop_owners.end())) {
++      return {ParallelFragmentAccessStatus::kInvalid,
++              "a loop thread does not own the accessed fragment element"};
++    }
++    if (is_write && loop_owners != fragment_owners) {
++      return {ParallelFragmentAccessStatus::kInvalid,
++              "the loop does not update every owner of an accessed fragment "
++              "element"};
++    }
++  }
++  return {ParallelFragmentAccessStatus::kValid, ""};
++}
++
+ class IfBufferRemapLoopGenerator : public StmtExprMutator {
+ public:
+   static For run(Stmt stmt, Map<Buffer, Buffer> buffer_remap,
+@@ -120,6 +309,142 @@ int SelectMinPaddingVectorSize(int max_vector_size, PrimExpr loop_total_size,
+   return best_vector_size;
+ }
+ 
++std::optional<std::string>
++GetFragmentForwardMapError(const Fragment &fragment, const Range &thread_bounds,
++                           arith::Analyzer *analyzer) {
++  ICHECK(fragment.defined());
++  ICHECK(thread_bounds.defined());
++  ICHECK(analyzer != nullptr);
++
++  Range declared_range = fragment->ThreadRange().defined()
++                             ? fragment->ThreadRange()
++                             : thread_bounds;
++  if (!analyzer->CanProve(declared_range->extent > 0)) {
++    return "the declared thread range must have positive extent";
++  }
++  if (!analyzer->CanProve(declared_range->min >= thread_bounds->min) ||
++      !analyzer->CanProve(declared_range->min + declared_range->extent <=
++                          thread_bounds->min + thread_bounds->extent)) {
++    std::ostringstream os;
++    os << "declared thread range " << declared_range
++       << " is outside the current participant range " << thread_bounds;
++    return os.str();
++  }
++  auto scoped_analyzer = analyzer->Clone();
++  for (size_t i = 0; i < fragment->InputDim(); ++i) {
++    scoped_analyzer->Bind(InputPlaceholder(i),
++                          Range(0, fragment->InputShape()[i]), true);
++  }
++  scoped_analyzer->Bind(ReplicationPlaceholder(),
++                        Range(0, fragment->ReplicateExtent()), true);
++  arith::IntSet thread_set =
++      scoped_analyzer->int_set(fragment->GetForwardThread());
++  if (thread_set.IsNothing()) {
++    return "the fragment thread image is empty";
++  }
++  if (arith::is_neg_inf(thread_set.min()) ||
++      arith::is_pos_inf(thread_set.max())) {
++    // A symbolic loop extent can make interval analysis inconclusive even
++    // when the thread expression itself is valid.  Keep the pre-existing
++    // symbolic injectivity check as the authority in that case.
++    return std::nullopt;
++  }
++  PrimExpr thread_extent =
++      analyzer->Simplify(thread_set.max() - thread_set.min() + 1);
++  if (!analyzer->CanProve(thread_extent <= declared_range->extent)) {
++    std::ostringstream os;
++    os << "normalized thread extent " << thread_extent
++       << " exceeds the declared participant extent " << declared_range->extent;
++    return os.str();
++  }
++  for (const PrimExpr &extent : fragment->InputShape()) {
++    if (!EvaluateConstantInteger(analyzer->Simplify(extent))) {
++      return std::nullopt;
++    }
++  }
++  if (!EvaluateConstantInteger(
++          analyzer->Simplify(fragment->ReplicateExtent()))) {
++    return std::nullopt;
++  }
++  if (auto error = GetFragmentBijectionError(fragment, analyzer)) {
++    return error;
++  }
++
++  // PartitionLoop consumes this inverse directly.  A forward map can be an
++  // exact bijection while TVM's iter-map solver still synthesizes a wrong
++  // inverse for cyclic floor-div/mod expressions, so validate the same static
++  // round trip before accepting the inferred candidate.
++  try {
++    (void)fragment->InverseWithLevel();
++  } catch (const NormalizeIterException &err) {
++    return err.what();
++  }
++  return std::nullopt;
++}
++
++std::optional<std::string> GetFragmentWriteInjectivityError(
++    const Fragment &loop_layout, const Fragment &fragment,
++    const Array<IterVar> &loop_vars, const Map<Var, IterVar> &inner_vars,
++    const Array<PrimExpr> &access_indices, arith::Analyzer *analyzer) {
++  Var rep("__tl_parallel_write_rep", loop_layout->ReplicateExtent()->dtype);
++  Array<PrimExpr> loop_indices = loop_vars.Map(
++      [](const IterVar &iter_var) { return PrimExpr(iter_var->var); });
++  Array<PrimExpr> physical_coordinates{
++      loop_layout->ForwardThread(loop_indices, rep)};
++  Array<PrimExpr> physical_indices = fragment->Forward(access_indices);
++  physical_coordinates.insert(physical_coordinates.end(),
++                              physical_indices.begin(), physical_indices.end());
++
++  Array<IterVar> logical_domain = loop_vars;
++  for (const auto &[var, iter_var] : inner_vars) {
++    bool is_used = false;
++    for (const PrimExpr &coordinate : physical_coordinates) {
++      if (tirx::UsesVar(coordinate, [&](const VarNode *node) {
++            return GetRef<Var>(node).same_as(var);
++          })) {
++        is_used = true;
++        break;
++      }
++    }
++    if (is_used) {
++      logical_domain.push_back(iter_var);
++    }
++  }
++  logical_domain.push_back(IterVar(Range(0, loop_layout->ReplicateExtent()),
++                                   rep, IterVarType::kDataPar));
++
++  // DetectInjective reports both proven collisions and unsupported symbolic
++  // maps as errors.  A symbolic Parallel extent therefore cannot justify
++  // rejecting the program; bounded concrete cases are checked by the exact
++  // owner check in ValidateCandidateAgainstFragments.
++  for (const IterVar &iter_var : logical_domain) {
++    if (!EvaluateConstantInteger(analyzer->Simplify(iter_var->dom->extent))) {
++      return std::nullopt;
++    }
++  }
++
++  Array<IterVar> normalized_domain;
++  Map<Var, PrimExpr> normalization;
++  for (size_t i = 0; i < logical_domain.size(); ++i) {
++    const IterVar &iter_var = logical_domain[i];
++    Var normalized_var("__tl_write_i" + std::to_string(i),
++                       iter_var->var.dtype());
++    normalized_domain.push_back(IterVar(Range(0, iter_var->dom->extent),
++                                        normalized_var, IterVarType::kDataPar));
++    normalization.Set(iter_var->var, normalized_var + iter_var->dom->min);
++  }
++  arith::IterMapResult injectivity =
++      Layout(normalized_domain, Substitute(physical_coordinates, normalization))
++          ->DetectInjective();
++  if (injectivity->errors.empty()) {
++    return std::nullopt;
++  }
++  std::ostringstream os;
++  os << "the fragment write is not one-to-one. Details: "
++     << injectivity->errors;
++  return os.str();
++}
++
+ } // anonymous namespace
+ 
+ /**
+@@ -340,9 +665,7 @@ LayoutMap ParallelOpNode::InferLayout(const LayoutInferArgs &layout_args,
+     // LayoutConflictException lets free mode discard the attempt. Strict and
+     // common levels have no discard channel, so they keep the early-out.
+     if (level == InferLevel::kFree && loop_layout_.defined()) {
+-      ValidateCandidateAgainstFragments(loop_layout_, layout_args,
+-                                        /*throw_on_error=*/true,
+-                                        /*check_forward_index=*/false);
++      ValidateInferredLayout(layout_args);
+     }
+     return {};
+   }
+@@ -594,9 +917,8 @@ LayoutMap ParallelOpNode::InferLayout(const LayoutInferArgs &layout_args,
+       /*check_forward_index=*/false, source_buffer);
+ 
+   // Step 3: Build replication guards
+-  BuildReplicationGuardsIfNeeded(
+-      layout_args, store_shared_global_buffers_, store_fragment_buffers_,
+-      has_cross_thread_access_, const_index_fragment_buffer);
++  BuildReplicationGuardsIfNeeded(layout_args, store_fragment_buffers_,
++                                 has_cross_thread_access_);
+ 
+   // Step 4: Collect buffer fragments
+   LayoutMap results;
+@@ -616,6 +938,19 @@ LayoutMap ParallelOpNode::InferLayout(const LayoutInferArgs &layout_args,
+     results.Set(update.buffer, ProposeReducerPartial(update, layout_args));
+   }
+ 
++  if (level == InferLevel::kFree) {
++    LayoutMap completed_layout_map = layout_args.layout_map;
++    for (const auto &[buffer, layout] : results) {
++      completed_layout_map.Set(buffer, layout);
++    }
++    ValidateInferredLayout(LayoutInferArgs{
++        layout_args.target, layout_args.thread_bounds, completed_layout_map,
++        layout_args.analyzer, layout_args.buffer_remap,
++        layout_args.bind_var_to_expr, layout_args.in_pipeline,
++        layout_args.strict_layout_map, layout_args.candidate_vector_size_limit,
++        layout_args.allocated_fragment_buffers});
++  }
++
+   loop_layout_inferred_ = true;
+   return results;
+ }
+@@ -782,6 +1117,49 @@ Fragment ParallelOpNode::ComputeReducerPinnedCandidate(
+   return Fragment();
+ }
+ 
++void ParallelOpNode::ValidateInferredLayout(
++    const LayoutInferArgs &layout_args) const {
++  if (!loop_layout_.defined()) {
++    throw LayoutConflictException(
++        "T.Parallel has no loop layout after free layout inference.");
++  }
++
++  if (indice_map_.empty()) {
++    return;
++  }
++
++  if (auto error = GetFragmentForwardMapError(
++          loop_layout_, layout_args.thread_bounds, layout_args.analyzer)) {
++    std::ostringstream os;
++    os << "T.Parallel inferred an invalid loop layout for fragment access: "
++       << *error << ". Layout: " << loop_layout_->DebugOutput();
++    throw LayoutConflictException(os.str());
++  }
++
++  ValidateCandidateAgainstFragments(
++      loop_layout_, layout_args, /*throw_on_error=*/true,
++      /*check_forward_index=*/false, /*source_buffer=*/Buffer());
++
++  for (const Buffer &buffer : access_order_) {
++    const BufferAccessInfo &access = GetAccessInfo(buffer);
++    if (!access.is_write || !layout_args.layout_map.count(buffer)) {
++      continue;
++    }
++    Optional<Fragment> fragment = layout_args.layout_map[buffer].as<Fragment>();
++    if (!fragment.defined()) {
++      continue;
++    }
++    if (auto error = GetFragmentWriteInjectivityError(
++            loop_layout_, fragment.value(), loop_vars_, inner_vars_,
++            access.indices, layout_args.analyzer)) {
++      std::ostringstream os;
++      os << "T.Parallel cannot write fragment buffer `" << buffer->name
++         << "`: " << *error;
++      throw LayoutConflictException(os.str());
++    }
++  }
++}
++
+ Optional<PrimExpr> ParallelOpNode::GetPredicate(PrimExpr thread_index) const {
+   if (predicate_.defined()) {
+     return Substitute(predicate_.value(),
+@@ -887,8 +1265,6 @@ bool ParallelOpNode::ValidateCandidateAgainstFragments(
+     const Fragment &candidate, const LayoutInferArgs &layout_args,
+     bool throw_on_error, bool check_forward_index,
+     const Buffer &source_buffer) const {
+-  auto vars =
+-      loop_vars_.Map([](const IterVar &iv) { return PrimExpr(iv->var); });
+   for (const auto &buffer : access_order_) {
+     const auto &access = GetAccessInfo(buffer);
+     if (!layout_args.layout_map.count(buffer))
+@@ -896,30 +1272,19 @@ bool ParallelOpNode::ValidateCandidateAgainstFragments(
+     auto fragment = layout_args.layout_map[buffer].as<Fragment>().value();
+     std::ostringstream oss;
+     bool success = true;
+-    if (access.is_read &&
+-        !ProveFragmentContains(candidate, fragment, vars, access.indices,
+-                               analyzer_, check_forward_index)) {
++    ParallelFragmentAccessResult result = EnumerateParallelFragmentAccess(
++        candidate, fragment, loop_vars_, inner_vars_, access.indices,
++        access.is_write, check_forward_index, &analyzer_);
++    // Enumeration returning unavailable means the relationship is not proven
++    // invalid (for example, a legal dynamic loop or a domain above the bounded
++    // fallback limit).  Keep the candidate and let normal lowering handle it.
++    if (result.status == ParallelFragmentAccessStatus::kInvalid) {
+       if (throw_on_error) {
+         oss << "Layout infer conflict between " << buffer << " and "
+             << source_buffer << " in T.Parallel loop:" << '\n'
+             << "    loop " << candidate->DebugOutput() << '\n'
+-            << "    fragment " << fragment->DebugOutput() << '\n';
+-      }
+-      success = false;
+-    }
+-    // Fragment writes need exact owner-thread compatibility. Coverage alone
+-    // allows extra loop threads to write local slots that belong to different
+-    // logical fragment elements under the buffer layout.
+-    if (access.is_write &&
+-        (!ProveFragmentContains(fragment, candidate, access.indices, vars,
+-                                analyzer_, check_forward_index) ||
+-         !ProveFragmentContains(candidate, fragment, vars, access.indices,
+-                                analyzer_, check_forward_index))) {
+-      if (throw_on_error) {
+-        oss << "Layout infer conflict between " << buffer << " and "
+-            << source_buffer << " in T.Parallel loop:" << '\n'
+-            << "    loop " << candidate->DebugOutput() << '\n'
+-            << "    fragment " << fragment->DebugOutput() << '\n';
++            << "    fragment " << fragment->DebugOutput() << '\n'
++            << "    reason " << result.detail << '\n';
+       }
+       success = false;
+     }
+@@ -967,9 +1332,42 @@ Fragment ParallelOpNode::ComputeLoopLayoutFromBuffer(
+       }
+     });
+ 
++    Map<Var, arith::IntSet> varying_domains;
++    for (const IterVar &loop_var : loop_vars_) {
++      varying_domains.Set(loop_var->var,
++                          arith::IntSet::FromRange(loop_var->dom));
++    }
++    varying_domains.Set(rep, arith::IntSet::FromRange(rep_iter->dom));
++    arith::IntSet accessed_threads =
++        arith::EvalSet(loop_var_to_thread, varying_domains);
++    if (accessed_threads.IsNothing() ||
++        arith::is_neg_inf(accessed_threads.min()) ||
++        arith::is_pos_inf(accessed_threads.max())) {
++      std::ostringstream os;
++      os << "Cannot determine the thread range used to access fragment buffer `"
++         << buffer->name << "` (thread map: " << loop_var_to_thread << ").";
++      throw LayoutConflictException(os.str());
++    }
++    PrimExpr accessed_thread_min =
++        layout_args.analyzer->Simplify(accessed_threads.min());
++    PrimExpr accessed_thread_max =
++        layout_args.analyzer->Simplify(accessed_threads.max());
++    PrimExpr accessed_thread_extent = layout_args.analyzer->Simplify(
++        accessed_thread_max - accessed_thread_min + 1);
++    PrimExpr source_thread_base = src_layout->ThreadRange().defined()
++                                      ? src_layout->ThreadRange()->min
++                                      : make_zero(accessed_thread_min.dtype());
++    Range accessed_thread_range =
++        Range::FromMinExtent(layout_args.analyzer->Simplify(
++                                 source_thread_base + accessed_thread_min),
++                             accessed_thread_extent);
++
+     try {
+-      result = Fragment(loop_vars_, {}, loop_var_to_thread, rep_iter)
+-                   ->BindThreadRange(layout_args.thread_bounds);
++      result = Fragment(loop_vars_, {},
++                        layout_args.analyzer->Simplify(loop_var_to_thread -
++                                                       accessed_thread_min),
++                        rep_iter)
++                   ->BindThreadRange(accessed_thread_range);
+     } catch (const Error &err) {
+       std::ostringstream msg;
+       msg << "Layout inference for buffer `" << buffer->name
+@@ -1056,43 +1454,17 @@ ParallelOpNode::ComputePlanCandidate(const LayoutInferArgs &layout_args) const {
+ 
+ void ParallelOpNode::BuildReplicationGuardsIfNeeded(
+     const LayoutInferArgs &layout_args,
+-    const std::vector<Buffer> &store_shared_global_buffers,
+     const std::vector<Buffer> &store_fragment_buffers,
+-    bool has_cross_thread_access,
+-    const std::vector<Buffer> &const_index_fragment_buffer) const {
++    bool has_cross_thread_access) const {
+   if (is_one(loop_layout_->ReplicateExtent()))
+     return;
+   if (!has_cross_thread_access)
+     return;
+ 
+   if (!store_fragment_buffers.empty()) {
+-    bool replicate_is_from_dynamic_index_fragment = false;
+-    for (const auto &fragment : store_fragment_buffers) {
+-      if (!layout_args.layout_map.count(fragment)) {
+-        continue;
+-      }
+-
+-      auto fragment_layout =
+-          layout_args.layout_map[fragment].as<Fragment>().value();
+-      if (is_one(fragment_layout->ReplicateExtent()))
+-        continue;
+-
+-      if (analyzer_.CanProveEqual(fragment_layout->ReplicateExtent(),
+-                                  loop_layout_->ReplicateExtent()))
+-        continue;
+-      if (std::find(const_index_fragment_buffer.begin(),
+-                    const_index_fragment_buffer.end(),
+-                    fragment) == const_index_fragment_buffer.end()) {
+-        replicate_is_from_dynamic_index_fragment = true;
+-      }
+-    }
+-
+-    if (!replicate_is_from_dynamic_index_fragment)
+-      return;
+-
+-    ICHECK(store_shared_global_buffers.empty())
+-        << "Invalid layout: cannot have both fragment and shared store buffers "
+-           "in replicated loop layout.";
++    // Fragment writes require every replica to execute. Any coexisting
++    // shared/global stores therefore execute once per replica as well;
++    // duplicate same-value stores are permitted by CUDA instruction semantics.
+     return;
+   } else {
+     auto inv = loop_layout_->Inverse();
+@@ -1217,14 +1589,13 @@ FragmentThreadIndexProbe::FragmentThreadIndexProbe(
+   }
+   partition_vars.push_back(thread_var_);
+   if (loop_layout->ThreadRange().defined()) {
+-    analyzer->Bind(thread_var_,
+-                   Range::FromMinExtent(loop_layout->ThreadRange()->min,
+-                                        loop_layout->ThreadRange()->extent));
++    thread_domain_ = Range::FromMinExtent(loop_layout->ThreadRange()->min,
++                                          loop_layout->ThreadRange()->extent);
+   } else {
+-    analyzer->Bind(thread_var_,
+-                   Range::FromMinExtent(make_zero(DataType::Int(32)),
+-                                        loop_layout->ThreadExtent()));
++    thread_domain_ = Range::FromMinExtent(make_zero(DataType::Int(32)),
++                                          loop_layout->ThreadExtent());
+   }
++  analyzer->Bind(thread_var_, thread_domain_);
+ 
+   Array<PrimExpr> recovered_indices;
+   try {
+@@ -1262,10 +1633,18 @@ bool FragmentThreadIndexProbe::AccessUsesThread(
+   for (const auto &index : physical_indices) {
+     PrimExpr simplified = analyzer_->Simplify(index);
+     if (tirx::UsesVar(simplified, [&](const VarNode *var_node) {
+-          return GetRef<Var>(var_node).same_as(thread_var_);
++          return GetRef<Var>(var_node).same_as(ReplicationPlaceholder());
+         })) {
+       return true;
+     }
++    Map<Var, arith::IntSet> varying_domain;
++    varying_domain.Set(thread_var_, arith::IntSet::FromRange(thread_domain_));
++    arith::IntSet values = arith::EvalSet(simplified, varying_domain);
++    if (values.IsNothing() || arith::is_neg_inf(values.min()) ||
++        arith::is_pos_inf(values.max()) ||
++        !analyzer_->CanProveEqual(values.min(), values.max())) {
++      return true;
++    }
+   }
+   return false;
+ }
+diff --git a/src/op/parallel.h b/src/op/parallel.h
+index 1b77d821d3..f43d696efc 100644
+--- a/src/op/parallel.h
++++ b/src/op/parallel.h
+@@ -62,6 +62,7 @@ class FragmentThreadIndexProbe {
+ private:
+   bool valid_{false};
+   tirx::Var thread_var_;
++  Range thread_domain_;
+   Map<tirx::Var, PrimExpr> loop_var_map_;
+   Map<tirx::Var, PrimExpr> thread_offset_map_;
+   bool has_thread_offset_{false};
+@@ -181,6 +182,10 @@ class ParallelOpNode : public TileOperatorNode {
+   // constant 0.
+   Optional<PrimExpr> GetPredicate(PrimExpr thread_index) const;
+ 
++  // Validate the inferred loop mapping against every currently known fragment
++  // layout. The free-inference driver calls this again after full propagation.
++  void ValidateInferredLayout(const LayoutInferArgs &layout_args) const;
++
+   // Clone this operator.
+   TileOperator Clone() const override;
+ 
+@@ -241,10 +246,8 @@ class ParallelOpNode : public TileOperatorNode {
+   // Add replication guard predicates when needed for cross-thread stores.
+   void BuildReplicationGuardsIfNeeded(
+       const LayoutInferArgs &layout_args,
+-      const std::vector<Buffer> &store_shared_global_buffers,
+       const std::vector<Buffer> &store_fragment_buffers,
+-      bool has_cross_thread_access,
+-      const std::vector<Buffer> &const_index_fragment_buffer) const;
++      bool has_cross_thread_access) const;
+   // Add a predicate to the current predicate expression.
+   void AddPredicate(const PrimExpr &expr) const {
+     predicate_ = predicate_.defined() ? And(expr, predicate_.value()) : expr;
+diff --git a/src/transform/layout_inference/layout_inference.cc b/src/transform/layout_inference/layout_inference.cc
+index 07466c6579..3b8e394e1a 100644
+--- a/src/transform/layout_inference/layout_inference.cc
++++ b/src/transform/layout_inference/layout_inference.cc
+@@ -21,6 +21,7 @@
+ #include <memory>
+ #include <optional>
+ #include <queue>
++#include <sstream>
+ #include <unordered_set>
+ 
+ #include "../../config.h"
+@@ -28,6 +29,7 @@
+ #include "../../layout/utils.h"
+ #include "../../op/builtin.h"
+ #include "../../op/copy.h"
++#include "../../op/fill.h"
+ #include "../../op/parallel.h"
+ #include "../../op/reducer.h"
+ #include "../../op/utils.h"
+@@ -284,7 +286,8 @@ class BufferUseDefCollector : public IRVisitorWithAnalyzer {
+                                                   bind_var_to_expr_,
+                                                   false,
+                                                   strict_layout_map,
+-                                                  candidate_vector_size_limit},
++                                                  candidate_vector_size_limit,
++                                                  allocated_fragment_buffers_},
+                                   level);
+     } catch (const std::bad_optional_access &e) {
+       LOG(FATAL) << "bad_optional_access while inferring layout for op "
+@@ -963,12 +966,17 @@ class BufferUseDefCollector : public IRVisitorWithAnalyzer {
+       thread_bounds_vec_.push_back(CurrentThreadBounds());
+       analyzer_vec_.push_back(analyzer_.Clone());
+     } else {
+-      IRVisitorWithAnalyzer::VisitStmt(op->body);
++      // Preserve serial-loop bounds in analyzer snapshots captured by nested
++      // TileOps. Visiting only the body bypasses the analyzer's For scope.
++      IRVisitorWithAnalyzer::VisitStmt_(op);
+     }
+   }
+ 
+   void VisitStmt_(const SBlockNode *op) final {
+     for (auto buffer : op->alloc_buffers) {
++      if (IsFragmentBuffer(buffer)) {
++        allocated_fragment_buffers_.Set(buffer, Bool(true));
++      }
+       if (buffer_data_to_buffers_.count(buffer->data)) {
+         auto buffers = buffer_data_to_buffers_[buffer->data];
+         buffers.push_back(buffer);
+@@ -1270,6 +1278,9 @@ class BufferUseDefCollector : public IRVisitorWithAnalyzer {
+   }
+ 
+   Map<Var, Array<Buffer>> buffer_data_to_buffers_;
++  // Buffer identities originating at T.alloc_fragment sites. Views and
++  // aliases sharing the same data Var are deliberately excluded.
++  Map<Buffer, Bool> allocated_fragment_buffers_;
+   // Map from Bind variable to its bound expression
+   Map<Var, PrimExpr> bind_var_to_expr_;
+   std::vector<ObjectRef> infer_list_stmt_;
+@@ -1337,11 +1348,15 @@ class BufferUseDefCollector : public IRVisitorWithAnalyzer {
+     LayoutMap layout_map;
+     AttemptCost cost;
+   };
+-  std::optional<AttemptOutcome> RunOneAttempt(
+-      int attempt_root, const std::vector<int> &members,
+-      const LayoutMap &base_layout_map, const LayoutMap &strict_layout_map,
+-      const std::vector<std::pair<Buffer, Fragment>> &seed_layouts,
+-      const LayoutCostModel &cost_model, int candidate_vector_size_limit = 0) {
++  std::optional<AttemptOutcome>
++  RunOneAttempt(int attempt_root, const std::vector<int> &members,
++                const std::vector<Buffer> &buffers,
++                const LayoutMap &base_layout_map,
++                const LayoutMap &strict_layout_map,
++                const std::vector<std::pair<Buffer, Fragment>> &seed_layouts,
++                const LayoutCostModel &cost_model,
++                std::optional<std::string> *last_failure,
++                int candidate_vector_size_limit = 0) {
+     auto back_infer_list = BackupInferList();
+     LayoutMap tmp_layout_map = base_layout_map;
+     // A failed attempt can leave pending propagation work. Keep both the
+@@ -1370,6 +1385,7 @@ class BufferUseDefCollector : public IRVisitorWithAnalyzer {
+                            q, in_queue);
+         }
+       }
++      ValidateFreeInferenceAttempt(members, buffers, tmp_layout_map);
+     } catch (const LayoutConflictException &e) {
+       ok = false;
+       failure = e.what();
+@@ -1379,6 +1395,9 @@ class BufferUseDefCollector : public IRVisitorWithAnalyzer {
+     } catch (const LoopLayoutInjectiveException &e) {
+       ok = false;
+       failure = e.what();
++    } catch (const Error &e) {
++      ok = false;
++      failure = e.what();
+     }
+     std::optional<AttemptOutcome> outcome;
+     if (ok) {
+@@ -1386,6 +1405,9 @@ class BufferUseDefCollector : public IRVisitorWithAnalyzer {
+       outcome =
+           AttemptOutcome{BackupInferList(), std::move(tmp_layout_map), cost};
+     } else {
++      if (last_failure != nullptr) {
++        *last_failure = failure;
++      }
+       DLOG(INFO) << "[InferInFreeMode] attempt root " << attempt_root
+                  << " discarded: " << failure;
+     }
+@@ -1393,6 +1415,76 @@ class BufferUseDefCollector : public IRVisitorWithAnalyzer {
+     return outcome;
+   }
+ 
++  void ValidateFreeInferenceAttempt(const std::vector<int> &members,
++                                    const std::vector<Buffer> &buffers,
++                                    const LayoutMap &layout_map) const {
++    auto fragment_analyzer = analyzer_.Clone();
++    // Free fragment layouts are storage assignments, not merely ownership
++    // hints.  Their complete `(logical coordinates, replica)` domain must map
++    // bijectively onto a rectangular `(thread, local indices)` allocation.
++    for (const Buffer &buffer : buffers) {
++      // Reducer buffers carry PartialFragment values whose replicas are
++      // addends, not duplicate storage. Their injectivity is checked by the
++      // reducer-specific commit path.
++      if (!IsFragmentBuffer(buffer) || IsReducerV2Buffer(buffer) ||
++          !allocated_fragment_buffers_.count(buffer)) {
++        continue;
++      }
++      if (!layout_map.count(buffer)) {
++        std::ostringstream os;
++        os << "Free layout inference did not produce a layout for fragment "
++              "buffer `"
++           << buffer->name << "`.";
++        throw LayoutConflictException(os.str());
++      }
++      Optional<Fragment> fragment = layout_map[buffer].as<Fragment>();
++      if (!fragment.defined()) {
++        std::ostringstream os;
++        os << "Free layout inference produced a non-fragment layout for "
++              "fragment buffer `"
++           << buffer->name << "`.";
++        throw LayoutConflictException(os.str());
++      }
++      if (auto error = GetFragmentBijectionError(fragment.value(),
++                                                 fragment_analyzer.get())) {
++        std::ostringstream os;
++        os << "Free layout inference produced an invalid layout for fragment "
++              "buffer `"
++           << buffer->name << "`: " << *error
++           << ". Layout: " << fragment.value()->DebugOutput();
++        throw LayoutConflictException(os.str());
++      }
++    }
++
++    // Recheck every explicit or generated Parallel after the entire component
++    // has propagated. An earlier per-op check may not have seen fragment
++    // layouts inferred by a later member of the same attempt.
++    for (int member : members) {
++      LayoutInferArgs layout_args{target_,    thread_bounds_vec_[member],
++                                  layout_map, analyzer_vec_[member].get(),
++                                  {},         bind_var_to_expr_,
++                                  false,      {},
++                                  0,          allocated_fragment_buffers_};
++      const auto *parallel = infer_list_[member].as<ParallelOpNode>();
++      if (parallel != nullptr) {
++        parallel->ValidateInferredLayout(layout_args);
++        continue;
++      }
++
++      const auto *copy = infer_list_[member].as<CopyNode>();
++      if (copy != nullptr && copy->par_op_.defined()) {
++        copy->par_op_->ValidateInferredLayout(layout_args);
++        continue;
++      }
++
++      const auto *fill = infer_list_[member].as<FillNode>();
++      if (fill != nullptr && IsFragmentBuffer(fill->dst)) {
++        ParallelOp fill_parallel(fill->MakeSIMTLoop(layout_args.analyzer));
++        fill_parallel->InferLayout(layout_args, InferLevel::kFree);
++      }
++    }
++  }
++
+   void InferInFreeMode(LayoutMap &layout_map,
+                        const LayoutMap &strict_layout_map) {
+ 
+@@ -1452,9 +1544,6 @@ class BufferUseDefCollector : public IRVisitorWithAnalyzer {
+       int root = uf.Find(infer_indices[0]);
+       components_buffers[root].push_back(buffer);
+     }
+-    // Keep components_buffers for debug purpose
+-    (void)components_buffers;
+-
+     // For each component, try each op as root, and determine the least
+     // replicated one
+     std::unique_ptr<LayoutCostModel> cost_model =
+@@ -1468,6 +1557,7 @@ class BufferUseDefCollector : public IRVisitorWithAnalyzer {
+       AttemptCost best_cost;
+       bool has_best = false;
+       int best_infer_root = -1;
++      std::optional<std::string> last_failure;
+ 
+       auto adopt = [&](AttemptOutcome &&outcome, int attempt_root) {
+         best_infer_list = std::move(outcome.infer_list);
+@@ -1496,8 +1586,9 @@ class BufferUseDefCollector : public IRVisitorWithAnalyzer {
+                      << " candidate_vector_size_limit="
+                      << candidate_vector_size_limit << '\n';
+           auto outcome = RunOneAttempt(
+-              attempt_infer_root, members, layout_map, strict_layout_map,
+-              /*seed_layouts=*/{}, *cost_model, candidate_vector_size_limit);
++              attempt_infer_root, members, components_buffers[root], layout_map,
++              strict_layout_map, /*seed_layouts=*/{}, *cost_model,
++              &last_failure, candidate_vector_size_limit);
+           if (!outcome) {
+             continue;
+           }
+@@ -1529,14 +1620,20 @@ class BufferUseDefCollector : public IRVisitorWithAnalyzer {
+         if (!seeds.empty()) {
+           DLOG(INFO) << "[InferInFreeMode] all attempts failed; retrying with "
+                      << "wide fallback dst layouts";
+-          auto outcome = RunOneAttempt(members.front(), members, layout_map,
+-                                       strict_layout_map, seeds, *cost_model);
++          auto outcome = RunOneAttempt(
++              members.front(), members, components_buffers[root], layout_map,
++              strict_layout_map, seeds, *cost_model, &last_failure);
+           if (outcome) {
+             adopt(std::move(*outcome), members.front());
+           }
+         }
+       }
+-      ICHECK(has_best) << "no available layout found" << '\n';
++      if (!has_best) {
++        TVM_FFI_THROW(ValueError)
++            << "No valid layout was found for a connected layout-inference "
++               "component. Last failure: "
++            << last_failure.value_or("unknown layout inference failure");
++      }
+       // Apply the best plan for this component
+       infer_list_ = std::move(best_infer_list);
+       layout_map = best_layout_map;
+diff --git a/testing/python/issue/test_tilelang_issue_2942.py b/testing/python/issue/test_tilelang_issue_2942.py
+new file mode 100644
+index 0000000000..356c6095d2
+--- /dev/null
++++ b/testing/python/issue/test_tilelang_issue_2942.py
+@@ -0,0 +1,335 @@
++import pytest
++import torch
++
++import tilelang
++import tilelang.language as T
++import tilelang.testing
++
++
++M, N = 32, 64
++# Keep the inferred fragment geometry identical on pre-SM100 and SM100+
++# targets. These tests exercise float32x4 ownership boundaries.
++PASS_CONFIGS = {"tl.disable_vectorize_256": True}
++
++
++def build(off, h):
++    @tilelang.jit(out_idx=[-1], pass_configs=PASS_CONFIGS)
++    def prog():
++        @T.prim_func
++        def main(
++            A: T.Tensor((M, N), "float32"),
++            C: T.Tensor((M, N), "float32"),
++        ):
++            with T.Kernel(1, threads=128) as _:
++                f = T.alloc_fragment((M, N), "float32")
++                T.copy(A, f)
++                T.fill(f[off : off + h, :], 7.0)
++                T.copy(f, C)
++
++        return main
++
++    return prog
++
++
++@pytest.mark.parametrize("off, h", [(0, 8), (8, 8), (3, 4)])
++@tilelang.testing.requires_cuda
++def test_fragment_fill_rectangular_slice_uses_valid_fallback_layout(off, h):
++    kernel = build(off, h)()
++    a = torch.arange(M * N, dtype=torch.float32, device="cuda").reshape(M, N)
++    expected = a.clone()
++    expected[off : off + h] = 7.0
++    c = kernel(a)
++    torch.testing.assert_close(c, expected, rtol=0, atol=0)
++
++
++@tilelang.testing.requires_cuda
++def test_fragment_fill_non_rectangular_slice_is_rejected():
++    with pytest.raises(ValueError, match="No valid layout"):
++        build(6, 4)()
++
++
++@tilelang.testing.requires_cuda
++def test_fragment_copy_read_slice_uses_valid_fallback_layout():
++    @tilelang.jit(out_idx=[-2, -1], pass_configs=PASS_CONFIGS)
++    def prog():
++        @T.prim_func
++        def main(
++            A: T.Tensor((M, N), "float32"),
++            C: T.Tensor((M, N), "float32"),
++            D: T.Tensor((4, N), "float32"),
++        ):
++            with T.Kernel(1, threads=128):
++                f = T.alloc_fragment((M, N), "float32")
++                s = T.alloc_shared((4, N), "float32")
++
++                T.copy(A, f)
++                T.copy(f[3:7, :], s)
++                T.copy(s, D)
++                T.copy(f, C)
++
++        return main
++
++    kernel = prog()
++    a = torch.arange(M * N, dtype=torch.float32, device="cuda").reshape(M, N)
++    c, d = kernel(a)
++    torch.testing.assert_close(c, a, rtol=0, atol=0)
++    torch.testing.assert_close(d, a[3:7], rtol=0, atol=0)
++
++
++@tilelang.testing.requires_cuda
++def test_fragment_copy_non_rectangular_write_slice_is_rejected():
++    @tilelang.jit(pass_configs=PASS_CONFIGS)
++    def prog():
++        @T.prim_func
++        def main(
++            A: T.Tensor((M, N), "float32"),
++            patch: T.Tensor((4, N), "float32"),
++            C: T.Tensor((M, N), "float32"),
++        ):
++            with T.Kernel(1, threads=128):
++                f = T.alloc_fragment((M, N), "float32")
++                T.copy(A, f)
++                T.copy(patch, f[6:10, :])
++                T.copy(f, C)
++
++        return main
++
++    with pytest.raises(ValueError, match="No valid layout"):
++        prog()
++
++
++def build_parallel_fragment_slice(off, h):
++    @tilelang.jit(pass_configs=PASS_CONFIGS)
++    def prog():
++        @T.prim_func
++        def main(
++            A: T.Tensor((M, N), "float32"),
++            patch: T.Tensor((h, N), "float32"),
++            C: T.Tensor((M, N), "float32"),
++        ):
++            with T.Kernel(1, threads=128):
++                f = T.alloc_fragment((M, N), "float32")
++                T.copy(A, f)
++                for i, j in T.Parallel(h, N):
++                    f[i + off, j] = patch[i, j]
++                T.copy(f, C)
++
++        return main
++
++    return prog
++
++
++def build_unanchored_parallel_fragment_slice(off, h):
++    @tilelang.jit(out_idx=[-1], pass_configs=PASS_CONFIGS)
++    def prog():
++        @T.prim_func
++        def main(
++            patch: T.Tensor((h, N), "float32"),
++            C: T.Tensor((M, N), "float32"),
++        ):
++            with T.Kernel(1, threads=128):
++                f = T.alloc_fragment((M, N), "float32")
++                for i, j in T.Parallel(h, N):
++                    f[i + off, j] = patch[i, j]
++                T.copy(f, C)
++
++        return main
++
++    return prog
++
++
++@pytest.mark.parametrize("off, h", [(3, 4), (16, 8)])
++@tilelang.testing.requires_cuda
++def test_explicit_parallel_fragment_slice_uses_valid_fallback_layout(off, h):
++    kernel = build_parallel_fragment_slice(off, h)()
++    a = torch.arange(M * N, dtype=torch.float32, device="cuda").reshape(M, N)
++    patch = -torch.arange(1, h * N + 1, dtype=torch.float32, device="cuda").reshape(h, N)
++    expected = a.clone()
++    expected[off : off + h] = patch
++    c = torch.full_like(a, 777777.0)
++    kernel(a, patch, c)
++    torch.testing.assert_close(c, expected, rtol=0, atol=0)
++
++
++@tilelang.testing.requires_cuda
++def test_explicit_parallel_fragment_non_rectangular_slice_is_rejected():
++    with pytest.raises(ValueError, match="No valid layout"):
++        build_parallel_fragment_slice(6, 4)()
++
++
++@tilelang.testing.requires_cuda
++def test_unanchored_parallel_fragment_rectangular_slice_is_allowed():
++    off, h = 3, 4
++    kernel = build_unanchored_parallel_fragment_slice(off, h)()
++    patch = torch.arange(h * N, dtype=torch.float32, device="cuda").reshape(h, N)
++    c = kernel(patch)
++    torch.testing.assert_close(c[off : off + h], patch, rtol=0, atol=0)
++
++
++@tilelang.testing.requires_cuda
++def test_unanchored_parallel_fragment_non_rectangular_slice_is_rejected():
++    with pytest.raises(ValueError, match="No valid layout"):
++        build_unanchored_parallel_fragment_slice(6, 4)()
++
++
++@tilelang.testing.requires_cuda
++def test_explicit_parallel_fragment_collision_is_rejected():
++    @tilelang.jit
++    def prog():
++        @T.prim_func
++        def main(
++            A: T.Tensor((16, N), "float32"),
++            C: T.Tensor((8, N), "float32"),
++        ):
++            with T.Kernel(1, threads=128):
++                f = T.alloc_fragment((8, N), "float32")
++                for i, j in T.Parallel(16, N):
++                    f[i % 8, j] = A[i, j]
++                T.copy(f, C)
++
++        return main
++
++    with pytest.raises(ValueError, match="not one-to-one"):
++        prog()
++
++
++@tilelang.testing.requires_cuda
++def test_fragment_slice_with_manual_layout_anchor_is_allowed():
++    fragment_layout = T.Fragment(
++        (M, N),
++        forward_fn=lambda i, j: (i * 4 + j // 16, j % 16),
++    )
++
++    @tilelang.jit(out_idx=[-1])
++    def prog():
++        @T.prim_func
++        def main(
++            A: T.Tensor((M, N), "float32"),
++            C: T.Tensor((M, N), "float32"),
++        ):
++            with T.Kernel(1, threads=128):
++                f = T.alloc_fragment((M, N), "float32")
++                T.annotate_layout({f: fragment_layout})
++
++                T.copy(A, f)
++                T.fill(f[3:11, :], 7.0)
++                T.copy(f, C)
++
++        return main
++
++    prog()
++
++
++@tilelang.testing.requires_cuda
++def test_fragment_slice_with_gemm_layout_anchor_is_allowed():
++    size = 16
++
++    @tilelang.jit(out_idx=[-1])
++    def prog():
++        @T.prim_func
++        def main(
++            A: T.Tensor((size, size), "float16"),
++            B: T.Tensor((size, size), "float16"),
++            C: T.Tensor((8, size), "float32"),
++        ):
++            with T.Kernel(1, threads=32):
++                a_shared = T.alloc_shared((size, size), "float16")
++                b_shared = T.alloc_shared((size, size), "float16")
++                partial_shared = T.alloc_shared((8, size), "float32")
++                f = T.alloc_fragment((size, size), "float32")
++
++                T.copy(A, a_shared)
++                T.copy(B, b_shared)
++                T.clear(f)
++                T.gemm(a_shared, b_shared, f, transpose_B=True)
++                # Keep the partial slice aligned with the GEMM accumulator's
++                # 8-row ownership period. A shifted slice such as 3:11 also
++                # exercises cyclic-layout inversion, which is independent of
++                # whether GEMM established a strict layout for the fragment.
++                T.copy(f[8:16, :], partial_shared)
++                T.copy(partial_shared, C)
++
++        return main
++
++    kernel = prog()
++    torch.manual_seed(0)
++    a = torch.randn((size, size), dtype=torch.float16, device="cuda")
++    b = torch.randn((size, size), dtype=torch.float16, device="cuda")
++    c = kernel(a, b)
++    expected = (a.float() @ b.float().T)[8:16]
++    torch.testing.assert_close(c, expected, rtol=1e-2, atol=1e-2)
++
++
++@tilelang.testing.requires_cuda
++def test_parallel_with_complete_inner_serial_access_is_allowed():
++    @tilelang.jit(out_idx=[-1])
++    def prog():
++        @T.prim_func
++        def main(
++            A: T.Tensor((M, N), "float32"),
++            C: T.Tensor((M, N), "float32"),
++        ):
++            with T.Kernel(1, threads=128):
++                f = T.alloc_fragment((M, N), "float32")
++                for i in T.Parallel(M):
++                    for j in T.serial(N):
++                        f[i, j] = A[i, j]
++                T.copy(f, C)
++
++        return main
++
++    prog()
++
++
++@tilelang.testing.requires_cuda
++def test_parallel_with_complete_outer_serial_access_is_allowed():
++    rows, cols = 4, 256
++
++    @tilelang.jit(out_idx=[-1])
++    def prog():
++        @T.prim_func
++        def main(
++            A: T.Tensor((rows, cols), "float32"),
++            C: T.Tensor((cols,), "float32"),
++        ):
++            with T.Kernel(1, threads=64):
++                f = T.alloc_fragment((rows, cols), "float32")
++                out = T.alloc_fragment((cols,), "float32")
++                T.copy(A, f)
++                T.clear(out)
++                for i in T.serial(rows):
++                    for j in T.Parallel(cols):
++                        out[j] += f[i, j]
++                T.copy(out, C)
++
++        return main
++
++    prog()
++
++
++@tilelang.testing.requires_cuda
++def test_replicated_parallel_allows_same_value_global_writes():
++    replicated_layout = T.Fragment(
++        (1,),
++        forward_fn=lambda i, rep: (rep, 0),
++        replicate=128,
++    )
++
++    @tilelang.jit(out_idx=[-1])
++    def prog():
++        @T.prim_func
++        def main(C: T.Tensor((1,), "float32")):
++            with T.Kernel(1, threads=128):
++                f = T.alloc_fragment((1,), "float32")
++                T.annotate_layout({f: replicated_layout})
++                for i in T.Parallel(1):
++                    f[i] = T.float32(1)
++                    C[i] = T.float32(1)
++
++        return main
++
++    prog()
++
++
++if __name__ == "__main__":
++    tilelang.testing.main()
+diff --git a/testing/python/language/test_tilelang_language_reduce.py b/testing/python/language/test_tilelang_language_reduce.py
+index 3ef7ddef9b..be4e9fadd8 100644
+--- a/testing/python/language/test_tilelang_language_reduce.py
++++ b/testing/python/language/test_tilelang_language_reduce.py
+@@ -231,8 +231,10 @@ def partial_warp_reduce(
+                 for i, j in T.Parallel(1, 384):
+                     x_frag[i, j] = x[i, j]
+                 T.reduce_sum(x_frag, sum_frag, dim=1)
+-                for i in T.Parallel(1):
+-                    out[i] = sum_frag[i]
++                # Keep the output within the fragment's [0, 48) owner range
++                # so lowering reaches the intended reduction-width check.
++                if T.get_thread_binding() == 0:
++                    out[0] = sum_frag[0]
+ 
+         return partial_warp_reduce
+ 
+@@ -277,8 +279,9 @@ def warp_misaligned_base_reduce(
+                 for i, j in T.Parallel(1, 512):
+                     x_frag[i, j] = x[i, j]
+                 T.reduce_sum(x_frag, sum_frag, dim=1)
+-                for i in T.Parallel(1):
+-                    out[i] = sum_frag[i]
++                # Thread 16 owns the result in [16, 80); thread 0 does not.
++                if T.get_thread_binding() == 16:
++                    out[0] = sum_frag[0]
+ 
+         return warp_misaligned_base_reduce
+ 
+@@ -443,16 +446,17 @@ def test_reduce_partial_thread_barrier_rejects_discontiguous_warps():
+     ("abssum", T.int64, 128, 128, "fragment", "fragment", 32, 1),
+     ("absmax", T.float32, 128, 128, "fragment", "fragment", 32, 1),
+     ("absmax", T.int64, 128, 128, "fragment", "fragment", 32, 1),
+-    # batch > 1: verify run_batch codegen and correctness together
++    # batch > 1: verify run_batch codegen and correctness together. Keep enough
++    # rows per thread for the requested batch even with 256-bit vectorization.
+     ("sum", T.float32, 128, 64, "shared", "fragment", 256, 2),
+     ("sum", T.float32, 128, 64, "shared", "fragment", 256, 4),
+-    ("sum", T.float16, 64, 128, "fragment", "fragment", 256, 4),
++    ("sum", T.float16, 128, 128, "fragment", "fragment", 256, 4),
+     ("sum", T.bfloat16, 128, 128, "fragment", "fragment", 32, 1),
+-    ("sum", T.bfloat16, 64, 128, "fragment", "fragment", 256, 4),
++    ("sum", T.bfloat16, 128, 128, "fragment", "fragment", 256, 4),
+     ("max", T.bfloat16, 128, 64, "shared", "fragment", 256, 2),
+     ("max", T.float32, 128, 128, "fragment", "fragment", 256, 4),
+     ("min", T.float32, 64, 128, "shared", "fragment", 128, 2),
+-    ("min", T.float16, 128, 128, "fragment", "fragment", 256, 8),
++    ("min", T.float16, 256, 128, "fragment", "fragment", 256, 8),
+     ("abssum", T.float32, 128, 128, "fragment", "fragment", 256, 4),
+     ("absmax", T.float32, 128, 128, "fragment", "fragment", 256, 4),
+ ]
+diff --git a/testing/python/target/test_tilelang_codegen_cutedsl_reduce.py b/testing/python/target/test_tilelang_codegen_cutedsl_reduce.py
+index fc9e329e4a..9f4a639012 100644
+--- a/testing/python/target/test_tilelang_codegen_cutedsl_reduce.py
++++ b/testing/python/target/test_tilelang_codegen_cutedsl_reduce.py
+@@ -8,9 +8,6 @@
+ 
+ 
+ def _lower_cutedsl_partial_reduce():
+-    if not tvm.runtime.enabled("cuda"):
+-        pytest.skip("TileLang CuTeDSL codegen requires TVM built with CUDA support.")
+-
+     build_cutedsl = tvm.ffi.get_global_func("target.build.tilelang_cutedsl_without_compile", allow_missing=True)
+     if build_cutedsl is None:
+         pytest.skip("TileLang CuTeDSL backend is not enabled in this build.")
+@@ -32,13 +29,15 @@ def prog(A: T.Tensor((1, 512), "float32"), B: T.Tensor((1,), "float32")):
+             for i, j in T.Parallel(1, 512):
+                 x_frag[i, j] = A[i, j]
+             T.reduce_sum(x_frag, sum_frag, dim=1)
+-            for i in T.Parallel(1):
+-                B[i] = sum_frag[i]
++            # Only threads [0, 64) own sum_frag; use one owner for the store.
++            if T.get_thread_binding() == 0:
++                B[0] = sum_frag[0]
+ 
+     with target:
+         return lower(prog.with_attr("global_symbol", "main"), target=target)
+ 
+ 
++@tilelang.testing.requires_cuda
+ def test_cutedsl_codegen_partial_reduce_named_barrier():
+     """The partial scalar AllReduce uses its exact participant count."""
+     artifact = _lower_cutedsl_partial_reduce()
+diff --git a/testing/python/transform/test_tilelang_transform_lower_tile_op.py b/testing/python/transform/test_tilelang_transform_lower_tile_op.py
+index 6a0d6ed443..aff1fade14 100644
+--- a/testing/python/transform/test_tilelang_transform_lower_tile_op.py
++++ b/testing/python/transform/test_tilelang_transform_lower_tile_op.py
+@@ -236,8 +236,8 @@ def before(
+ 
+ 
+ @tilelang.testing.requires_cuda
+-def test_lower_tile_op_rejects_shifted_modulo_fragment_index():
+-    """Reject #2948 instead of silently dropping a fragment index rotation."""
++def test_layout_inference_rejects_shifted_modulo_fragment_index():
++    """Reject #2948 during inference before lowering can drop the rotation."""
+     size = 128
+     target = tvm.target.Target({"kind": "cuda", "arch": "sm_80"})
+ 
+@@ -255,10 +255,8 @@ def before(
+     mod = tvm.IRModule.from_expr(before)
+     mod = tvm.tirx.transform.BindTarget(target)(mod)
+     mod = tl.transform.MaterializeKernelLaunch()(mod)
+-    with target:
+-        mod = tl.transform.LayoutInference()(mod)
+-        with pytest.raises(Exception, match="non-round-tripping inverse"):
+-            tl.transform.LowerTileOp()(mod)
++    with target, pytest.raises(ValueError, match="non-round-tripping inverse"):
++        tl.transform.LayoutInference()(mod)
+ 
+ 
+ def test_lower_tile_op_preserves_ragged_parallel_padding_guard():

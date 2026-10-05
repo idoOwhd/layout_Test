@@ -1,0 +1,3355 @@
+diff --git a/examples/warp_specialize/example_warp_specialize_flashmla.py b/examples/warp_specialize/example_warp_specialize_flashmla.py
+index 3316a5ca0c..57bf6a4c8b 100644
+--- a/examples/warp_specialize/example_warp_specialize_flashmla.py
++++ b/examples/warp_specialize/example_warp_specialize_flashmla.py
+@@ -16,6 +16,10 @@ def flashattn(batch, heads, kv_head_num, seqlen_kv, dim, pe_dim, block_N, block_
+     VALID_BLOCK_H = min(block_H, kv_group_num)
+     assert kv_head_num == 1, "kv_head_num must be 1"
+     h_dim = dim // 2
++    # QK^T is split into K=64 tiles to be pipelined with TMA copy
++    k_tile = pe_dim
++    assert h_dim % k_tile == 0, "h_dim must be divisible by k_tile"
++    num_k_tiles = h_dim // k_tile
+ 
+     @T.prim_func
+     def main_no_split(
+@@ -68,6 +72,7 @@ def main_no_split(
+             acc_s_0_cast = T.alloc_fragment([block_H, block_N], dtype)
+             acc_s_1 = T.alloc_fragment([block_H, block_N], accum_dtype)
+             acc_s_1_cast = T.alloc_fragment([block_H, block_N], dtype)
++            sp0_cast = T.alloc_fragment([block_H, block_N], dtype)
+             acc_o_l = T.alloc_fragment([block_H, h_dim], accum_dtype)
+             acc_o_r = T.alloc_fragment([block_H, h_dim], accum_dtype)
+             scores_max_0 = T.alloc_fragment([block_H], accum_dtype)
+@@ -87,12 +92,12 @@ def main_no_split(
+             q_shared_ready_barrier = T.alloc_barrier(arrive_count=256)
+ 
+             # barriers_K0
+-            kv_shared_0_l_is_ready = T.alloc_barrier(arrive_count=128)
+-            kv_shared_0_r_is_ready = T.alloc_barrier(arrive_count=128)
++            kv_shared_0_l_is_ready = T.alloc_barrier(arrive_count=[128] * num_k_tiles)
++            kv_shared_0_r_is_ready = T.alloc_barrier(arrive_count=[128] * num_k_tiles)
+             kv_shared_0_pe_is_ready = T.alloc_barrier(arrive_count=128)
+             # barriers_K1
+-            kv_shared_1_l_is_ready = T.alloc_barrier(arrive_count=128)
+-            kv_shared_1_r_is_ready = T.alloc_barrier(arrive_count=128)
++            kv_shared_1_l_is_ready = T.alloc_barrier(arrive_count=[128] * num_k_tiles)
++            kv_shared_1_r_is_ready = T.alloc_barrier(arrive_count=[128] * num_k_tiles)
+             kv_shared_1_pe_is_ready = T.alloc_barrier(arrive_count=128)
+ 
+             # redundant barriers
+@@ -120,26 +125,58 @@ def main_no_split(
+                 T.fill(acc_o_l, 0)
+                 T.fill(logsum_0, 0)
+ 
+-                T.tma_copy(KV[bid, block_N : 2 * block_N, cur_kv_head, :h_dim], KV_shared_1_l, barrier=kv_shared_1_l_is_ready)
+-                T.barrier_arrive(kv_shared_1_l_is_ready)
+-
+-                T.tma_copy(KV[bid, block_N : 2 * block_N, cur_kv_head, h_dim:], KV_shared_1_r, barrier=kv_shared_1_r_is_ready)
+-                T.barrier_arrive(kv_shared_1_r_is_ready)
++                for j in T.unroll(num_k_tiles):
++                    T.tma_copy(
++                        KV[
++                            bid,
++                            block_N : 2 * block_N,
++                            cur_kv_head,
++                            j * k_tile : (j + 1) * k_tile,
++                        ],
++                        KV_shared_1_l[:, j * k_tile : (j + 1) * k_tile],
++                        barrier=kv_shared_1_l_is_ready[j],
++                    )
++                    T.barrier_arrive(kv_shared_1_l_is_ready[j])
++
++                for j in T.unroll(num_k_tiles):
++                    T.tma_copy(
++                        KV[
++                            bid,
++                            block_N : 2 * block_N,
++                            cur_kv_head,
++                            h_dim + j * k_tile : h_dim + (j + 1) * k_tile,
++                        ],
++                        KV_shared_1_r[:, j * k_tile : (j + 1) * k_tile],
++                        barrier=kv_shared_1_r_is_ready[j],
++                    )
++                    T.barrier_arrive(kv_shared_1_r_is_ready[j])
+ 
+                 T.tma_copy(K_pe[bid, block_N : 2 * block_N, cur_kv_head, :], K_pe_shared_1, barrier=kv_shared_1_pe_is_ready)
+                 T.barrier_arrive(kv_shared_1_pe_is_ready)
+ 
+-                for k in T.serial(loop_range):
+-                    T.barrier_wait(kv_shared_0_l_is_ready, k % 2)
+-                    T.wgmma_gemm(Q_shared_l, KV_shared_0_l, acc_s_0, transpose_B=True, clear_accum=True)
+-                    T.barrier_wait(kv_shared_0_r_is_ready, k % 2)
+-                    T.wgmma_gemm(Q_shared_r, KV_shared_0_r, acc_s_0, transpose_B=True)
+-
+-                    T.barrier_wait(kv_shared_0_pe_is_ready, k % 2)
+-                    T.wgmma_gemm(Q_pe_local_0, K_pe_shared_0, acc_s_0, transpose_B=True)
+-
+-                    T.wait_wgmma(0)
++                # Step 1. QK0 is rotated to the end of the loop to enable further overlapping, so here we need an extra QK in the prologue.
++                for j in T.unroll(num_k_tiles):
++                    T.barrier_wait(kv_shared_0_l_is_ready[j], 0)
++                    T.wgmma_gemm(
++                        Q_shared_l[:, j * k_tile : (j + 1) * k_tile],
++                        KV_shared_0_l[:, j * k_tile : (j + 1) * k_tile],
++                        acc_s_0,
++                        transpose_B=True,
++                        clear_accum=(j == 0),
++                    )
++                for j in T.unroll(num_k_tiles):
++                    T.barrier_wait(kv_shared_0_r_is_ready[j], 0)
++                    T.wgmma_gemm(
++                        Q_shared_r[:, j * k_tile : (j + 1) * k_tile],
++                        KV_shared_0_r[:, j * k_tile : (j + 1) * k_tile],
++                        acc_s_0,
++                        transpose_B=True,
++                    )
++                T.barrier_wait(kv_shared_0_pe_is_ready, 0)
++                T.wgmma_gemm(Q_pe_local_0, K_pe_shared_0, acc_s_0, transpose_B=True)
++                T.wait_wgmma(0)
+ 
++                for k in T.serial(loop_range):
+                     # Step 3.
+                     T.copy(scores_max, scores_max_0)
+                     T.copy(scores_max_0, scores_max_prev_0)
+@@ -149,9 +186,9 @@ def main_no_split(
+ 
+                     # Step 4.
+                     for i, j in T.Parallel(block_H, block_N):
+-                        acc_s_0[i, j] = T.exp2(acc_s_0[i, j] * scale - scores_max[i] * scale)
++                        acc_s_0[i, j] = T.exp2(acc_s_0[i, j] * scale - scores_max_0[i] * scale)
+                     for i in T.Parallel(block_H):
+-                        scores_scale_0[i] = T.exp2(scores_max_prev_0[i] * scale - scores_max[i] * scale)
++                        scores_scale_0[i] = T.exp2(scores_max_prev_0[i] * scale - scores_max_0[i] * scale)
+ 
+                     T.reduce_sum(acc_s_0, scores_sum_0, dim=1)
+ 
+@@ -164,23 +201,34 @@ def main_no_split(
+                     for i in T.Parallel(block_H):
+                         logsum_0[i] = logsum_0[i] * scores_scale_0[i] + scores_sum_0[i]
+ 
+-                    # Step 6.
+-                    T.gemm(acc_s_0_cast, KV_shared_0_l, acc_o_l)
+                     T.barrier_arrive(score_max_0_ready_barrier)
+ 
++                    # Step 6.
++                    T.wgmma_gemm(acc_s_0_cast, KV_shared_0_l, acc_o_l)
++                    T.wait_wgmma(0)
++
+                     T.barrier_wait(scale_1_ready_barrier, k % 2)
+ 
+                     if k < loop_range - 1:
+-                        T.tma_copy(
+-                            KV[bid, (2 * k + 2) * block_N : (2 * k + 3) * block_N, cur_kv_head, :h_dim],
+-                            KV_shared_0_l,
+-                            barrier=kv_shared_0_l_is_ready,
+-                        )
+-                        T.barrier_arrive(kv_shared_0_l_is_ready)
++                        for j in T.unroll(num_k_tiles):
++                            T.tma_copy(
++                                KV[
++                                    bid,
++                                    (2 * k + 2) * block_N : (2 * k + 3) * block_N,
++                                    cur_kv_head,
++                                    j * k_tile : (j + 1) * k_tile,
++                                ],
++                                KV_shared_0_l[:, j * k_tile : (j + 1) * k_tile],
++                                barrier=kv_shared_0_l_is_ready[j],
++                            )
++                            T.barrier_arrive(kv_shared_0_l_is_ready[j])
+ 
+                     # Step 11.
+                     for i, j in T.Parallel(block_H, block_N):
+-                        SP0_shared[i, j] = acc_s_0[i, j] * scores_scale_1[i]
++                        sp0_cast[i, j] = acc_s_0[i, j] * scores_scale_1[i]
++                    T.copy(sp0_cast, SP0_shared)
++                    # Currently InjectFenceProxy cannot infer from warp specialization code that this is a RAW dependency with another warpgroup. We need to fence the async proxy so that GMMA knows that we have written to SMEM.
++                    T.fence_proxy_async()
+ 
+                     T.barrier_arrive(p0_1_1_ready_barrier)
+ 
+@@ -192,22 +240,54 @@ def main_no_split(
+                     T.barrier_wait(s_shared_ready_barrier, k % 2)
+ 
+                     # Step 14.
+-                    T.gemm(SP1_shared, KV_shared_1_l, acc_o_l)
++                    T.wgmma_gemm(SP1_shared, KV_shared_1_l, acc_o_l)
+ 
++                    # Step 1. QK0 rotated to the end of the loop, and we insert the TMA loading for next KV_shared_1_l in the middle of the QK to hide TMA issue latency.
+                     if k < loop_range - 1:
+-                        T.tma_copy(
+-                            KV[bid, (2 * k + 3) * block_N : (2 * k + 4) * block_N, cur_kv_head, :h_dim],
+-                            KV_shared_1_l,
+-                            barrier=kv_shared_1_l_is_ready,
+-                        )
+-                        T.barrier_arrive(kv_shared_1_l_is_ready)
+-
++                        # Half of next QK0
++                        for j in T.unroll(num_k_tiles):
++                            T.barrier_wait(kv_shared_0_l_is_ready[j], (k + 1) % 2)
++                            T.wgmma_gemm(
++                                Q_shared_l[:, j * k_tile : (j + 1) * k_tile],
++                                KV_shared_0_l[:, j * k_tile : (j + 1) * k_tile],
++                                acc_s_0,
++                                transpose_B=True,
++                                clear_accum=(j == 0),
++                            )
++                        # Keep the half of QK0 in-flight, and only wait for last PV1
++                        T.wait_wgmma(num_k_tiles)
++                        for j in T.unroll(num_k_tiles):
++                            T.tma_copy(
++                                KV[
++                                    bid,
++                                    (2 * k + 3) * block_N : (2 * k + 4) * block_N,
++                                    cur_kv_head,
++                                    j * k_tile : (j + 1) * k_tile,
++                                ],
++                                KV_shared_1_l[:, j * k_tile : (j + 1) * k_tile],
++                                barrier=kv_shared_1_l_is_ready[j],
++                            )
++                            T.barrier_arrive(kv_shared_1_l_is_ready[j])
+                         T.tma_copy(
+                             K_pe[bid, (2 * k + 3) * block_N : (2 * k + 4) * block_N, cur_kv_head, :],
+                             K_pe_shared_1,
+                             barrier=kv_shared_1_pe_is_ready,
+                         )
+                         T.barrier_arrive(kv_shared_1_pe_is_ready)
++                        # Another half of QK0 and QPE0
++                        for j in T.unroll(num_k_tiles):
++                            T.barrier_wait(kv_shared_0_r_is_ready[j], (k + 1) % 2)
++                            T.wgmma_gemm(
++                                Q_shared_r[:, j * k_tile : (j + 1) * k_tile],
++                                KV_shared_0_r[:, j * k_tile : (j + 1) * k_tile],
++                                acc_s_0,
++                                transpose_B=True,
++                            )
++                        T.barrier_wait(kv_shared_0_pe_is_ready, (k + 1) % 2)
++                        T.wgmma_gemm(Q_pe_local_0, K_pe_shared_0, acc_s_0, transpose_B=True)
++
++                    # Unconditional wait, so that ptxas knows the lifetime of the accumulators end here in the loop.
++                    T.wait_wgmma(0)
+ 
+                 T.copy(logsum_0, logsum)
+                 T.barrier_arrive(lse_0_ready_barrier)
+@@ -222,26 +302,51 @@ def main_no_split(
+                 T.fill(acc_o_r, 0)
+                 T.fill(logsum_1, 0)
+ 
+-                T.tma_copy(KV[bid, :block_N, cur_kv_head, :h_dim], KV_shared_0_l, barrier=kv_shared_0_l_is_ready)
+-                T.barrier_arrive(kv_shared_0_l_is_ready)
+-                T.tma_copy(KV[bid, :block_N, cur_kv_head, h_dim:], KV_shared_0_r, barrier=kv_shared_0_r_is_ready)
+-                T.barrier_arrive(kv_shared_0_r_is_ready)
++                for j in T.unroll(num_k_tiles):
++                    T.tma_copy(
++                        KV[bid, :block_N, cur_kv_head, j * k_tile : (j + 1) * k_tile],
++                        KV_shared_0_l[:, j * k_tile : (j + 1) * k_tile],
++                        barrier=kv_shared_0_l_is_ready[j],
++                    )
++                    T.barrier_arrive(kv_shared_0_l_is_ready[j])
++                for j in T.unroll(num_k_tiles):
++                    T.tma_copy(
++                        KV[
++                            bid,
++                            :block_N,
++                            cur_kv_head,
++                            h_dim + j * k_tile : h_dim + (j + 1) * k_tile,
++                        ],
++                        KV_shared_0_r[:, j * k_tile : (j + 1) * k_tile],
++                        barrier=kv_shared_0_r_is_ready[j],
++                    )
++                    T.barrier_arrive(kv_shared_0_r_is_ready[j])
+                 T.tma_copy(K_pe[bid, :block_N, cur_kv_head, :], K_pe_shared_0, barrier=kv_shared_0_pe_is_ready)
+                 T.barrier_arrive(kv_shared_0_pe_is_ready)
+ 
+-                for k in T.serial(loop_range):
+-                    # Step 2.
+-                    T.barrier_wait(kv_shared_1_l_is_ready, k % 2)
+-                    T.wgmma_gemm(Q_shared_l, KV_shared_1_l, acc_s_1, transpose_B=True, clear_accum=True)
+-
+-                    T.barrier_wait(kv_shared_1_r_is_ready, k % 2)
+-                    T.wgmma_gemm(Q_shared_r, KV_shared_1_r, acc_s_1, transpose_B=True)
+-
+-                    T.barrier_wait(kv_shared_1_pe_is_ready, k % 2)
+-                    T.wgmma_gemm(Q_pe_local_1, K_pe_shared_1, acc_s_1, transpose_B=True)
+-
+-                    T.wait_wgmma(0)
++                # Step 2. QK1 is rotated to the end of the loop to enable further overlapping, so here we need an extra QK in the prologue.
++                for j in T.unroll(num_k_tiles):
++                    T.barrier_wait(kv_shared_1_l_is_ready[j], 0)
++                    T.wgmma_gemm(
++                        Q_shared_l[:, j * k_tile : (j + 1) * k_tile],
++                        KV_shared_1_l[:, j * k_tile : (j + 1) * k_tile],
++                        acc_s_1,
++                        transpose_B=True,
++                        clear_accum=(j == 0),
++                    )
++                for j in T.unroll(num_k_tiles):
++                    T.barrier_wait(kv_shared_1_r_is_ready[j], 0)
++                    T.wgmma_gemm(
++                        Q_shared_r[:, j * k_tile : (j + 1) * k_tile],
++                        KV_shared_1_r[:, j * k_tile : (j + 1) * k_tile],
++                        acc_s_1,
++                        transpose_B=True,
++                    )
++                T.barrier_wait(kv_shared_1_pe_is_ready, 0)
++                T.wgmma_gemm(Q_pe_local_1, K_pe_shared_1, acc_s_1, transpose_B=True)
++                T.wait_wgmma(0)
+ 
++                for k in T.serial(loop_range):
+                     # Step 7.
+                     T.barrier_wait(score_max_0_ready_barrier, k % 2)
+ 
+@@ -251,11 +356,11 @@ def main_no_split(
+                     T.copy(scores_max_1, scores_max)
+ 
+                     for i in T.Parallel(block_H):
+-                        scores_scale_1[i] = T.exp2(scores_max_prev_1[i] * scale - scores_max[i] * scale)
++                        scores_scale_1[i] = T.exp2(scores_max_prev_1[i] * scale - scores_max_1[i] * scale)
+ 
+                     # Step 8.
+                     for i, j in T.Parallel(block_H, block_N):
+-                        acc_s_1[i, j] = T.exp2(acc_s_1[i, j] * scale - scores_max[i] * scale)
++                        acc_s_1[i, j] = T.exp2(acc_s_1[i, j] * scale - scores_max_1[i] * scale)
+ 
+                     # Step 9.
+                     T.reduce_sum(acc_s_1, scores_sum_1, dim=1)
+@@ -270,30 +375,41 @@ def main_no_split(
+ 
+                     # Step 10. compute O1 with KV_shared_1_rd
+                     T.copy(acc_s_1, acc_s_1_cast)
+-                    T.wgmma_gemm(acc_s_1_cast, KV_shared_1_r, acc_o_r)
+                     T.copy(acc_s_1_cast, SP1_shared)
++                    T.wgmma_gemm(acc_s_1_cast, KV_shared_1_r, acc_o_r)
+                     T.barrier_arrive(s_shared_ready_barrier)
+ 
+-                    if k < loop_range - 1:
+-                        T.tma_copy(
+-                            KV[bid, (2 * k + 3) * block_N : (2 * k + 4) * block_N, cur_kv_head, h_dim:],
+-                            KV_shared_1_r,
+-                            barrier=kv_shared_1_r_is_ready,
+-                        )
+-                        T.barrier_arrive(kv_shared_1_r_is_ready)
+-
+-                    T.barrier_wait(p0_1_1_ready_barrier, k % 2)
+                     # Step 12.
+-                    T.gemm(SP0_shared, KV_shared_0_r, acc_o_r)
++                    T.barrier_wait(p0_1_1_ready_barrier, k % 2)
++                    T.wgmma_gemm(SP0_shared, KV_shared_0_r, acc_o_r)
+ 
+                     if k < loop_range - 1:
+-                        T.tma_copy(
+-                            KV[bid, (2 * k + 2) * block_N : (2 * k + 3) * block_N, cur_kv_head, h_dim:],
+-                            KV_shared_0_r,
+-                            barrier=kv_shared_0_r_is_ready,
+-                        )
+-                        T.barrier_arrive(kv_shared_0_r_is_ready)
+-
++                        T.wait_wgmma(1)
++                        for j in T.unroll(num_k_tiles):
++                            T.tma_copy(
++                                KV[
++                                    bid,
++                                    (2 * k + 3) * block_N : (2 * k + 4) * block_N,
++                                    cur_kv_head,
++                                    h_dim + j * k_tile : h_dim + (j + 1) * k_tile,
++                                ],
++                                KV_shared_1_r[:, j * k_tile : (j + 1) * k_tile],
++                                barrier=kv_shared_1_r_is_ready[j],
++                            )
++                            T.barrier_arrive(kv_shared_1_r_is_ready[j])
++                        T.wait_wgmma(0)
++                        for j in T.unroll(num_k_tiles):
++                            T.tma_copy(
++                                KV[
++                                    bid,
++                                    (2 * k + 2) * block_N : (2 * k + 3) * block_N,
++                                    cur_kv_head,
++                                    h_dim + j * k_tile : h_dim + (j + 1) * k_tile,
++                                ],
++                                KV_shared_0_r[:, j * k_tile : (j + 1) * k_tile],
++                                barrier=kv_shared_0_r_is_ready[j],
++                            )
++                            T.barrier_arrive(kv_shared_0_r_is_ready[j])
+                         T.tma_copy(
+                             K_pe[bid, (2 * k + 2) * block_N : (2 * k + 3) * block_N, cur_kv_head, :],
+                             K_pe_shared_0,
+@@ -301,6 +417,30 @@ def main_no_split(
+                         )
+                         T.barrier_arrive(kv_shared_0_pe_is_ready)
+ 
++                        # Step 2. Rotated QK1.
++                        for j in T.unroll(num_k_tiles):
++                            T.barrier_wait(kv_shared_1_l_is_ready[j], (k + 1) % 2)
++                            T.wgmma_gemm(
++                                Q_shared_l[:, j * k_tile : (j + 1) * k_tile],
++                                KV_shared_1_l[:, j * k_tile : (j + 1) * k_tile],
++                                acc_s_1,
++                                transpose_B=True,
++                                clear_accum=(j == 0),
++                            )
++                        for j in T.unroll(num_k_tiles):
++                            T.barrier_wait(kv_shared_1_r_is_ready[j], (k + 1) % 2)
++                            T.wgmma_gemm(
++                                Q_shared_r[:, j * k_tile : (j + 1) * k_tile],
++                                KV_shared_1_r[:, j * k_tile : (j + 1) * k_tile],
++                                acc_s_1,
++                                transpose_B=True,
++                            )
++                        T.barrier_wait(kv_shared_1_pe_is_ready, (k + 1) % 2)
++                        T.wgmma_gemm(Q_pe_local_1, K_pe_shared_1, acc_s_1, transpose_B=True)
++
++                    # Unconditional. Same as above.
++                    T.wait_wgmma(0)
++
+                 T.barrier_wait(lse_0_ready_barrier, 0)
+                 for i in T.Parallel(block_H):
+                     logsum[i] += logsum_1[i]
+diff --git a/src/cuda/op/copy.cc b/src/cuda/op/copy.cc
+index 617225b5f7..48c14438de 100644
+--- a/src/cuda/op/copy.cc
++++ b/src/cuda/op/copy.cc
+@@ -361,18 +361,9 @@ static void RequireTMASmemAlignment(const LowerArgs &lower_args,
+                                     int cu_tensor_map_swizzle) {
+   if (!lower_args.require_smem_alignment)
+     return;
+-  SwizzleMode mode = SwizzleMode::kNone;
+-  if (cu_tensor_map_swizzle == static_cast<int>(CU_TENSOR_MAP_SWIZZLE_32B)) {
+-    mode = SwizzleMode::kQuarter;
+-  } else if (cu_tensor_map_swizzle ==
+-             static_cast<int>(CU_TENSOR_MAP_SWIZZLE_64B)) {
+-    mode = SwizzleMode::kHalf;
+-  } else if (cu_tensor_map_swizzle ==
+-             static_cast<int>(CU_TENSOR_MAP_SWIZZLE_128B)) {
+-    mode = SwizzleMode::kFull;
+-  }
+-  lower_args.require_smem_alignment(shared_tensor->data,
+-                                    SmemAlignmentForSwizzle(mode));
++  // CU_TENSOR_MAP_SWIZZLE_* values equal the SwizzleMode canonical ordinals.
++  SwizzleMode mode = SwizzleMode::FromOrdinal(cu_tensor_map_swizzle);
++  lower_args.require_smem_alignment(shared_tensor->data, mode.SmemAlignment());
+ }
+ 
+ struct TMAIm2ColDesc {
+@@ -2215,11 +2206,11 @@ Stmt Copy::LowerBulkGather4(const CopyNode &op, const LowerArgs &lower_args,
+   desc.swizzle = static_cast<int>(CU_TENSOR_MAP_SWIZZLE_NONE);
+   if (shared_layout.defined() && shared_layout->InputDim() >= 2) {
+     SwizzleMode mode = DetectSwizzleMode(shared_layout, shared_tensor_unmapped);
+-    if (mode == SwizzleMode::kQuarter) {
++    if (mode == SwizzleMode::Swizzle32B()) {
+       desc.swizzle = static_cast<int>(CU_TENSOR_MAP_SWIZZLE_32B);
+-    } else if (mode == SwizzleMode::kHalf) {
++    } else if (mode == SwizzleMode::Swizzle64B()) {
+       desc.swizzle = static_cast<int>(CU_TENSOR_MAP_SWIZZLE_64B);
+-    } else if (mode == SwizzleMode::kFull) {
++    } else if (mode == SwizzleMode::Swizzle128B()) {
+       desc.swizzle = static_cast<int>(CU_TENSOR_MAP_SWIZZLE_128B);
+     }
+   }
+diff --git a/src/layout/cute_layout.cc b/src/layout/cute_layout.cc
+index c82779276d..15c563b041 100644
+--- a/src/layout/cute_layout.cc
++++ b/src/layout/cute_layout.cc
+@@ -8,6 +8,7 @@
+ 
+ #include "support/check.h"
+ #include <algorithm>
++#include <cstdlib>
+ #include <limits>
+ #include <map>
+ #include <optional>
+@@ -61,17 +62,21 @@ Swizzle Swizzle::Recast(int old_bits, int new_bits) const {
+   ICHECK(n != nullptr) << "Recast on a null Swizzle";
+   if (!n->IsSwizzled())
+     return Swizzle::Identity();
+-  // Reinterpreting the element size scales every address by old_bits/new_bits,
+-  // so bit positions shift by log2(old_bits) - log2(new_bits). Element sizes
+-  // must be powers of two for this to be a clean bit shift.
+   int old_log = Log2Exact(old_bits);
+   int new_log = Log2Exact(new_bits);
+   ICHECK(old_log >= 0 && new_log >= 0)
+       << "Recast expects power-of-two element sizes, got " << old_bits << " -> "
+       << new_bits;
+-  int m_base = n->m_base + (old_log - new_log);
+-  ICHECK(m_base >= 0) << "Recast produced negative m_base: " << m_base;
+-  return Swizzle(n->b_bits, m_base, n->s_shift);
++  // Mirror CuTe recast_layout(Swizzle<B,M,S>): new>=old => upcast<new/old>
++  // (NewM = M - log2N; clamp via B if negative); new<old => downcast<old/new>
++  // (M + log2N).
++  if (new_bits >= old_bits) {
++    int new_m = n->m_base - (new_log - old_log);
++    if (new_m >= 0)
++      return Swizzle(n->b_bits, new_m, n->s_shift);
++    return Swizzle(std::max(n->b_bits + new_m, 0), 0, n->s_shift);
++  }
++  return Swizzle(n->b_bits, n->m_base + (old_log - new_log), n->s_shift);
+ }
+ 
+ IntTuple::IntTuple(int64_t value) {
+@@ -553,7 +558,13 @@ Layout BwCoalesce(const IntTuple &fsh, const IntTuple &fst, IntTuple front_sh,
+   }
+   prepend(front_sh, front_st);
+   if (res_sh.size() == 1 && IsConst(res_sh[0]) && AsConst(res_sh[0]) == 1)
+-    return Layout(Array<int64_t>{1}, Array<int64_t>{0});
++    return Layout(IntTuple(int64_t(1)), IntTuple(int64_t(0)));
++  // CuTe bw_coalesce returns Layout<NewShape,NewStride> with a SCALAR NewShape
++  // when a single mode survives (it only builds a tuple via prepend on >=2
++  // modes). Mirror that: a one-mode result is scalar-shaped, not a 1-tuple, so
++  // logical_divide/complement stay flat and congruent matches CuTe.
++  if (res_sh.size() == 1)
++    return Layout(res_sh[0], res_st[0]);
+   return Layout(Array<IntTuple>(res_sh.begin(), res_sh.end()),
+                 Array<IntTuple>(res_st.begin(), res_st.end()));
+ }
+@@ -628,7 +639,6 @@ Layout RightInverse(const Layout &layout) {
+ 
+ namespace {
+ 
+-int64_t Abs(int64_t v) { return v < 0 ? -v : v; }
+ int64_t Signum(int64_t v) { return (v > 0) - (v < 0); }
+ int64_t CeilDiv(int64_t a, int64_t b) { return (a + b - 1) / b; }
+ 
+@@ -794,9 +804,9 @@ Layout CompositionImpl(const IntTuple &lhs_shape, const IntTuple &lhs_stride,
+         << ", curr_shape=" << curr_shape;
+     // How much of this lhs mode the current stride spans, and the stride left
+     // over for the next mode.
+-    int64_t next_shape = CeilDiv(curr_shape, Abs(rest_stride));
++    int64_t next_shape = CeilDiv(curr_shape, std::abs(rest_stride));
+     int64_t next_stride =
+-        CeilDiv(Abs(rest_stride), curr_shape) * Signum(rest_stride);
++        CeilDiv(std::abs(rest_stride), curr_shape) * Signum(rest_stride);
+     if (next_shape == 1 || rest_shape == 1) {
+       rest_stride = next_stride; // nothing lands in this mode; carry on.
+     } else {
+@@ -854,6 +864,148 @@ Layout Take(const Layout &layout, int64_t n) {
+   return Layout(std::move(shape), std::move(stride));
+ }
+ 
++Layout Filter(const Layout &layout) {
++  // CuTe filter = coalesce(filter_zeros): a constant-0-stride mode becomes
++  // size-1 (then dropped by coalesce). Dynamic/ScaledBasis modes pass through.
++  IntTuple fsh = Flatten(layout->shape), fst = Flatten(layout->stride);
++  Array<IntTuple> out_sh, out_st;
++  for (int64_t i = 0, r = Rank(fsh); i < r; ++i) {
++    out_sh.push_back(IsZeroLeaf(fst[i]) ? IntTuple(int64_t(1)) : fsh[i]);
++    out_st.push_back(fst[i]);
++  }
++  return Coalesce(Layout(out_sh, out_st));
++}
++
++IntTuple Cosize(const Layout &layout) {
++  // CuTe cosize = 1 + sum_i (shape_i - 1) * |stride_i| over flat scalar modes;
++  // stays symbolic if any shape/stride is dynamic.
++  IntTuple fsh = Flatten(layout->shape), fst = Flatten(layout->stride);
++  IntTuple co = IntTuple(int64_t(1));
++  for (int64_t i = 0, r = Rank(fsh); i < r; ++i) {
++    IntTuple sh = fsh[i], st = fst[i];
++    ICHECK(!IsTuple(sh) && !IsScaledBasis(sh) && !IsTuple(st) &&
++           !IsScaledBasis(st))
++        << "Cosize requires scalar shape/stride, got " << sh << " : " << st;
++    IntTuple abs_st = IsConst(st) ? IntTuple(std::abs(AsConst(st)))
++                                  : IntTuple(tvm::abs(AsPrimExpr(st)));
++    co = AddLeaf(co, MulLeaf(AddLeaf(sh, IntTuple(int64_t(-1))), abs_st));
++  }
++  return co;
++}
++
++namespace {
++
++// ceil_div of two scalar leaves; constant when both are, else a PrimExpr.
++IntTuple CeilDivLeaf(const IntTuple &a, const IntTuple &b) {
++  if (IsConst(a) && IsConst(b))
++    return IntTuple(CeilDiv(AsConst(a), AsConst(b)));
++  DataType dt = IsPrimExpr(a) ? AsPrimExpr(a)->dtype : AsPrimExpr(b)->dtype;
++  return IntTuple(
++      tvm::floordiv(AsConstOrPrimExpr(a, dt) + AsConstOrPrimExpr(b, dt) - 1,
++                    AsConstOrPrimExpr(b, dt)));
++}
++
++// Static port of CuTe detail::complement (layout.hpp:1176-1227). `shapes`/
++// `strides` are the FILTERED flat modes (no stride-0, no size-1); `cotarget` is
++// the codomain size to fill. Sort-and-fold: repeatedly take the smallest
++// remaining stride, emit the gap below it as a mode, advance past it.
++Layout ComplementStatic(std::vector<int64_t> shapes,
++                        std::vector<int64_t> strides, int64_t cotarget) {
++  int64_t R = static_cast<int64_t>(shapes.size());
++  if (R == 0) // Fully-trivial layout: complement is the whole [0, cotarget).
++    return Coalesce(Layout(Array<int64_t>{cotarget}, Array<int64_t>{1}));
++  Array<int64_t> out_sh, out_st;
++  int64_t run = 1; // running stride
++  for (int64_t i = 0; i < R - 1; ++i) {
++    auto min_it = std::min_element(strides.begin(), strides.end());
++    int64_t min_idx = min_it - strides.begin(), min_stride = *min_it;
++    int64_t new_shape = min_stride / run;
++    ICHECK(new_shape != 0) << "Non-injective layout detected in complement";
++    out_sh.push_back(new_shape);
++    out_st.push_back(run);
++    run = min_stride * shapes[min_idx];
++    shapes.erase(shapes.begin() + min_idx);
++    strides.erase(strides.begin() + min_idx);
++  }
++  // Last shape mode, then the rest mode filling up to cotarget.
++  int64_t new_shape = strides[0] / run;
++  ICHECK(new_shape != 0) << "Non-injective layout detected in complement";
++  out_sh.push_back(new_shape);
++  out_st.push_back(run);
++  int64_t last_stride = strides[0] * shapes[0];
++  out_sh.push_back(CeilDiv(cotarget, last_stride));
++  out_st.push_back(last_stride);
++  return Coalesce(Layout(out_sh, out_st));
++}
++
++// CuTe detail::complement for a single filtered rank-1 mode (s):(d),
++// specialized to R==1 (fold body runs zero times), with possibly-dynamic
++// shape/stride:
++//   coalesce( (d, ceil_div(cotarget, d*s)) : (1, d*s) ).
++Layout ComplementRank1(const IntTuple &shape, const IntTuple &stride,
++                       int64_t cotarget) {
++  ICHECK(!IsTuple(stride) && !IsScaledBasis(stride))
++      << "Complement requires a scalar stride, got " << stride;
++  IntTuple ds = MulLeaf(stride, shape);
++  return Coalesce(
++      Layout(Array<IntTuple>{stride, CeilDivLeaf(IntTuple(cotarget), ds)},
++             Array<IntTuple>{IntTuple(int64_t(1)), ds}));
++}
++
++} // namespace
++
++Layout Complement(const Layout &layout, int64_t cotarget) {
++  Layout f = Filter(layout); // flat (Coalesce output).
++  IntTuple fsh = Flatten(f->shape), fst = Flatten(f->stride);
++  // Drop the residual (1):(0) Coalesce/Filter leaves for an empty layout.
++  std::vector<IntTuple> sh, st;
++  bool all_const = true;
++  for (int64_t i = 0, r = Rank(fsh); i < r; ++i) {
++    if (IsConst(fsh[i]) && AsConst(fsh[i]) == 1 && IsZeroLeaf(fst[i]))
++      continue;
++    sh.push_back(fsh[i]);
++    st.push_back(fst[i]);
++    all_const &= IsConst(fsh[i]) && IsConst(fst[i]);
++  }
++  int64_t R = static_cast<int64_t>(sh.size());
++  if (all_const) {
++    std::vector<int64_t> ci_sh, ci_st;
++    for (int64_t i = 0; i < R; ++i) {
++      ci_sh.push_back(AsConst(sh[i]));
++      ci_st.push_back(AsConst(st[i]));
++    }
++    return ComplementStatic(std::move(ci_sh), std::move(ci_st), cotarget);
++  }
++  // Dynamic strides can't be stride-ordered, so CuTe only supports rank-1
++  // (layout.hpp:1187-1189: static_assert(R == 1 || is_static<Stride>)).
++  ICHECK(R == 1) << "Dynamic-stride complement only for rank-1 layouts "
++                    "(mirrors CuTe static_assert); got rank "
++                 << R;
++  return ComplementRank1(sh[0], st[0], cotarget);
++}
++
++Layout Complement(const Layout &layout) {
++  IntTuple cs = Cosize(Filter(layout));
++  ICHECK(IsConst(cs)) << "single-argument Complement needs a static cosize "
++                         "(its codomain target), got "
++                      << cs;
++  return Complement(layout, AsConst(cs));
++}
++
++Layout LogicalDivide(const Layout &layout, const Layout &tiler) {
++  // CuTe 2-arg logical_divide (layout.hpp:1559-1562):
++  //   composition(layout, make_layout(tiler, complement(tiler,
++  //   size(coalesce(layout))))).
++  // Result is rank-2: mode 0 the tile, mode 1 the rest. The cotarget
++  // size(coalesce(layout)) must be static; `layout`'s strides may be dynamic.
++  IntTuple sz = Size(Coalesce(layout));
++  ICHECK(IsConst(sz)) << "LogicalDivide needs a static layout size (the "
++                         "complement cotarget), got "
++                      << sz;
++  Layout comp = Complement(tiler, AsConst(sz));
++  return Composition(layout, MakeLayout({tiler, comp}));
++}
++
+ Layout MakeColumnMajorLayout(const IntTuple &shape) {
+   return Layout(shape, CompactColMajor(shape));
+ }
+@@ -867,6 +1019,19 @@ Layout MakeIdentityLayout(const IntTuple &shape) {
+   return Layout(shape, IdentityStride(shape, path));
+ }
+ 
++Layout MakeLayout(const Array<Layout> &layouts) {
++  Array<IntTuple> sh, st;
++  for (const Layout &l : layouts) {
++    sh.push_back(l->shape);
++    st.push_back(l->stride);
++  }
++  return Layout(IntTupleTuple(sh), IntTupleTuple(st));
++}
++
++Layout Layout::WithShape(const IntTuple &shape) const {
++  return Composition(*this, MakeColumnMajorLayout(shape));
++}
++
+ ComposedLayout::ComposedLayout(Swizzle swizzle, int64_t offset, Layout layout) {
+   auto node = make_object<ComposedLayoutNode>();
+   node->swizzle = std::move(swizzle);
+@@ -875,6 +1040,48 @@ ComposedLayout::ComposedLayout(Swizzle swizzle, int64_t offset, Layout layout) {
+   data_ = std::move(node);
+ }
+ 
++namespace {
++
++// CuTe upcast<N>/downcast<N> on one scalar mode (layout.hpp:1806-1855).
++// upcast/downcast scale the unit-stride mode's SHAPE, not its stride (uniform
++// stride scaling would give a stride-1 mode a fractional stride). `up` selects
++// upcast vs downcast; factor==1 is identity. Returns (shape, stride).
++std::pair<int64_t, int64_t> RecastMode(int64_t factor, bool up, int64_t shape,
++                                       int64_t stride) {
++  if (factor == 1 || (up && stride == 0))
++    return {shape, stride};
++  if (up) {
++    int64_t a = std::abs(stride);
++    return {CeilDiv(shape, CeilDiv(factor, a)),
++            Signum(stride) * CeilDiv(a, factor)};
++  }
++  if (stride == 1 || stride == -1)
++    return {shape * factor, stride};
++  return {shape, stride * factor};
++}
++
++// Apply RecastMode over a (shape, stride) tree, preserving the hierarchy
++// (CuTe upcast/downcast recurse via transform_layout).
++std::pair<IntTuple, IntTuple>
++RecastTree(int64_t factor, bool up, const IntTuple &sh, const IntTuple &st) {
++  if (IsTuple(sh)) {
++    ICHECK(IsTuple(st) && Rank(sh) == Rank(st))
++        << "Recast: shape/stride tree mismatch";
++    Array<IntTuple> nsh, nst;
++    for (int64_t i = 0, n = Rank(sh); i < n; ++i) {
++      auto [csh, cst] = RecastTree(factor, up, sh[i], st[i]);
++      nsh.push_back(csh);
++      nst.push_back(cst);
++    }
++    return {IntTupleTuple(nsh), IntTupleTuple(nst)};
++  }
++  ICHECK(IsConst(sh) && IsConst(st)) << "Recast requires plain integer leaves";
++  auto [os, od] = RecastMode(factor, up, AsConst(sh), AsConst(st));
++  return {IntTuple(os), IntTuple(od)};
++}
++
++} // namespace
++
+ ComposedLayout ComposedLayout::Recast(int old_bits, int new_bits) const {
+   const ComposedLayoutNode *n = get();
+   ICHECK(n != nullptr) << "Recast on a null ComposedLayout";
+@@ -883,27 +1090,26 @@ ComposedLayout ComposedLayout::Recast(int old_bits, int new_bits) const {
+   ICHECK(old_log >= 0 && new_log >= 0)
+       << "Recast expects power-of-two element sizes, got " << old_bits << " -> "
+       << new_bits;
+-  // Scaling the element width multiplies every address by old_bits/new_bits.
+-  // For a clean integer layout this must be an exact power-of-two scale; the
+-  // shift can be positive (smaller elements) or negative (larger elements).
+-  int shift = old_log - new_log;
+-  auto scale = [&](int64_t v) -> int64_t {
+-    if (shift >= 0)
+-      return v << shift;
+-    int64_t d = static_cast<int64_t>(1) << (-shift);
+-    ICHECK(v % d == 0) << "Recast cannot scale " << v << " by 2^" << shift
+-                       << " without remainder";
+-    return v / d;
+-  };
+-  // Scale every stride leaf, preserving the shape tree (TransformLeaf keeps the
+-  // hierarchy; the recovered layout's strides are plain integers).
+-  IntTuple new_stride = TransformLeaf(n->layout->stride, [&](IntTuple s) {
+-    ICHECK(IsConst(s)) << "Recast requires plain integer strides";
+-    return IntTuple(scale(AsConst(s)));
+-  });
+-  Layout new_layout(n->layout->shape, new_stride);
+-  return ComposedLayout(n->swizzle.Recast(old_bits, new_bits), scale(n->offset),
+-                        new_layout);
++  // Recasting old_bits -> new_bits is CuTe recast_layout: new>old =>
++  // upcast<new/old>, new<old => downcast<old/new>. See RecastMode for why the
++  // unit-stride mode scales its shape. The offset is a plain address.
++  bool up = new_bits >= old_bits;
++  int64_t factor = up ? (int64_t(1) << (new_log - old_log))
++                      : (int64_t(1) << (old_log - new_log));
++  auto [out_sh, out_st] =
++      RecastTree(factor, up, n->layout->shape, n->layout->stride);
++  int64_t new_offset;
++  if (factor == 1) {
++    new_offset = n->offset;
++  } else if (up) {
++    ICHECK(n->offset % factor == 0)
++        << "Recast cannot scale offset " << n->offset << " up by " << factor;
++    new_offset = n->offset / factor;
++  } else {
++    new_offset = n->offset * factor;
++  }
++  return ComposedLayout(n->swizzle.Recast(old_bits, new_bits), new_offset,
++                        Layout(out_sh, out_st));
+ }
+ 
+ namespace {
+@@ -1395,6 +1601,14 @@ Optional<Layout> RecoverPlainLayout(const AddrProbe &A, const Swizzle &swizzle,
+   return plain;
+ }
+ 
++// Build an IntTuple congruent to a flat TileLang input shape.
++IntTuple ShapeTuple(const std::vector<int32_t> &input_shape) {
++  Array<IntTuple> dims;
++  for (int32_t s : input_shape)
++    dims.push_back(IntTuple(static_cast<int64_t>(s)));
++  return IntTupleTuple(dims);
++}
++
+ } // namespace
+ 
+ // Recover a TileLang layout that has no swizzle and zero offset as a plain
+@@ -1405,7 +1619,12 @@ Optional<Layout> LayoutFromTileLang(const tvm::tl::Layout &layout) {
+   AddrProbe A(layout);
+   if (A.shape().empty())
+     return std::nullopt;
+-  return RecoverPlainLayout(A, Swizzle::Identity(), /*offset=*/0);
++  Optional<Layout> plain =
++      RecoverPlainLayout(A, Swizzle::Identity(), /*offset=*/0);
++  if (!plain.defined())
++    return std::nullopt;
++  // Return a layout congruent to the input TileLang shape (not the flat form).
++  return plain.value().WithShape(ShapeTuple(A.shape()));
+ }
+ 
+ // Recover a swizzled affine layout, A(x) = Sw(offset + plain(x)), from a
+@@ -1490,7 +1709,43 @@ ComposedLayoutFromTileLang(const tvm::tl::Layout &layout) {
+   Optional<Layout> plain = RecoverPlainLayout(A, swizzle, offset);
+   if (!plain.defined())
+     return std::nullopt;
+-  return ComposedLayout(swizzle, offset, plain.value());
++  // Return a layout congruent to the input TileLang shape (not the flat form),
++  // so callers can index modes positionally (e.g. logical_divide per mode).
++  return ComposedLayout(swizzle, offset,
++                        plain.value().WithShape(ShapeTuple(A.shape())));
++}
++
++// Restrict an affine cute::Layout to the sub-tile selected by `range` (one
++// Range per top-level mode, e.g. a BufferRegion's per-axis ranges). The layout
++// may be hierarchical (a swizzle-split decoded layout): each mode is reshaped
++// to its logical extent via CuTe `with_shape`, which flattens the split sub-
++// modes back to the logical slice. Because the layout is affine, evaluating it
++// at the region origin `mins` gives a single base offset, so:
++//   layout(mins + c) == layout(mins) + sublayout(c)  for all c in the sub-tile.
++// Returns (offset, sublayout). `mins` may be dynamic (e.g. a sliced operand
++// `B[:, j*64:...]` inside a loop), so the offset is an IntTuple, not an int.
++Tuple<IntTuple, Layout> Restrict(const Layout &layout,
++                                 const Array<Range> &range) {
++  int64_t r = Rank(layout->shape);
++  ICHECK_EQ(static_cast<int64_t>(range.size()), r)
++      << "Restrict: region rank " << range.size() << " != layout rank " << r;
++
++  Array<IntTuple> min_modes;
++  Array<Layout> sub_modes;
++  for (int64_t i = 0; i < r; ++i) {
++    min_modes.push_back(IntTuple(range[i]->min));
++    // Skip statically-extent-1 modes (e.g. a pipeline stage pinned to one
++    // element): they'd leave size-1 modes that break the GMMA canonical divide.
++    const auto *ext_imm = range[i]->extent.as<IntImmNode>();
++    if (ext_imm && ext_imm->value == 1)
++      continue;
++    sub_modes.push_back(layout[i].WithShape(IntTuple(range[i]->extent)));
++  }
++  IntTuple offset = layout(IntTupleTuple(min_modes));
++  if (sub_modes.empty()) // everything pinned to one element: scalar (1):(0).
++    return Tuple<IntTuple, Layout>(
++        offset, Layout(IntTuple(int64_t(1)), IntTuple(int64_t(0))));
++  return Tuple<IntTuple, Layout>(offset, MakeLayout(sub_modes));
+ }
+ 
+ namespace {
+@@ -1604,6 +1859,8 @@ TVM_FFI_STATIC_INIT_BLOCK() {
+       // -- Swizzle --------------------------------------------------------
+       .def("tl.cute.swizzle_is_swizzled",
+            [](const Swizzle &swizzle) { return swizzle->IsSwizzled(); })
++      .def("tl.cute.swizzle_to_swizzle_mode",
++           [](const Swizzle &swizzle) { return swizzle->ToSwizzleMode(); })
+       .def("tl.cute.swizzle_recast",
+            [](const Swizzle &swizzle, int old_bits, int new_bits) {
+              return swizzle.Recast(old_bits, new_bits);
+@@ -1636,6 +1893,12 @@ TVM_FFI_STATIC_INIT_BLOCK() {
+            [](IntTuple shape, IntTuple stride) {
+              return Layout(std::move(shape), std::move(stride));
+            })
++      .def("tl.cute.make_layout_concat",
++           [](const Array<Layout> &layouts) { return MakeLayout(layouts); })
++      .def("tl.cute.with_shape",
++           [](const Layout &layout, const IntTuple &shape) {
++             return layout.WithShape(shape);
++           })
+       .def("tl.cute.layout_get",
+            [](const Layout &layout, int64_t index) { return layout[index]; })
+       // coord is an IntTuple: a scalar leaf for a single linear index, or a
+@@ -1667,6 +1930,20 @@ TVM_FFI_STATIC_INIT_BLOCK() {
+            [](const Layout &layout, int64_t max_extent) {
+              return Coalesce(layout, max_extent);
+            })
++      .def("tl.cute.filter",
++           [](const Layout &layout) { return Filter(layout); })
++      .def("tl.cute.congruent",
++           [](const IntTuple &a, const IntTuple &b) { return Congruent(a, b); })
++      .def("tl.cute.cosize",
++           [](const Layout &layout) { return Cosize(layout); })
++      .def("tl.cute.complement",
++           [](const Layout &layout, int64_t cotarget) {
++             return Complement(layout, cotarget);
++           })
++      .def("tl.cute.logical_divide",
++           [](const Layout &layout, const Layout &tiler) {
++             return LogicalDivide(layout, tiler);
++           })
+       // -- Make*Layout ----------------------------------------------------
+       .def("tl.cute.make_column_major_layout",
+            [](const IntTuple &shape) { return MakeColumnMajorLayout(shape); })
+@@ -1687,6 +1964,10 @@ TVM_FFI_STATIC_INIT_BLOCK() {
+       .def("tl.cute.composed_layout_from_tilelang",
+            [](const tvm::tl::Layout &layout) {
+              return ComposedLayoutFromTileLang(layout);
++           })
++      .def("tl.cute.restrict",
++           [](const Layout &layout, const Array<Range> &range) {
++             return Restrict(layout, range);
+            });
+ }
+ 
+diff --git a/src/layout/cute_layout.h b/src/layout/cute_layout.h
+index cc1b66030b..f039e49dd0 100644
+--- a/src/layout/cute_layout.h
++++ b/src/layout/cute_layout.h
+@@ -7,6 +7,7 @@
+ #define TVM_TL_LAYOUT_CUTE_LAYOUT_H_
+ 
+ #include "support/check.h"
++#include "swizzle_mode.h"
+ #include <tvm/ffi/container/array.h>
+ #include <tvm/ffi/object.h>
+ #include <tvm/ffi/reflection/registry.h>
+@@ -76,6 +77,20 @@ class SwizzleNode : public Object {
+   // <b,4,3> this is the CUtensorMap swizzle size (32/64/128 B for b = 1/2/3).
+   int64_t Granularity() const { return int64_t(1) << (m_base + b_bits); }
+ 
++  /// The canonical swizzle mode supported by the hardware.
++  /// @pre this should be in byte-address space, so M=4 and S=3 if there is
++  /// swizzling present.
++  SwizzleMode ToSwizzleMode() const {
++    if (b_bits == 0) {
++      return SwizzleMode::None();
++    }
++    ICHECK(m_base == 4 && s_shift == 3 && b_bits >= 1 && b_bits <= 3)
++        << "Not a canonical GMMA swizzle atom Sw<" << b_bits << "," << m_base
++        << "," << s_shift << ">; expected Sw<{1,2,3},4,3>";
++    // b_bits 1->32B(ord 1), 2->64B(ord 2), 3->128B(ord 3).
++    return SwizzleMode::FromOrdinal(b_bits);
++  }
++
+   // Apply the swizzle to a physical offset: ZZZ ^= YYY.
+   int64_t Apply(int64_t offset) const;
+ };
+@@ -363,6 +378,9 @@ class Layout : public ObjectRef {
+   ///         is a tuple.
+   TVM_DLL IntTuple operator()(const IntTuple &coord) const;
+ 
++  // Compose with a column-major layout of this shape.
++  TVM_DLL Layout WithShape(const IntTuple &shape) const;
++
+   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(Layout, ObjectRef, LayoutNode);
+ };
+ 
+@@ -403,6 +421,24 @@ TVM_DLL Layout Coalesce(const Layout &layout, int64_t max_extent);
+ /// Take a given number of modes from a layout.
+ TVM_DLL Layout Take(const Layout &layout, int64_t n);
+ 
++/// Drop stride-0 and size-1 modes, then coalesce.
++TVM_DLL Layout Filter(const Layout &layout);
++
++/// Codomain size of a layout.
++/// @post for all `0 <= i < size(layout)`, layout(i) < result.
++TVM_DLL IntTuple Cosize(const Layout &layout);
++
++/// Complement of a layout.
++TVM_DLL Layout Complement(const Layout &layout, int64_t cotarget);
++
++/// Complement against the layout's own cosize.
++TVM_DLL Layout Complement(const Layout &layout);
++
++/// Logical divide of `layout` by `tiler`.
++/// Splits each tiled mode into (tile, rest).
++/// @pre `tiler` and `Size(layout)` must be static.
++TVM_DLL Layout LogicalDivide(const Layout &layout, const Layout &tiler);
++
+ // Column major layout over `shape`.
+ template <typename Container>
+ inline Layout MakeColumnMajorLayout(const Container &shape) {
+@@ -456,6 +492,9 @@ TVM_DLL Layout MakeRowMajorLayout(const IntTuple &shape);
+ // Identity layout over `shape`: per-axis unit ScaledBases.
+ TVM_DLL Layout MakeIdentityLayout(const IntTuple &shape);
+ 
++// Concatenate layouts.
++TVM_DLL Layout MakeLayout(const Array<Layout> &layouts);
++
+ // A CuTe ComposedLayout of the form Swizzle o offset o Layout.
+ // Evaluating at x yields swizzle.apply(offset + layout(x)).
+ class ComposedLayoutNode : public Object {
+@@ -513,6 +552,12 @@ Optional<Layout> LayoutFromTileLang(const tvm::tl::Layout &layout);
+ Optional<ComposedLayout>
+ ComposedLayoutFromTileLang(const tvm::tl::Layout &layout);
+ 
++/// Restrict the layout to a sublayout defined by a region.
++/// @return result.sublayout(coords_in_region) + result.offset
++//            == layout(range.min + coords_in_region)
++Tuple<IntTuple, Layout> Restrict(const Layout &layout,
++                                 const Array<Range> &range);
++
+ } // namespace cute
+ } // namespace tl
+ } // namespace tvm
+diff --git a/src/layout/gemm_layouts.cc b/src/layout/gemm_layouts.cc
+index cdd37c195d..6f5ad01d46 100644
+--- a/src/layout/gemm_layouts.cc
++++ b/src/layout/gemm_layouts.cc
+@@ -966,7 +966,7 @@ Layout MakeTcgen05MmaSwizzledLayout(const Buffer &buffer, int continuity,
+ SwizzleMode DetectSwizzleMode(const Layout &layout, const Buffer &buffer) {
+   SwizzleShapeInfo info;
+   if (!TryGetSwizzleShapeInfo(buffer, &info)) {
+-    return SwizzleMode::kNone;
++    return SwizzleMode::None();
+   }
+   int vector_size = 128 / info.element_size;
+ 
+@@ -978,22 +978,22 @@ SwizzleMode DetectSwizzleMode(const Layout &layout, const Buffer &buffer) {
+   if (stride_ok &&
+       info.continuous % (static_cast<int64_t>(vector_size) * 2) == 0) {
+     if (StructuralEqual()(layout, MakeQuarterBankSwizzleLayout(buffer))) {
+-      return SwizzleMode::kQuarter;
++      return SwizzleMode::Swizzle32B();
+     }
+   }
+   if (stride_ok &&
+       info.continuous % (static_cast<int64_t>(vector_size) * 4) == 0) {
+     if (StructuralEqual()(layout, MakeHalfBankSwizzleLayout(buffer))) {
+-      return SwizzleMode::kHalf;
++      return SwizzleMode::Swizzle64B();
+     }
+   }
+   if (stride_ok &&
+       info.continuous % (static_cast<int64_t>(vector_size) * 8) == 0) {
+     if (StructuralEqual()(layout, MakeFullBankSwizzleLayout(buffer))) {
+-      return SwizzleMode::kFull;
++      return SwizzleMode::Swizzle128B();
+     }
+   }
+-  return SwizzleMode::kNone;
++  return SwizzleMode::None();
+ }
+ 
+ Optional<Layout> MergeSwizzleLayouts(const Layout &layout1,
+@@ -1007,23 +1007,22 @@ Optional<Layout> MergeSwizzleLayouts(const Layout &layout1,
+   SwizzleMode mode2 = DetectSwizzleMode(layout2, buffer);
+ 
+   // If either is not a swizzle layout, cannot merge
+-  if (mode1 == SwizzleMode::kNone || mode2 == SwizzleMode::kNone) {
++  if (mode1.IsNone() || mode2.IsNone()) {
+     return std::nullopt;
+   }
+ 
+-  // Take the smaller swizzle granularity (smaller enum value)
+-  SwizzleMode min_mode = std::min(mode1, mode2);
++  // Take the smaller swizzle granularity (smaller canonical ordinal)
++  SwizzleMode min_mode =
++      mode1.CanonicalOrdinal() <= mode2.CanonicalOrdinal() ? mode1 : mode2;
+ 
+-  switch (min_mode) {
+-  case SwizzleMode::kQuarter:
++  if (min_mode == SwizzleMode::Swizzle32B()) {
+     return MakeQuarterBankSwizzleLayout(buffer);
+-  case SwizzleMode::kHalf:
++  } else if (min_mode == SwizzleMode::Swizzle64B()) {
+     return MakeHalfBankSwizzleLayout(buffer);
+-  case SwizzleMode::kFull:
++  } else if (min_mode == SwizzleMode::Swizzle128B()) {
+     return MakeFullBankSwizzleLayout(buffer);
+-  default:
+-    return std::nullopt;
+   }
++  return std::nullopt;
+ }
+ 
+ } // namespace tl
+diff --git a/src/layout/layout.h b/src/layout/layout.h
+index e523f38381..8f07c22376 100644
+--- a/src/layout/layout.h
++++ b/src/layout/layout.h
+@@ -16,6 +16,7 @@
+ #include <tvm/tirx/buffer.h>
+ 
+ #include "support/check.h"
++#include "swizzle_mode.h"
+ 
+ namespace tvm {
+ namespace tl {
+@@ -295,37 +296,9 @@ Layout MakeFullBankSwizzleLayout(const tirx::Buffer &buffer);
+ Layout MakeHalfBankSwizzleLayout(const tirx::Buffer &buffer);
+ Layout MakeQuarterBankSwizzleLayout(const tirx::Buffer &buffer);
+ 
+-// Swizzle mode for shared memory layouts (nvidia only)
+-// Smaller enum value = smaller swizzle granularity
+-enum class SwizzleMode {
+-  kNone = 0,    // Not a swizzle layout (linear or padded)
+-  kQuarter = 1, // 32B swizzle (CU_TENSOR_MAP_SWIZZLE_32B)
+-  kHalf = 2,    // 64B swizzle (CU_TENSOR_MAP_SWIZZLE_64B)
+-  kFull = 3     // 128B swizzle (CU_TENSOR_MAP_SWIZZLE_128B)
+-};
+-
+ // Detect which swizzle mode a layout uses
+ SwizzleMode DetectSwizzleMode(const Layout &layout, const tirx::Buffer &buffer);
+ 
+-// Required shared-memory base alignment (in bytes) for a TMA/bulk-copy or
+-// MMA-descriptor operand with the given swizzle mode. The base must lie on a
+-// swizzle-pattern repeat boundary (swizzle byte width x 8 rows); otherwise the
+-// hardware applies the swizzle with a phase shift relative to the layout the
+-// compiler assumed, silently producing wrong data.
+-inline int SmemAlignmentForSwizzle(SwizzleMode mode) {
+-  switch (mode) {
+-  case SwizzleMode::kQuarter:
+-    return 256; // 32B swizzle
+-  case SwizzleMode::kHalf:
+-    return 512; // 64B swizzle
+-  case SwizzleMode::kFull:
+-    return 1024; // 128B swizzle
+-  case SwizzleMode::kNone:
+-  default:
+-    return 128; // bulk-copy base requirement for non-swizzled operands
+-  }
+-}
+-
+ // Merge two swizzle layouts by taking the smaller granularity
+ // Returns NullOpt if either layout is not a swizzle layout
+ ffi::Optional<Layout> MergeSwizzleLayouts(const Layout &layout1,
+diff --git a/src/layout/swizzle_mode.cc b/src/layout/swizzle_mode.cc
+new file mode 100644
+index 0000000000..27196c03ef
+--- /dev/null
++++ b/src/layout/swizzle_mode.cc
+@@ -0,0 +1,50 @@
++/*!
++ * \file swizzle_mode.cc
++ * \brief Registration and FFI surface for tl::SwizzleMode.
++ */
++
++#include "swizzle_mode.h"
++
++#include <tvm/ffi/reflection/accessor.h>
++#include <tvm/ffi/reflection/creator.h>
++#include <tvm/ffi/reflection/enum_def.h>
++#include <tvm/ffi/reflection/registry.h>
++
++namespace tvm {
++namespace tl {
++
++// Register the enum type and its variants. Declaration order fixes the dense
++// ordinals (0..3), which equal the CU_TENSOR_MAP_SWIZZLE_* values.
++TVM_FFI_STATIC_INIT_BLOCK() {
++  namespace refl = tvm::ffi::reflection;
++  // EnumObj subclasses have no __ffi_init__; allocate via init(false).
++  refl::ObjectDef<SwizzleModeObj>(
++      refl::init(false)); // NOLINT(bugprone-unused-raii)
++  refl::TypeAttrDef<SwizzleModeObj>().def(
++      refl::type_attr::kConvert,
++      &refl::details::FFIConvertFromAnyViewToObjectRef<SwizzleMode>);
++  refl::EnumDef<SwizzleModeObj>("NONE");         // ordinal 0
++  refl::EnumDef<SwizzleModeObj>("SWIZZLE_32B");  // ordinal 1
++  refl::EnumDef<SwizzleModeObj>("SWIZZLE_64B");  // ordinal 2
++  refl::EnumDef<SwizzleModeObj>("SWIZZLE_128B"); // ordinal 3
++}
++
++// Projection helpers exposed to Python so the descriptor-field encodings live
++// in exactly one place (here).
++TVM_FFI_STATIC_INIT_BLOCK() {
++  namespace refl = tvm::ffi::reflection;
++  refl::GlobalDef()
++      .def("tl.swizzle_mode_wgmma_layout_type",
++           [](const SwizzleMode &m) { return m.WgmmaLayoutType(); })
++      .def("tl.swizzle_mode_tcgen05_layout_type",
++           [](const SwizzleMode &m) { return m.Tcgen05LayoutType(); })
++      .def("tl.swizzle_mode_byte_width",
++           [](const SwizzleMode &m) { return m.ByteWidth(); })
++      .def("tl.swizzle_mode_smem_alignment",
++           [](const SwizzleMode &m) { return m.SmemAlignment(); })
++      .def("tl.swizzle_mode_from_ordinal",
++           [](int64_t ordinal) { return SwizzleMode::FromOrdinal(ordinal); });
++}
++
++} // namespace tl
++} // namespace tvm
+diff --git a/src/layout/swizzle_mode.h b/src/layout/swizzle_mode.h
+new file mode 100644
+index 0000000000..61ad461c6e
+--- /dev/null
++++ b/src/layout/swizzle_mode.h
+@@ -0,0 +1,100 @@
++/*!
++ * \file swizzle_mode.h
++ * \brief Shared memory swizzle mode.
++ */
++
++#ifndef TVM_TL_LAYOUT_SWIZZLE_MODE_H_
++#define TVM_TL_LAYOUT_SWIZZLE_MODE_H_
++
++#include <tvm/ffi/cast.h>
++#include <tvm/ffi/enum.h>
++#include <tvm/ffi/object.h>
++#include <tvm/runtime/logging.h>
++
++#include "support/check.h"
++
++namespace tvm {
++namespace tl {
++
++// A swizzle mode enum, in TVM FFI convention.
++class SwizzleModeObj : public ffi::EnumObj {
++public:
++  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.SwizzleMode", SwizzleModeObj,
++                                    ffi::EnumObj);
++};
++
++class SwizzleMode : public ffi::Enum {
++public:
++  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(SwizzleMode, ffi::Enum,
++                                             SwizzleModeObj);
++
++  static SwizzleMode None() { return Get("NONE"); }
++  static SwizzleMode Swizzle32B() { return Get("SWIZZLE_32B"); }
++  static SwizzleMode Swizzle64B() { return Get("SWIZZLE_64B"); }
++  static SwizzleMode Swizzle128B() { return Get("SWIZZLE_128B"); }
++
++  // Convert from CU_TENSOR_MAP_SWIZZLE_* values.
++  static SwizzleMode FromOrdinal(int64_t ordinal) {
++    switch (ordinal) {
++    case 0:
++      return None();
++    case 1:
++      return Swizzle32B();
++    case 2:
++      return Swizzle64B();
++    case 3:
++      return Swizzle128B();
++    default:
++      LOG(FATAL) << "Invalid SwizzleMode ordinal: " << ordinal;
++      return None();
++    }
++  }
++
++  // Convert to CU_TENSOR_MAP_SWIZZLE_* values.
++  int CanonicalOrdinal() const {
++    return static_cast<int>(operator->()->_value);
++  }
++
++  bool IsNone() const { return CanonicalOrdinal() == 0; }
++
++  // GMMA descriptor layout type field: none->0, 32B->3, 64B->2, 128B->1.
++  int WgmmaLayoutType() const {
++    int o = CanonicalOrdinal();
++    return o == 0 ? 0 : 4 - o;
++  }
++
++  // UTCMMA descriptor swizzle field: none->0, 32B->6, 64B->4, 128B->2.
++  int Tcgen05LayoutType() const {
++    int o = CanonicalOrdinal();
++    return o == 0 ? 0 : 2 * (4 - o);
++  }
++
++  // Swizzle size in bytes: none->1, 32B->32, 64B->64, 128B->128.
++  int ByteWidth() const {
++    int o = CanonicalOrdinal();
++    return o == 0 ? 1 : (16 << o);
++  }
++
++  // Required shared-memory base alignment (bytes): the base must lie on a
++  // swizzle-pattern repeat boundary (swizzle byte width x 8 rows) or the
++  // hardware applies the swizzle with a phase shift -> silently wrong data.
++  // none->128 (bulk-copy base requirement), 32B->256, 64B->512, 128B->1024.
++  int SmemAlignment() const {
++    int o = CanonicalOrdinal();
++    return 128 << o;
++  }
++
++private:
++  static SwizzleMode Get(const ffi::String &name) {
++    ffi::Enum e = ffi::EnumObj::Get<SwizzleModeObj>(name);
++    const auto *node = e.as<SwizzleModeObj>();
++    ICHECK(node != nullptr)
++        << "SwizzleMode entry `" << name << "` is not a SwizzleModeObj";
++    return ffi::GetRef<SwizzleMode>(node);
++  }
++};
++
++} // namespace tl
++} // namespace tvm
++
++#endif // TVM_TL_LAYOUT_SWIZZLE_MODE_H_
+diff --git a/src/op/gemm.cc b/src/op/gemm.cc
+index e73d44207f..b1438ab1bc 100644
+--- a/src/op/gemm.cc
++++ b/src/op/gemm.cc
+@@ -102,8 +102,8 @@ Gemm::Gemm(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
+   node->clearAccum_ = args[9].as<PrimExpr>().value();
+   node->strideA_ = args[10].as<IntImm>().value()->value;
+   node->strideB_ = args[11].as<IntImm>().value()->value;
+-  node->offsetA_ = args[12].as<IntImm>().value()->value;
+-  node->offsetB_ = args[13].as<IntImm>().value()->value;
++  node->offsetA_ = args[12].as<PrimExpr>().value();
++  node->offsetB_ = args[13].as<PrimExpr>().value();
+   if (args.size() > 14) {
+     node->kPack_ = args[14].as<IntImm>().value()->value;
+     if (node->kPack_ != 1 && node->kPack_ != 2) {
+diff --git a/src/op/gemm.h b/src/op/gemm.h
+index 772640f27a..bc968b9914 100644
+--- a/src/op/gemm.h
++++ b/src/op/gemm.h
+@@ -108,7 +108,8 @@ class GemmNode : public TileOperatorNode {
+   bool transA_, transB_;
+   int m_, n_, k_;
+   int strideA_, strideB_;
+-  int offsetA_, offsetB_;
++  // Offsets may be symbolic (e.g. a sliced operand B[:, j*64:...] in a loop).
++  PrimExpr offsetA_, offsetB_;
+   PrimExpr clearAccum_ = const_false();
+   tirx::BufferLoad mbar_; // mbar is optional, only used for TCGEN5MMA
+   Array<PrimExpr> cCoords_;
+diff --git a/src/tl_templates/cuda/common.h b/src/tl_templates/cuda/common.h
+index b28a907cb1..7a6c620e50 100644
+--- a/src/tl_templates/cuda/common.h
++++ b/src/tl_templates/cuda/common.h
+@@ -647,6 +647,12 @@ TL_DEVICE void increase_descriptor_offset(GmmaDescriptor &descriptor,
+   descriptor.reg32_[0] += (offset >> 4);
+ }
+ 
++template <typename T>
++TL_DEVICE void increase_descriptor_offset(Tcgen05SMemDescriptor &descriptor,
++                                          T offset) {
++  descriptor.reg32_[0] += (offset >> 4);
++}
++
+ // and add the desired implicit conversion from bfloat16_t.
+ struct float_e4m3_t : public cute::float_e4m3_t {
+   using cute::float_e4m3_t::float_e4m3_t;
+diff --git a/testing/python/language/test_tilelang_language_tcgen05_gemm.py b/testing/python/language/test_tilelang_language_tcgen05_gemm.py
+index cd2b2ed82f..ac760a2780 100644
+--- a/testing/python/language/test_tilelang_language_tcgen05_gemm.py
++++ b/testing/python/language/test_tilelang_language_tcgen05_gemm.py
+@@ -118,3 +118,75 @@ def main(
+         match=r"T\.tcgen05_gemm\(\) requires Blackwell TCGEN5MMA lowering",
+     ):
+         tilelang.compile(main, target="cuda")
++
++
++def _make_sliced_tcgen05_kernel(M, N, K, num_k_tiles):
++    k_tile = K // num_k_tiles
++
++    @T.prim_func
++    def main(
++        A: T.Tensor((M, K), T.bfloat16),
++        B: T.Tensor((N, K), T.bfloat16),
++        D: T.Tensor((M, N), T.bfloat16),
++    ):
++        with T.Kernel(1, threads=128):
++            A_shared = T.alloc_shared((M, K), T.bfloat16)
++            B_shared = T.alloc_shared((N, K), T.bfloat16)
++            C_tmem = T.alloc_tmem((M, N), T.float32)
++            mbar = T.alloc_barrier(1)
++            C_local = T.alloc_fragment((M, N), T.float32)
++            C_shared = T.alloc_shared((M, N), T.bfloat16)
++
++            T.copy(A, A_shared)
++            T.copy(B, B_shared)
++            T.clear(C_local)
++            for j in T.serial(num_k_tiles):
++                T.tcgen05_gemm(
++                    A_shared[:, j * k_tile : (j + 1) * k_tile],
++                    B_shared[:, j * k_tile : (j + 1) * k_tile],
++                    C_tmem,
++                    transpose_B=True,
++                    mbar=mbar,
++                    clear_accum=(j == 0),
++                )
++                T.mbarrier_wait_parity(mbar, j % 2)
++            T.copy(C_tmem, C_local)
++            T.copy(C_local, C_shared)
++            T.copy(C_shared, D)
++
++    return main
++
++
++@tilelang.testing.requires_cuda
++@tilelang.testing.requires_cuda_compute_version(10)
++@tilelang.testing.requires_cuda_compute_version_lt(11)
++def test_tcgen05_gemm_sliced_operand_emits_offset():
++    # A sliced (non-zero-origin) UMMA operand must build the descriptor from the
++    # buffer base and advance it with increase_descriptor_offset (warp-uniform),
++    # mirroring the WGMMA path.
++    kernel = tilelang.compile(_make_sliced_tcgen05_kernel(128, 128, 128, 2), target="cuda")
++    src = kernel.get_kernel_source()
++    assert "increase_descriptor_offset" in src
++
++
++@tilelang.testing.requires_cuda
++@tilelang.testing.requires_cuda_compute_version(10)
++@tilelang.testing.requires_cuda_compute_version_lt(11)
++@pytest.mark.parametrize(
++    "M,N,K,num_k_tiles",
++    [
++        (128, 128, 128, 2),
++        (128, 128, 256, 4),
++        (128, 256, 128, 2),
++    ],
++)
++def test_tcgen05_gemm_sliced_operand_correctness(M, N, K, num_k_tiles):
++    import torch
++
++    kernel = tilelang.compile(_make_sliced_tcgen05_kernel(M, N, K, num_k_tiles), target="cuda")
++    a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
++    b = torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
++    d = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
++    kernel(a, b, d)
++    ref = (a.float() @ b.float().t()).to(torch.bfloat16)
++    torch.testing.assert_close(d, ref, rtol=1e-2, atol=1e-2)
+diff --git a/testing/python/language/test_tilelang_language_wgmma_gemm.py b/testing/python/language/test_tilelang_language_wgmma_gemm.py
+index 4f5c573837..e7e8c1f961 100644
+--- a/testing/python/language/test_tilelang_language_wgmma_gemm.py
++++ b/testing/python/language/test_tilelang_language_wgmma_gemm.py
+@@ -4,6 +4,53 @@
+ import tilelang.language as T
+ import tilelang.testing
+ from tilelang import tvm
++from tvm import tirx
++from tilelang.layout import SwizzleMode
++from tilelang.layout.swizzle import (
++    make_full_bank_swizzled_layout,
++    make_half_bank_swizzled_layout,
++    make_quarter_bank_swizzled_layout,
++)
++from tilelang.cuda.intrinsics.macro.wgmma_macro_generator import compute_gmma_descriptor
++
++
++@pytest.mark.parametrize(
++    "maker,mode,wgmma_field,sbo",
++    [
++        (make_full_bank_swizzled_layout, SwizzleMode.SWIZZLE_128B, 1, 64),
++        (make_half_bank_swizzled_layout, SwizzleMode.SWIZZLE_64B, 2, 32),
++        (make_quarter_bank_swizzled_layout, SwizzleMode.SWIZZLE_32B, 3, 16),
++    ],
++)
++@pytest.mark.parametrize("n_dim,k_dim", [(64, 64), (64, 256), (128, 64), (64, 512)])
++def test_compute_gmma_descriptor_k_major(maker, mode, wgmma_field, sbo, n_dim, k_dim):
++    buf = tirx.decl_buffer((n_dim, k_dim), "float16", name="B", scope="shared")
++    p = compute_gmma_descriptor(maker(buf), buf, transposed=False)
++    assert p.swizzle_mode == mode
++    assert p.swizzle_mode.wgmma_layout_type() == wgmma_field
++    assert p.leading_byte_offset == 1
++    assert p.stride_byte_offset == sbo
++
++
++@pytest.mark.parametrize("k_dim,n_dim", [(64, 128), (64, 256), (64, 64)])
++def test_compute_gmma_descriptor_mn_major_128b(k_dim, n_dim):
++    buf = tirx.decl_buffer((k_dim, n_dim), "float16", name="B", scope="shared")
++    p = compute_gmma_descriptor(make_full_bank_swizzled_layout(buf), buf, transposed=True)
++    assert p.swizzle_mode == SwizzleMode.SWIZZLE_128B
++    assert p.stride_byte_offset == 64
++    # LBO is 0 for a single MN atom (n_dim == atom), else the multi-atom step.
++    assert p.leading_byte_offset in (0, 512)
++
++
++def test_compute_gmma_descriptor_same_layout_both_majors():
++    # FlashMLA KV_shared [block_N, h_dim] (128B swizzle) must analyze as BOTH a
++    # K-major operand (QK) and an MN-major operand (PV) -- the same physical bytes.
++    buf = tirx.decl_buffer((64, 256), "float16", name="KV", scope="shared")
++    lay = make_full_bank_swizzled_layout(buf)
++    pk = compute_gmma_descriptor(lay, buf, transposed=False)
++    pmn = compute_gmma_descriptor(lay, buf, transposed=True)
++    assert pk.leading_byte_offset == 1 and pk.stride_byte_offset == 64
++    assert pmn.swizzle_mode == SwizzleMode.SWIZZLE_128B
+ 
+ 
+ def _make_wgmma_kernel(gemm_op):
+@@ -76,3 +123,67 @@ def main(
+         match=r"T\.wgmma_gemm\(\) requires Hopper WGMMA lowering",
+     ):
+         tilelang.compile(main, target="cuda")
++
++
++def _make_sliced_wgmma_kernel(M, N, K, num_k_tiles):
++    k_tile = K // num_k_tiles
++
++    @T.prim_func
++    def main(
++        A: T.Tensor((M, K), T.float16),
++        B: T.Tensor((N, K), T.float16),
++        D: T.Tensor((M, N), T.float16),
++    ):
++        with T.Kernel(1, threads=128):
++            A_shared = T.alloc_shared((M, K), T.float16)
++            B_shared = T.alloc_shared((N, K), T.float16)
++            C_local = T.alloc_fragment((M, N), T.float32)
++
++            T.copy(A, A_shared)
++            T.copy(B, B_shared)
++            T.clear(C_local)
++            for j in T.serial(num_k_tiles):
++                T.wgmma_gemm(
++                    A_shared[:, j * k_tile : (j + 1) * k_tile],
++                    B_shared[:, j * k_tile : (j + 1) * k_tile],
++                    C_local,
++                    transpose_B=True,
++                )
++            T.wait_wgmma(0)
++            T.copy(C_local, D)
++
++    return main
++
++
++@tilelang.testing.requires_cuda
++@tilelang.testing.requires_cuda_compute_version_eq(9, 0)
++def test_wgmma_gemm_sliced_operand_emits_offset():
++    # A sliced (non-zero-origin) operand must build the descriptor from the buffer
++    # base and advance it with increase_descriptor_offset.
++    kernel = tilelang.compile(_make_sliced_wgmma_kernel(64, 64, 64, 4), target="cuda")
++    src = kernel.get_kernel_source()
++    assert "increase_descriptor_offset" in src
++
++
++@tilelang.testing.requires_cuda
++@tilelang.testing.requires_cuda_compute_version_eq(9, 0)
++@pytest.mark.parametrize(
++    "M,N,K,num_k_tiles",
++    [
++        (64, 64, 64, 4),
++        (64, 64, 128, 4),
++        (64, 64, 256, 8),
++        (128, 64, 64, 2),
++        (64, 128, 64, 2),
++    ],
++)
++def test_wgmma_gemm_sliced_operand_correctness(M, N, K, num_k_tiles):
++    import torch
++
++    kernel = tilelang.compile(_make_sliced_wgmma_kernel(M, N, K, num_k_tiles), target="cuda")
++    a = torch.randn(M, K, device="cuda", dtype=torch.float16)
++    b = torch.randn(N, K, device="cuda", dtype=torch.float16)
++    d = torch.empty(M, N, device="cuda", dtype=torch.float16)
++    kernel(a, b, d)
++    ref = (a.float() @ b.float().t()).half()
++    torch.testing.assert_close(d, ref, rtol=1e-2, atol=1e-2)
+diff --git a/testing/python/layout/test_tilelang_cute.py b/testing/python/layout/test_tilelang_cute.py
+index b3c9d2ce0d..f51ed127a5 100644
+--- a/testing/python/layout/test_tilelang_cute.py
++++ b/testing/python/layout/test_tilelang_cute.py
+@@ -54,6 +54,19 @@ def forward(*vars):
+     return Layout(shape, forward)
+ 
+ 
++# ---------------------------------------------------------------------------
++# to_python / from_python: round-trip nested shapes; a layout exposes its
++# shape/stride as raw IntTuples.
++# ---------------------------------------------------------------------------
++def test_from_python_roundtrips_to_python():
++    # from_python is the inverse of to_python for nested shapes.
++    assert cute.to_python(cute.from_python([2, (3, 4)])) == (2, (3, 4))
++    # A layout exposes its shape/stride as raw IntTuples for algebra.
++    L = cute.make_layout((2, 3))
++    assert L.shape == (2, 3)
++    assert L.stride == (1, 2)
++
++
+ # ---------------------------------------------------------------------------
+ # IntTuple: construction, unpacking, and CuTe arithmetic (operator + / *).
+ # ---------------------------------------------------------------------------
+@@ -81,57 +94,34 @@ def test_int_tuple_scaled_basis_arithmetic():
+     assert cute.to_python(spread) == (1, 1)  # 1@0 + 1@1 -> (1)+(0,1) -> (1,1)
+ 
+ 
+-def test_from_python_roundtrips_to_python():
+-    # from_python is the inverse of to_python for nested shapes.
+-    assert cute.to_python(cute.from_python([2, (3, 4)])) == (2, (3, 4))
+-    # A layout exposes its shape/stride as raw IntTuples for algebra.
+-    L = cute.make_layout((2, 3))
+-    assert L.shape == (2, 3)
+-    assert L.stride == (1, 2)
+-
+-
+ # ---------------------------------------------------------------------------
+-# make_layout / make_identity_layout / accessors:
+-# rank, size, layout[idx], layout(coord), flatten, flatten_to_tuple.
++# product / flatten_to_tuple: leaf product of a raw shape; collapse a
++# hierarchical shape/stride to a flat tuple of leaves.
+ # ---------------------------------------------------------------------------
+-def test_make_layout_default_stride_is_column_major():
+-    # Omitting stride yields the compact column-major stride (mode 0 fastest).
+-    assert tvm.ir.structural_equal(cute.make_layout((4, 8)), cute.make_column_major_layout((4, 8)))
+-    _assert_struct(cute.make_layout((4, 8)), (4, 8), (1, 4))
+-
+-
+-def test_make_identity_layout_strides_are_unit_basis():
+-    # Each identity stride is the unit basis E<k>.
+-    L = cute.make_layout((4, 4), stride=(cute.E(0), cute.E(1)))
+-    assert tvm.ir.structural_equal(L, cute.make_identity_layout((4, 4)))
+-    for k, s in enumerate(L.stride):
+-        assert isinstance(s, cute.ScaledBasis) and s.value == 1 and s.mode == (k,)
+-
+-
+-def test_make_layout_nested_column_row_identity():
+-    # Column/row-major and identity over a nested shape produce congruent nested
+-    # strides (CuTe compact_col_major / compact_row_major / make_identity_layout).
+-    assert tvm.ir.structural_equal(cute.make_column_major_layout((2, (2, 2))), cute.make_layout((2, (2, 2)), stride=(1, (2, 4))))
+-    assert tvm.ir.structural_equal(cute.make_row_major_layout((2, (2, 2))), cute.make_layout((2, (2, 2)), stride=(4, (2, 1))))
+-    # Identity maps each linear coord to its full nested idx2crd coordinate.
+-    I = cute.make_identity_layout((2, (2, 2)))
+-    assert I.shape == (2, (2, 2))
+-    assert [I(c) for c in range(8)] == [(c % 2, (c // 2 % 2, c // 4)) for c in range(8)]
+-    # Dynamic extents thread through the makers.
++def test_size_and_product():
++    # size() is the domain of a Layout / ComposedLayout; product() is the leaf
++    # product of a raw shape (flat, nested, or a scalar).
++    assert cute.size(cute.make_layout((4, 8))) == 32
++    assert cute.product((4, 8)) == 32
++    assert cute.product((2, (2, 2))) == 8
++    assert cute.product(5) == 5
++    # Both thread PrimExprs for dynamic extents.
+     n = tvm.tirx.Var("n", "int32")
+-    assert tvm.ir.structural_equal(cute.make_column_major_layout((n, 4)), cute.make_layout((n, 4), stride=(1, n)))
++    assert tvm.ir.structural_equal(cute.product((n, 4)), n * 4)
++    assert tvm.ir.structural_equal(cute.size(cute.make_layout((n, 4), stride=(1, n))), n * 4)
+ 
+ 
+-def test_scaled_basis_and_int_expr_strides():
+-    # A non-unit ScaledBasis stride round-trips its scale and mode.
+-    (sb,) = cute.make_layout((2,), stride=(cute.ScaledBasis(64, 1),)).stride
+-    assert isinstance(sb, cute.ScaledBasis) and sb.value == 64 and sb.mode == (1,)
+-    # A dynamic (PrimExpr) stride round-trips structurally.
+-    s = tvm.tirx.Var("s", "int32")
+-    (leaf,) = cute.make_layout((8,), stride=(s,)).stride
+-    assert tvm.ir.structural_equal(leaf, s)
++def test_flatten_to_tuple_collapses_hierarchy():
++    # A hierarchical composition result flattens to a flat tuple of leaves.
++    R = cute.composition(cute.make_layout((8, 8), stride=(8, 1)), cute.make_layout((2, 4), stride=(1, 4)))
++    assert cute.flatten_to_tuple(R.shape) == tuple(int(s) for s in cute.flatten(R).shape)
++    assert len(cute.flatten_to_tuple(R.shape)) == len(cute.flatten_to_tuple(R.stride))
+ 
+ 
++# ---------------------------------------------------------------------------
++# Layout: rank / size / layout[idx] / flatten, layout(coord) evaluation,
++# with_shape, and from_tilelang (recover a plain affine layout, else None).
++# ---------------------------------------------------------------------------
+ def test_rank_size_getitem_flatten():
+     L = cute.make_layout((4, 8), stride=(8, 1))
+     assert cute.rank(L) == 2 and cute.size(L) == 32
+@@ -142,19 +132,6 @@ def test_rank_size_getitem_flatten():
+     assert tvm.ir.structural_equal(cute.flatten(L), L)
+ 
+ 
+-def test_size_and_product():
+-    # size() is the domain of a Layout / ComposedLayout; product() is the leaf
+-    # product of a raw shape (flat, nested, or a scalar).
+-    assert cute.size(cute.make_layout((4, 8))) == 32
+-    assert cute.product((4, 8)) == 32
+-    assert cute.product((2, (2, 2))) == 8
+-    assert cute.product(5) == 5
+-    # Both thread PrimExprs for dynamic extents.
+-    n = tvm.tirx.Var("n", "int32")
+-    assert tvm.ir.structural_equal(cute.product((n, 4)), n * 4)
+-    assert tvm.ir.structural_equal(cute.size(cute.make_layout((n, 4), stride=(1, n))), n * 4)
+-
+-
+ def test_eval_plain_is_scalar():
+     # layout(coord): idx2crd (mode 0 fastest) dotted with the strides.
+     L = cute.make_layout((4, 8), stride=(8, 1))
+@@ -200,11 +177,26 @@ def test_eval_basis_is_coordinate_tuple():
+     assert all(same(c) == (c,) for c in range(4))
+ 
+ 
+-def test_flatten_to_tuple_collapses_hierarchy():
+-    # A hierarchical composition result flattens to a flat tuple of leaves.
+-    R = cute.composition(cute.make_layout((8, 8), stride=(8, 1)), cute.make_layout((2, 4), stride=(1, 4)))
+-    assert cute.flatten_to_tuple(R.shape) == tuple(int(s) for s in cute.flatten(R).shape)
+-    assert len(cute.flatten_to_tuple(R.shape)) == len(cute.flatten_to_tuple(R.stride))
++def test_with_shape_splits_contiguous_run():
++    # A flat layout reinterpreted over a 2D shape: (8):(1) with_shape (2,4) ->
++    # the column-major linearization keeps function identity.
++    L = cute.make_layout(8, stride=1)
++    r = L.with_shape((2, 4))
++    assert r.shape == (2, 4)
++    for c0 in range(2):
++        for c1 in range(4):
++            assert r((c0, c1)) == L(c0 + 2 * c1)
++
++
++def test_layout_from_tilelang_affine():
++    L = cute.Layout.from_tilelang(Layout((16, 128), lambda i, j: i * 128 + j))
++    assert L is not None
++    _assert_struct(L, (16, 128), (128, 1))
++
++
++def test_layout_from_tilelang_rejects_swizzle():
++    swz = _build_swizzled_layout((64, 512), lambda i, j: i * 512 + j, 3, 3, 3)
++    assert cute.Layout.from_tilelang(swz) is None
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -236,10 +228,11 @@ def test_coalesce_preserves_function(shape, stride):
+ 
+ def test_coalesce_structural_results():
+     # Contiguous bit-modes fuse to one; non-contiguous stay split; a fully
+-    # size-1 layout collapses to the scalar (1):(0).
+-    _assert_struct(cute.coalesce(cute.make_layout((2, 2, 2, 2, 2), stride=(1, 2, 4, 8, 16))), (32,), (1,))
++    # size-1 layout collapses to the scalar 1:0. A single surviving mode is
++    # scalar-shaped (CuTe bw_coalesce returns Layout<NewShape,NewStride>).
++    _assert_struct(cute.coalesce(cute.make_layout((2, 2, 2, 2, 2), stride=(1, 2, 4, 8, 16))), 32, 1)
+     _assert_struct(cute.coalesce(cute.make_layout((8, 8), stride=(64, 1))), (8, 8), (64, 1))
+-    _assert_struct(cute.coalesce(cute.make_layout((1, 1), stride=(5, 7))), (1,), (0,))
++    _assert_struct(cute.coalesce(cute.make_layout((1, 1), stride=(5, 7))), 1, 0)
+     # A nested layout flattens, then fuses the contiguous (2,2):(1,4) prefix into
+     # one mode while the gapped last mode stays split (CuTe pycute coalesce).
+     _assert_struct(cute.coalesce(cute.make_layout(((2, 2), (2, 2)), stride=((1, 4), (8, 32)))), (2, 4, 2), (1, 4, 32))
+@@ -390,18 +383,167 @@ def test_tma_box_validity_via_composite():
+ 
+ 
+ # ---------------------------------------------------------------------------
+-# Layout.from_tilelang: recover a plain affine layout (no swizzle, zero offset),
+-# else None.
++# Layout algebra ported from CuTe for the GMMA descriptor analysis:
++# filter / cosize / complement / logical_divide. Reference values computed by
++# hand from CuTe (layout.hpp): complement sort-and-fold, logical_divide =
++# composition(layout, make_layout(tiler, complement(tiler, size(coalesce)))).
+ # ---------------------------------------------------------------------------
+-def test_layout_from_tilelang_affine():
+-    L = cute.Layout.from_tilelang(Layout((16, 128), lambda i, j: i * 128 + j))
+-    assert L is not None
+-    _assert_struct(L, (16, 128), (128, 1))
++def test_filter_drops_trivial_modes():
++    # filter = coalesce(filter_zeros): drop stride-0 and size-1 modes.
++    _assert_struct(cute.filter(cute.make_layout((4, 1, 2), stride=(1, 0, 8))), (4, 2), (1, 8))
++    _assert_struct(cute.filter(cute.make_layout((1, 1), stride=(5, 7))), 1, 0)
+ 
+ 
+-def test_layout_from_tilelang_rejects_swizzle():
+-    swz = _build_swizzled_layout((64, 512), lambda i, j: i * 512 + j, 3, 3, 3)
+-    assert cute.Layout.from_tilelang(swz) is None
++def test_filter_keeps_dynamic_modes():
++    s = tvm.tirx.Var("s", "int32")
++    # A const-0 stride mode is dropped; the dynamic-stride mode survives.
++    _assert_struct(cute.filter(cute.make_layout((4, 1, 8), stride=(s, 0, 1))), (4, 8), (s, 1))
++
++
++def test_cosize_matches_cute():
++    # cosize = 1 + sum_i (shape_i - 1) * |stride_i|.
++    assert cute.cosize(cute.make_layout((4, 2), stride=(1, 8))) == 12
++    assert cute.cosize(cute.make_layout((8, 8), stride=(8, 1))) == 64
++    assert cute.cosize(cute.make_layout((64, 8), stride=(8, 1))) == 512
++
++
++def test_cosize_dynamic_is_symbolic():
++    s = tvm.tirx.Var("s", "int32")
++    # cosize = 1 + (4-1)*|s| + (8-1)*1 = 3*|s| + 8 ; stays a PrimExpr, and the
++    # |stride| term emits CuTe's abs(stride). Check by substituting s.
++    got = cute.cosize(cute.make_layout((4, 8), stride=(s, 1)))
++    assert isinstance(got, tirx.PrimExpr)
++    ana = tvm.arith.Analyzer()
++    for sv, expect in [(5, 3 * 5 + 8), (-5, 3 * 5 + 8)]:
++        sub = tvm.tirx.stmt_functor.substitute(got, {s: tvm.tirx.const(sv, "int32")})
++        assert int(ana.simplify(sub)) == expect
++
++
++def test_complement_matches_cute():
++    # complement(layout, cotarget): the gaps the layout does not address.
++    _assert_same_fn(cute.complement(cute.make_layout(2, stride=1), 16), cute.make_layout(8, stride=2))
++    # 4:1 within 24 -> rest is 6:4.
++    _assert_same_fn(cute.complement(cute.make_layout(4, stride=1), 24), cute.make_layout(6, stride=4))
++    # Structural: a single surviving mode is SCALAR-shaped (CuTe bw_coalesce
++    # returns Layout<NewShape,NewStride>, not a 1-tuple).
++    _assert_struct(cute.complement(cute.make_layout(2, stride=1), 16), 8, 2)
++    _assert_struct(cute.complement(cute.make_layout(4, stride=1), 24), 6, 4)
++
++
++def test_complement_rank1_dynamic():
++    s = tvm.tirx.Var("s", "int32")
++    # complement((4):(s), 1024) = coalesce((s, ceil_div(1024, 4s)):(1, 4s)).
++    comp = cute.complement(cute.make_layout(4, stride=s), 1024)
++    assert comp.shape[0] == s and comp.stride[0] == 1
++    # rest stride = 4*s ; rest extent = ceil_div(1024, 4*s) (symbolic).
++    ana = tvm.arith.Analyzer()
++    assert ana.simplify(comp.stride[1] - 4 * s) == 0
++
++
++def test_complement_rank_gt1_dynamic_rejected():
++    s = tvm.tirx.Var("s", "int32")
++    # CuTe static_assert: dynamic-stride complement only for rank-1 layouts.
++    with pytest.raises(Exception, match="rank-1"):
++        cute.complement(cute.make_layout((4, 8), stride=(s, 1)), 1024)
++
++
++def test_logical_divide_matches_cute():
++    # logical_divide splits a mode into (tile, rest).
++    _assert_same_fn(
++        cute.logical_divide(cute.make_layout(8, stride=1), cute.make_layout(2, stride=1)), cute.make_layout((2, 4), stride=(1, 2))
++    )
++    _assert_same_fn(
++        cute.logical_divide(cute.make_layout(8, stride=1), cute.make_layout(8, stride=1)), cute.make_layout((8, 1), stride=(1, 0))
++    )
++    # Structural: the result is FLAT (tile, rest), congruent to (_1, _1) -- the
++    # complement's single mode is scalar, so no spurious nesting (mirrors CuTe).
++    _assert_struct(cute.logical_divide(cute.make_layout(8, stride=1), cute.make_layout(2, stride=1)), (2, 4), (1, 2))
++    _assert_struct(cute.logical_divide(cute.make_layout(8, stride=1), cute.make_layout(8, stride=1)), (8, 1), (1, 0))
++    # Strided base (GMMA MN mode 128:4 divided by the W=8 tile) stays flat.
++    _assert_struct(cute.logical_divide(cute.make_layout(128, stride=4), cute.make_layout(8, stride=1)), (8, 16), (4, 32))
++    assert cute.congruent(cute.logical_divide(cute.make_layout(128, stride=4), cute.make_layout(8, stride=1)).shape, (1, 1))
++
++
++def test_logical_divide_dynamic_layout_stride():
++    s = tvm.tirx.Var("s", "int32")
++    # Static shape (so size is concrete) but a dynamic stride: division still
++    # works because complement is on the (static) tiler and composition handles
++    # the dynamic layout stride. (8):(s) by (2):(1) -> (2, 4):(s, 2s).
++    res = cute.logical_divide(cute.make_layout(8, stride=s), cute.make_layout(2, stride=1))
++    ana = tvm.arith.Analyzer()
++    # Result is hierarchical: shape (2, (4,)), stride (s, (2s,)).
++    assert ana.simplify(res(0) - 0) == 0
++    assert ana.simplify(res(1) - s) == 0  # next tile element: stride s
++    assert ana.simplify(res(2) - 2 * s) == 0  # next rest element: stride 2s
++
++
++# ---------------------------------------------------------------------------
++# make_layout / make_column_major / make_row_major / make_identity_layout, and
++# the make_layout([layout, ...]) concat form.
++# ---------------------------------------------------------------------------
++def test_make_layout_default_stride_is_column_major():
++    # Omitting stride yields the compact column-major stride (mode 0 fastest).
++    assert tvm.ir.structural_equal(cute.make_layout((4, 8)), cute.make_column_major_layout((4, 8)))
++    _assert_struct(cute.make_layout((4, 8)), (4, 8), (1, 4))
++
++
++def test_make_identity_layout_strides_are_unit_basis():
++    # Each identity stride is the unit basis E<k>.
++    L = cute.make_layout((4, 4), stride=(cute.E(0), cute.E(1)))
++    assert tvm.ir.structural_equal(L, cute.make_identity_layout((4, 4)))
++    for k, s in enumerate(L.stride):
++        assert isinstance(s, cute.ScaledBasis) and s.value == 1 and s.mode == (k,)
++
++
++def test_make_layout_nested_column_row_identity():
++    # Column/row-major and identity over a nested shape produce congruent nested
++    # strides (CuTe compact_col_major / compact_row_major / make_identity_layout).
++    assert tvm.ir.structural_equal(cute.make_column_major_layout((2, (2, 2))), cute.make_layout((2, (2, 2)), stride=(1, (2, 4))))
++    assert tvm.ir.structural_equal(cute.make_row_major_layout((2, (2, 2))), cute.make_layout((2, (2, 2)), stride=(4, (2, 1))))
++    # Identity maps each linear coord to its full nested idx2crd coordinate.
++    I = cute.make_identity_layout((2, (2, 2)))
++    assert I.shape == (2, (2, 2))
++    assert [I(c) for c in range(8)] == [(c % 2, (c // 2 % 2, c // 4)) for c in range(8)]
++    # Dynamic extents thread through the makers.
++    n = tvm.tirx.Var("n", "int32")
++    assert tvm.ir.structural_equal(cute.make_column_major_layout((n, 4)), cute.make_layout((n, 4), stride=(1, n)))
++
++
++def test_scaled_basis_and_int_expr_strides():
++    # A non-unit ScaledBasis stride round-trips its scale and mode.
++    (sb,) = cute.make_layout((2,), stride=(cute.ScaledBasis(64, 1),)).stride
++    assert isinstance(sb, cute.ScaledBasis) and sb.value == 64 and sb.mode == (1,)
++    # A dynamic (PrimExpr) stride round-trips structurally.
++    s = tvm.tirx.Var("s", "int32")
++    (leaf,) = cute.make_layout((8,), stride=(s,)).stride
++    assert tvm.ir.structural_equal(leaf, s)
++
++
++def test_make_layout_concat():
++    a = cute.make_layout(64, stride=1)
++    b = cute.make_layout(4, stride=64)
++    cat = cute.make_layout([a, b])
++    assert cat.shape == (64, 4)
++    assert cat.stride == (1, 64)
++
++
++# ---------------------------------------------------------------------------
++# ComposedLayout.recast: shift m_base by log2(old) - log2(new); b_bits /
++# s_shift preserved (a linear layout recast is a no-op).
++# ---------------------------------------------------------------------------
++def test_recast_method():
++    # Recast shifts m_base by log2(old) - log2(new); b_bits / s_shift preserved.
++    mode = cute.ComposedLayout.from_tilelang(_build_swizzled_layout((64, 512), lambda i, j: (j % 64) + i * 64 + (j // 64) * 4096, 3, 3, 3))
++    assert _swizzle(mode) == (3, 3, 3)
++    assert _swizzle(mode.recast(16, 8)) == (3, 4, 3)  # smaller elem -> m_base += 1
++    assert _swizzle(mode.recast(32, 8)) == (3, 5, 3)  # m_base += 2
++    assert _swizzle(mode.recast(16, 16)) == (3, 3, 3)  # same width -> no-op
++
++
++def test_recast_linear_is_noop():
++    mode = cute.ComposedLayout.from_tilelang(Layout((16, 128), lambda i, j: i * 128 + j))
++    assert not mode.swizzle.is_swizzled
++    assert _swizzle(mode.recast(32, 8)) == (0, 0, 0)
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -493,21 +635,6 @@ def test_core_is_dtype_agnostic_and_buffer_recasts():
+     assert _swizzle(cute.ComposedLayout.from_tilelang(layout, buf)) == (3, 4, 3)
+ 
+ 
+-def test_recast_method():
+-    # Recast shifts m_base by log2(old) - log2(new); b_bits / s_shift preserved.
+-    mode = cute.ComposedLayout.from_tilelang(_build_swizzled_layout((64, 512), lambda i, j: (j % 64) + i * 64 + (j // 64) * 4096, 3, 3, 3))
+-    assert _swizzle(mode) == (3, 3, 3)
+-    assert _swizzle(mode.recast(16, 8)) == (3, 4, 3)  # smaller elem -> m_base += 1
+-    assert _swizzle(mode.recast(32, 8)) == (3, 5, 3)  # m_base += 2
+-    assert _swizzle(mode.recast(16, 16)) == (3, 3, 3)  # same width -> no-op
+-
+-
+-def test_recast_linear_is_noop():
+-    mode = cute.ComposedLayout.from_tilelang(Layout((16, 128), lambda i, j: i * 128 + j))
+-    assert not mode.swizzle.is_swizzled
+-    assert _swizzle(mode.recast(32, 8)) == (0, 0, 0)
+-
+-
+ @pytest.mark.parametrize("OFFSET", [4096, 5 * 4096, 8192 + 4096])
+ def test_swizzle_with_nonzero_base_offset(OFFSET):
+     # A swizzle over a high, disjoint base offset: the base is carried as the
+@@ -593,6 +720,17 @@ def test_non_constant_extent_rejected():
+         cute.ComposedLayout.from_tilelang(Layout((n, 8), lambda i, j: i * 8 + j))
+ 
+ 
++def test_decoder_preserves_input_shape():
++    # ComposedLayoutFromTileLang returns a layout congruent to the TileLang input
++    # shape (not a flat coalesced layout); a swizzle that splits the contiguous
++    # dim yields a hierarchical sub-mode.
++    buf = tirx.decl_buffer((64, 512), "float16", name="A", scope="shared")
++    mode = cute.ComposedLayout.from_tilelang(make_full_bank_swizzled_layout(buf), buf)
++    # Congruent to (64, 512): in byte space the 512-elem contiguous dim is 1024
++    # bytes, split by the 128B swizzle atom into (128, 8).
++    assert mode.layout.shape == (64, (128, 8))
++
++
+ # ---------------------------------------------------------------------------
+ # End-to-end TMA copy with an explicitly-written swizzled layout. The forward
+ # index gives the design's full-bank (128B) swizzle address:
+@@ -639,5 +777,60 @@ def copy_swizzled(X: T.Tensor((M, N), "float16"), ok: T.Tensor((M, N), "int32"))
+     assert int(ok.min()) == 1, f"{(ok == 0).sum().item()} shared elements mismatched"
+ 
+ 
++# ---------------------------------------------------------------------------
++# Restrict: affine sub-tile of a layout, one Range per top-level mode. The
++# offset is layout(mins); each mode is reshaped to its logical extent via
++# with_shape, so layout(mins + c) == offset + sublayout(c). A hierarchical
++# (swizzle-split) mode is flattened to the logical slice.
++# ---------------------------------------------------------------------------
++def test_restrict_static_slice():
++    from tvm.ir import Range
++
++    L = cute.make_layout((64, 256), (256, 1))
++    off, sub = cute.restrict(L, [Range.from_min_extent(0, 64), Range.from_min_extent(64, 64)])
++    assert off == 64
++    assert sub.shape == (64, 64)
++    assert sub.stride == (256, 1)
++    # Identity at an interior coordinate.
++    assert L((3, 64 + 5)) == off + sub((3, 5))
++
++
++def test_restrict_dynamic_slice_origin():
++    from tvm.ir import Range
++
++    j = tvm.tirx.Var("j", "int32")
++    L = cute.make_layout((64, 256), (256, 1))
++    off, sub = cute.restrict(L, [Range.from_min_extent(0, 64), Range.from_min_extent(j * 64, 64)])
++    ana = tvm.arith.Analyzer()
++    assert ana.simplify(off - j * 64) == 0
++    assert sub.shape == (64, 64)
++    # Identity holds symbolically.
++    assert ana.simplify(L((3, j * 64 + 5)) - (off + sub((3, 5)))) == 0
++
++
++def test_restrict_rank_mismatch_rejected():
++    from tvm.ir import Range
++
++    L = cute.make_layout((64, 256), (256, 1))
++    with pytest.raises(tvm.error.InternalError):
++        cute.restrict(L, [Range.from_min_extent(0, 64)])  # 1 range for a rank-2 layout
++
++
++def test_restrict_hierarchical_mode():
++    from tvm.ir import Range
++
++    # A hierarchical mode (a swizzle-split K dim, (64,4):(1,4096)) is addressed
++    # by a single logical Range; with_shape flattens it to the j-th 64-wide tile.
++    j = tvm.tirx.Var("j", "int32")
++    L = cute.make_layout((64, (64, 4)), (64, (1, 4096)))
++    off, sub = cute.restrict(L, [Range.from_min_extent(0, 64), Range.from_min_extent(j * 64, 64)])
++    ana = tvm.arith.Analyzer()
++    # Logical K-origin j*64 maps through the split layout to physical j*4096.
++    assert ana.simplify(off - j * 4096) == 0
++    assert sub.shape == (64, 64)
++    # Identity through the hierarchical layout.
++    assert ana.simplify(L((3, j * 64 + 5)) - (off + sub((3, 5)))) == 0
++
++
+ if __name__ == "__main__":
+     tilelang.testing.main()
+diff --git a/tilelang/cuda/intrinsics/macro/tcgen05_macro_generator.py b/tilelang/cuda/intrinsics/macro/tcgen05_macro_generator.py
+index 211d63f285..0205712a57 100644
+--- a/tilelang/cuda/intrinsics/macro/tcgen05_macro_generator.py
++++ b/tilelang/cuda/intrinsics/macro/tcgen05_macro_generator.py
+@@ -1,6 +1,5 @@
+ from __future__ import annotations
+ from dataclasses import dataclass
+-from enum import IntEnum
+ import tilelang.language as T
+ from .mma_macro_generator import TensorCoreIntrinEmitter as MMAIntrinEmitter
+ from tvm import DataType
+@@ -12,16 +11,21 @@
+ from tilelang.utils import is_tensor_memory
+ from tilelang.layout import (
+     Layout,
+-    make_full_bank_swizzled_layout,
+-    make_half_bank_swizzled_layout,
+-    make_quarter_bank_swizzled_layout,
+-    make_linear_layout,
++    SwizzleMode,
++    cute,
+ )
+ from tvm.runtime import convert
+ 
+ lift = convert
+ 
+ 
++def _min_leaf_stride(stride) -> int:
++    """Smallest leaf stride within a (possibly nested) stride tuple."""
++    if isinstance(stride, tuple):
++        return min(_min_leaf_stride(s) for s in stride)
++    return int(stride)
++
++
+ @dataclass(frozen=True)
+ class TCGEN05DescriptorParams:
+     """Pre-computed parameters for TCGEN05 descriptor initialization and atom offset computation.
+@@ -30,8 +34,8 @@ class TCGEN05DescriptorParams:
+     ``init_tcgen05_*_desc()`` and ``tcgen05_*_atom()`` methods.
+     """
+ 
+-    swizzle_mode: int
+-    """SwizzleMode enum value (passed directly to ``T.initialize_tcgen05_descriptor``)."""
++    swizzle_mode: SwizzleMode
++    """Canonical swizzle mode; project to the descriptor field via ``tcgen05_layout_type()``."""
+     leading_byte_offset: int
+     """LBO >> 4, ready to pass to ``T.initialize_tcgen05_descriptor``."""
+     stride_byte_offset: int
+@@ -44,46 +48,11 @@ class TCGEN05DescriptorParams:
+     """Bit width of a single logical element."""
+     is_k_major: bool
+     """Whether the matrix is stored in K-major order (affects offset formula branching)."""
+-
+-
+-class SwizzleMode(IntEnum):
+-    # SWIZZLE_NONE = 0, SWIZZLE_32B = 3, SWIZZLE_64B = 2, SWIZZLE_128B = 1
+-    NONE = 0
+-    SWIZZLE_128B = 2
+-    SWIZZLE_64B = 4
+-    SWIZZLE_32B = 6
+-
+-    def is_none(self) -> bool:
+-        return self == SwizzleMode.NONE
+-
+-    def is_swizzle_32b(self) -> bool:
+-        return self == SwizzleMode.SWIZZLE_32B
+-
+-    def is_swizzle_64b(self) -> bool:
+-        return self == SwizzleMode.SWIZZLE_64B
+-
+-    def is_swizzle_128b(self) -> bool:
+-        return self == SwizzleMode.SWIZZLE_128B
+-
+-    def swizzle_byte_size(self) -> int:
+-        if self.is_swizzle_32b():
+-            return 32
+-        elif self.is_swizzle_64b():
+-            return 64
+-        elif self.is_swizzle_128b():
+-            return 128
+-        else:
+-            return 1
+-
+-    def swizzle_atom_size(self) -> int:
+-        if self.is_swizzle_32b():
+-            return 32 // 16
+-        elif self.is_swizzle_64b():
+-            return 64 // 16
+-        elif self.is_swizzle_128b():
+-            return 128 // 16
+-        else:
+-            return 1
++    slice_byte_offset: object = 0
++    """Physical byte offset (raw bytes) of the operand slice origin within its
++    buffer; passed to ``T.increase_descriptor_offset`` after building the
++    descriptor from the buffer base. ``0`` for a whole-buffer / base-origin
++    operand. Computed by :func:`compute_umma_descriptor` from the CuTe layout."""
+ 
+ 
+ def _bytes_to_elements(byte_count: int, elem_bits: int) -> int:
+@@ -101,6 +70,121 @@ def _elements_to_bytes(elem_count: int, elem_bits: int) -> int:
+     return bits // 8
+ 
+ 
++def compute_umma_descriptor(tl_layout, buffer, transposed: bool, micro_size_k: int = 16, region=None) -> TCGEN05DescriptorParams:
++    """Port of CuTe ``make_umma_desc`` (mma_traits_sm100.hpp).
++
++    The Blackwell analog of :func:`compute_gmma_descriptor`: decode an arbitrary
++    shared-memory ``tl_layout`` for ``buffer`` and compute the UMMA descriptor
++    parameters, accepting any UMMA-canonical layout. A non-canonical layout is a
++    programming error, so the canonicity checks assert (mirroring CuTe's
++    ``static_assert``s).
++
++    SBO/LBO are read in uint128 units from the canonical layout (dtype-agnostic,
++    exactly like ``make_umma_desc``); ``elem_bits`` is carried for the atom-offset
++    math. The ``SWIZZLE_128B_BASE32B`` UMMA mode is not produced by tilelang's
++    shared-layout makers, so only the standard {NONE,32B,64B,128B} atoms appear.
++    Unlike ``make_umma_desc`` (which sees one atom), the decoded layout here is the
++    whole operand tile; 2SM/block-scaled atom splitting is handled by the caller.
++
++    ``transposed`` selects which logical axis is MN vs K (shape only): default
++    ``[MN, K]``, transposed ``[K, MN]``. The operand is required to be row-major,
++    i.e. K-major iff ``not transposed``; the contiguity detected from the layout
++    is asserted to agree.
++
++    ``region`` is the operand's per-axis ranges (one :class:`tvm.ir.Range` per
++    logical buffer mode), used to restrict the decoded layout to a sliced
++    operand. It may be ``None`` for a full-buffer operand.
++    """
++    elem_bits = get_tvm_dtype(buffer.dtype).bits
++    # One decode in element space; the byte- and u128-address variants are pure
++    # recasts of it.
++    composed_elem = cute.ComposedLayout.from_tilelang(tl_layout)
++    assert composed_elem is not None, f"UMMA operand layout is not decodable by the CuTe analyzer: {tl_layout}"
++    # Swizzle is read in BYTE space (canonical atom Sw<b,4,3>, m_base==4).
++    byte_swizzle = composed_elem.recast(elem_bits, 8).swizzle
++    swizzle_mode = byte_swizzle.to_swizzle_mode()
++
++    # Restrict the (possibly hierarchical, swizzle-split) element-space layout to
++    # the operand's slice; the descriptor is built from the buffer base and
++    # advanced to the slice origin by this offset (warp-uniform).
++    tile = composed_elem.layout
++    slice_byte_offset = 0
++    if region is not None:
++        slice_off_elems, tile = cute.restrict(composed_elem.layout, region)
++        if slice_off_elems != 0:
++            slice_byte_offset = tvm.arith.Analyzer().simplify(slice_off_elems * elem_bits // 8)
++    assert cute.rank(tile) == 2, f"UMMA operand tile must be rank-2 (MN, K), got rank {cute.rank(tile)}"
++    # Present in UMMA (MN, K) order, then recast the swizzled element layout to
++    # uint128_t (exactly CuTe's recast<uint128_t const>(tensor)).
++    mn_idx = 1 if transposed else 0
++    k_idx = 1 - mn_idx
++    mn_dim = int(cute.size(tile[mn_idx]))
++    mnk = cute.make_layout([tile[mn_idx], tile[k_idx]])
++    u128 = cute.ComposedLayout(composed_elem.swizzle, composed_elem.offset, mnk).recast(elem_bits, 128)
++    mn_mode, k_mode = u128.layout[0], u128.layout[1]
++
++    # Row-major only: K-major iff not transposed. Assert the contiguity detected
++    # from the layout agrees.
++    k_major = not transposed
++    detected_k_major = _min_leaf_stride(k_mode.stride) == 1
++    assert detected_k_major == k_major, (
++        f"UMMA operand layout contiguity (k_major={detected_k_major}) disagrees with "
++        f"the row-major expectation (k_major={k_major} for transposed={transposed}); "
++        f"only row-major operand layouts are supported."
++    )
++
++    # SwizzleAtomMNSize per UMMA LayoutType (NONE->1, B32->2, B64->4, B128->8) = 1 << b_bits.
++    W = 1 << byte_swizzle.b_bits
++    swizzled = not swizzle_mode.is_none()
++
++    # CuTe make_umma_desc logical_divides each u128 (MN, K) mode by the canonical
++    # tiler:
++    #   MN-major: ((W,m),(8,k)):((1,LBO),(W,SBO))   [INTERLEAVE: ((1,m),(8,k)):((X,SBO),(1,LBO))]
++    #   K-major : ((8,m),(2,k)):((8,SBO),(1,2))
++    # Each divided mode is (tile, rest) and its strides read directly as scalars.
++    if k_major:
++        d_mn = cute.logical_divide(mn_mode, cute.make_layout(8, 1))
++        d_k = cute.logical_divide(k_mode, cute.make_layout(2, 1))
++    else:
++        d_mn = cute.logical_divide(mn_mode, cute.make_layout(W, 1))
++        d_k = cute.logical_divide(k_mode, cute.make_layout(8, 1))
++    assert cute.congruent(d_mn.shape, (1, 1)) and cute.congruent(d_k[0].shape, 1), (
++        f"UMMA operand is not a canonical layout: divided MN={d_mn.shape}, K-tile={d_k[0].shape}"
++    )
++    s00, s01 = d_mn.stride
++    s10 = d_k.stride[0]
++
++    if k_major:
++        # Canonical ((8,m),(2,k)):((8,SBO),(1,2)). stride<0,0>==W; stride<1,0> is
++        # the INTERLEAVE pass-through or 1 when swizzled. SBO=stride<0,1>, LBO=1.
++        assert s00 == W, f"Not a canonical UMMA_K layout: stride<0,0>={s00} != W={W}"
++        assert not (swizzled and s10 != 1), f"Not a canonical UMMA_K layout: stride<1,0>={s10} != 1"
++        sbo = s01
++        lbo = s10
++    else:
++        # Canonical ((W,m),(8,k)). stride<1,0>==W, and stride<0,0>==1 when swizzled.
++        assert cute.congruent(d_k.shape, (1, 1)), f"UMMA MN-major operand is not a canonical layout: divided K={d_k.shape}"
++        s11 = d_k.stride[1]
++        assert not (swizzled and s00 != 1), f"Not a canonical UMMA_MN layout: stride<0,0>={s00} != 1"
++        assert s10 == W, f"Not a canonical UMMA_MN layout: stride<1,0>={s10} != W={W}"
++        sbo = s11 if swizzled else s01
++        lbo = s01 if swizzled else s11
++
++    # Elements per swizzle atom along the non-K (MN) dimension; the unswizzled
++    # case spans the whole MN tile (bit-based so sub-byte dtypes stay packed).
++    swizzle_atom_elems = mn_dim if swizzle_mode.is_none() else _bytes_to_elements(swizzle_mode.swizzle_byte_size(), elem_bits)
++    return TCGEN05DescriptorParams(
++        swizzle_mode=swizzle_mode,
++        leading_byte_offset=int(lbo),
++        stride_byte_offset=int(sbo),
++        swizzle_atom_elems=swizzle_atom_elems,
++        k_atom_size=max(swizzle_atom_elems // micro_size_k, 1),
++        elem_bits=elem_bits,
++        is_k_major=k_major,
++        slice_byte_offset=slice_byte_offset,
++    )
++
++
+ # derive from MMAIntrinEmitter as some layouts are the same
+ class TensorCoreIntrinEmitter(MMAIntrinEmitter):
+     """Intrinsic emitter for Blackwell (SM100) TCGEN5MMA instructions.
+@@ -185,20 +269,6 @@ def _as_buffer(buf_or_region):
+             return buf_or_region.buffer
+         return buf_or_region
+ 
+-    def _determinate_swizzle_mode(self, buffer, layout: Layout) -> SwizzleMode:
+-        buffer = self._as_buffer(buffer)
+-        # same behavior to src/layout/gemm_layouts.cc::MakeGemmABLayoutHopper
+-        if layout is None or layout.is_equal(make_linear_layout(buffer)):
+-            return SwizzleMode.NONE
+-        elif layout.is_equal(make_quarter_bank_swizzled_layout(buffer)):
+-            return SwizzleMode.SWIZZLE_32B
+-        elif layout.is_equal(make_half_bank_swizzled_layout(buffer)):
+-            return SwizzleMode.SWIZZLE_64B
+-        elif layout.is_equal(make_full_bank_swizzled_layout(buffer)):
+-            return SwizzleMode.SWIZZLE_128B
+-        else:
+-            raise ValueError(f"Unsupported swizzle mode: {layout}")
+-
+     def tcgen05mma(self, A_buf: Buffer, B_buf: Buffer, C_local_buf: Buffer, mbar, clear_accum: PrimExpr = False):
+         """Emit a TCGEN5MMA operation, dispatching to SS or TS variant based on A's memory scope.
+ 
+@@ -344,9 +414,6 @@ def tcgen05mma_blockscaled(
+ 
+         a_is_k_major = not self.a_transposed
+         b_is_k_major = self.b_transposed
+-        a_swizzle_mode = self._determinate_swizzle_mode(A_buf, self.a_shared_layout)
+-
+-        a_elem_bits = get_tvm_dtype(self._as_buffer(A_buf).dtype).bits
+ 
+         if len(self.meta) != 5:
+             self.get_tcgen5_mma_meta(m_dim, n_dim, k_dim, disable_2cta=False, disable_ws=True)
+@@ -358,37 +425,14 @@ def tcgen05mma_blockscaled(
+         atom_m, atom_n, _, _, enable_2cta = self.tcgen05_meta_unpacked
+         atom_m_per_cta = atom_m // 2 if enable_2cta else atom_m
+ 
+-        a_swizzle_atom_elems = (
+-            atom_m_per_cta if a_swizzle_mode.is_none() else _bytes_to_elements(a_swizzle_mode.swizzle_byte_size(), a_elem_bits)
+-        )
+-
+-        # Block-scaled A LBO/SBO differ from regular SS (uses atom_m_per_cta instead of m_dim)
+-        a_leading_byte_offset = (
+-            _elements_to_bytes(8 * 8, a_elem_bits) if a_is_k_major else _elements_to_bytes(8 * atom_m_per_cta, a_elem_bits)
+-        )
+-        a_stride_byte_offset = _elements_to_bytes(8 * k_dim, a_elem_bits) if a_is_k_major else _elements_to_bytes(8 * 8, a_elem_bits)
+-        if not a_swizzle_mode.is_none():
+-            if a_is_k_major:
+-                a_leading_byte_offset = 16
+-                a_stride_byte_offset = 8 * a_swizzle_mode.swizzle_byte_size()
+-            else:
+-                a_m_axis_atoms = atom_m_per_cta // a_swizzle_atom_elems
+-                a_leading_byte_offset = k_dim * a_swizzle_mode.swizzle_byte_size() if a_m_axis_atoms > 1 else 0
+-                a_stride_byte_offset = (
+-                    _elements_to_bytes(8 * a_swizzle_atom_elems, a_elem_bits)
+-                    if a_m_axis_atoms > 1
+-                    else _elements_to_bytes(8 * atom_m_per_cta, a_elem_bits)
+-                )
+-
+-        a_params = TCGEN05DescriptorParams(
+-            swizzle_mode=int(a_swizzle_mode),
+-            leading_byte_offset=int(a_leading_byte_offset >> 4),
+-            stride_byte_offset=int(a_stride_byte_offset >> 4),
+-            swizzle_atom_elems=a_swizzle_atom_elems,
+-            k_atom_size=max(a_swizzle_atom_elems // micro_size_k, 1),
+-            elem_bits=a_elem_bits,
+-            is_k_major=a_is_k_major,
+-        )
++        # CuTe builds the block-scaled A descriptor with FrgTypeA =
++        # UMMA::smem_desc<a_major>, i.e. the *same* make_umma_desc as the regular
++        # SS path -- the descriptor describes the physical SMEM tile and is
++        # independent of the MMA atom_m. So decode it via compute_umma_descriptor
++        # (which also handles a sliced A operand) rather than re-deriving SBO/LBO
++        # from atom_m_per_cta. The per-atom M stepping in tcgen05_blockscaled_atom
++        # walks within the whole-tile descriptor exactly as tcgen05_ss_atom does.
++        a_params = self.compute_tcgen05_a_desc_params(A_buf)
+         b_params = self.compute_tcgen05_b_desc_params(B_buf)
+ 
+         base_instr_desc = self.get_tcgen5_blockscaled_instr_desc(
+@@ -661,105 +705,40 @@ def _access_ptr_from(buffer_or_load_or_region, access_type: str = "r"):
+     # -- Descriptor parameter computation (pure Python, no TIR) --
+ 
+     def compute_tcgen05_b_desc_params(self, B_buf) -> TCGEN05DescriptorParams:
+-        """Compute B descriptor parameters from the B shared buffer.
+-
+-        This is a pure-Python helper -- no TIR code is emitted.
+-        The returned ``TCGEN05DescriptorParams`` is passed to
+-        ``init_tcgen05_b_desc()`` and ``tcgen05_*_atom()`` methods.
++        """Compute B descriptor parameters from the B shared buffer via the CuTe
++        ``make_umma_desc`` port. The returned ``TCGEN05DescriptorParams`` is passed
++        to ``init_tcgen05_b_desc()`` and ``tcgen05_*_atom()``.
+ 
+         Parameters
+         ----------
+         B_buf : Buffer or BufferRegion
+             The B operand in shared memory.
+         """
+-        atom_m, atom_n, _, _, enable_2cta = self.tcgen05_meta_unpacked
+-        n_dim = self.block_col_warps * self.warp_col_tiles
+-        n_dim_per_cta = n_dim // 2 if enable_2cta else n_dim
+-        k_dim = self.chunk
+-        micro_size_k = self.micro_size_k
+-        elem_bits = get_tvm_dtype(self._as_buffer(B_buf).dtype).bits
+-        b_is_k_major = self.b_transposed
+-
+-        b_swizzle_mode = self._determinate_swizzle_mode(B_buf, self.b_shared_layout)
+-        b_swizzle_atom_elems = (
+-            n_dim_per_cta if b_swizzle_mode.is_none() else _bytes_to_elements(b_swizzle_mode.swizzle_byte_size(), elem_bits)
+-        )
+-
+-        b_leading_byte_offset = _elements_to_bytes(8 * 8, elem_bits) if b_is_k_major else _elements_to_bytes(8 * n_dim_per_cta, elem_bits)
+-        b_stride_byte_offset = (
+-            _elements_to_bytes(8 * k_dim, elem_bits)
+-            if b_is_k_major
+-            else (0 if n_dim_per_cta == 8 else _elements_to_bytes(8 * 8, elem_bits))
+-        )
+-        if not b_swizzle_mode.is_none():
+-            if b_is_k_major:
+-                b_leading_byte_offset = 16
+-                b_stride_byte_offset = 8 * b_swizzle_mode.swizzle_byte_size()
+-            else:
+-                b_n_axis_atoms = n_dim_per_cta // b_swizzle_atom_elems
+-                if b_n_axis_atoms <= 1:
+-                    b_leading_byte_offset = 0
+-                else:
+-                    b_leading_byte_offset = _elements_to_bytes(8 * 8 * k_dim, elem_bits)
+-                if b_n_axis_atoms <= 1:
+-                    b_stride_byte_offset = _elements_to_bytes(8 * n_dim_per_cta, elem_bits)
+-                else:
+-                    b_stride_byte_offset = _elements_to_bytes(8 * b_swizzle_atom_elems, elem_bits)
+-
+-        return TCGEN05DescriptorParams(
+-            swizzle_mode=int(b_swizzle_mode),
+-            leading_byte_offset=int(b_leading_byte_offset >> 4),
+-            stride_byte_offset=int(b_stride_byte_offset >> 4),
+-            swizzle_atom_elems=b_swizzle_atom_elems,
+-            k_atom_size=max(b_swizzle_atom_elems // micro_size_k, 1),
+-            elem_bits=elem_bits,
+-            is_k_major=b_is_k_major,
++        assert self.b_shared_layout is not None, "TCGEN05 B operand has no shared layout to decode"
++        return compute_umma_descriptor(
++            self.b_shared_layout,
++            B_buf.buffer if isinstance(B_buf, BufferRegion) else B_buf,
++            transposed=not self.b_transposed,
++            micro_size_k=self.micro_size_k,
++            region=list(B_buf.region) if isinstance(B_buf, BufferRegion) else None,
+         )
+ 
+     def compute_tcgen05_a_desc_params(self, A_buf) -> TCGEN05DescriptorParams:
+-        """Compute A descriptor parameters from the A shared buffer (SS variant).
+-
+-        This is a pure-Python helper -- no TIR code is emitted.
++        """Compute A descriptor parameters from the A shared buffer (SS variant)
++        via the CuTe ``make_umma_desc`` port.
+ 
+         Parameters
+         ----------
+         A_buf : Buffer or BufferRegion
+             The A operand in shared memory.
+         """
+-        m_dim = self.block_row_warps * self.warp_row_tiles
+-        k_dim = self.chunk
+-        micro_size_k = self.micro_size_k
+-        elem_bits = get_tvm_dtype(self._as_buffer(A_buf).dtype).bits
+-        a_is_k_major = not self.a_transposed
+-
+-        a_swizzle_mode = self._determinate_swizzle_mode(A_buf, self.a_shared_layout)
+-        a_swizzle_atom_elems = m_dim if a_swizzle_mode.is_none() else _bytes_to_elements(a_swizzle_mode.swizzle_byte_size(), elem_bits)
+-
+-        a_leading_byte_offset = _elements_to_bytes(8 * 8, elem_bits) if a_is_k_major else _elements_to_bytes(8 * m_dim, elem_bits)
+-        a_stride_byte_offset = _elements_to_bytes(8 * k_dim, elem_bits) if a_is_k_major else _elements_to_bytes(8 * 8, elem_bits)
+-        if not a_swizzle_mode.is_none():
+-            if a_is_k_major:
+-                a_leading_byte_offset = 16
+-                a_stride_byte_offset = 8 * a_swizzle_mode.swizzle_byte_size()
+-            else:
+-                a_m_axis_atoms = m_dim // a_swizzle_atom_elems
+-                if a_m_axis_atoms <= 1:
+-                    a_leading_byte_offset = 0
+-                else:
+-                    a_leading_byte_offset = k_dim * a_swizzle_mode.swizzle_byte_size()
+-                if a_m_axis_atoms <= 1:
+-                    a_stride_byte_offset = _elements_to_bytes(8 * m_dim, elem_bits)
+-                else:
+-                    a_stride_byte_offset = _elements_to_bytes(8 * a_swizzle_atom_elems, elem_bits)
+-
+-        return TCGEN05DescriptorParams(
+-            swizzle_mode=int(a_swizzle_mode),
+-            leading_byte_offset=int(a_leading_byte_offset >> 4),
+-            stride_byte_offset=int(a_stride_byte_offset >> 4),
+-            swizzle_atom_elems=a_swizzle_atom_elems,
+-            k_atom_size=max(a_swizzle_atom_elems // micro_size_k, 1),
+-            elem_bits=elem_bits,
+-            is_k_major=a_is_k_major,
++        assert self.a_shared_layout is not None, "TCGEN05 A operand has no shared layout to decode"
++        return compute_umma_descriptor(
++            self.a_shared_layout,
++            A_buf.buffer if isinstance(A_buf, BufferRegion) else A_buf,
++            transposed=self.a_transposed,
++            micro_size_k=self.micro_size_k,
++            region=list(A_buf.region) if isinstance(A_buf, BufferRegion) else None,
+         )
+ 
+     # -- Descriptor initialization (emit TIR) --
+@@ -776,17 +755,21 @@ def init_tcgen05_b_desc(self, desc_b, B_buf, b_params: TCGEN05DescriptorParams):
+         b_params : TCGEN05DescriptorParams
+             Pre-computed parameters from ``compute_tcgen05_b_desc_params()``.
+         """
+-        access_ptr_from = self._access_ptr_from
+         lbo = b_params.leading_byte_offset
+         sbo = b_params.stride_byte_offset
+-        swizzle_mode = b_params.swizzle_mode
+-        B_ptr = access_ptr_from(B_buf, "r")
++        swizzle_mode = b_params.swizzle_mode.tcgen05_layout_type()
++        slice_byte_offset = b_params.slice_byte_offset
++        is_sliced = not isinstance(slice_byte_offset, int) or slice_byte_offset != 0
++        B_base_ptr = self._as_buffer(B_buf).access_ptr("r")
+ 
+         @T.macro
+-        def _init_b(desc_b, B_ptr):
+-            T.initialize_tcgen05_descriptor(desc_b, B_ptr, lbo, sbo, 0, False, swizzle_mode)
++        def _init_b(desc_b, B_base_ptr):
++            # Build from the buffer base (uniform cvta), then advance to the slice origin.
++            T.initialize_tcgen05_descriptor(desc_b, B_base_ptr, lbo, sbo, 0, False, swizzle_mode)
++            if is_sliced:
++                T.increase_descriptor_offset(desc_b, slice_byte_offset)
+ 
+-        return _init_b(desc_b, B_ptr)
++        return _init_b(desc_b, B_base_ptr)
+ 
+     def init_tcgen05_a_desc(self, desc_a, A_buf, a_params: TCGEN05DescriptorParams):
+         """Emit TIR to initialize a pre-allocated TCGEN05 A descriptor (SS variant).
+@@ -800,17 +783,21 @@ def init_tcgen05_a_desc(self, desc_a, A_buf, a_params: TCGEN05DescriptorParams):
+         a_params : TCGEN05DescriptorParams
+             Pre-computed parameters from ``compute_tcgen05_a_desc_params()``.
+         """
+-        access_ptr_from = self._access_ptr_from
+         lbo = a_params.leading_byte_offset
+         sbo = a_params.stride_byte_offset
+-        swizzle_mode = a_params.swizzle_mode
+-        A_ptr = access_ptr_from(A_buf, "r")
++        swizzle_mode = a_params.swizzle_mode.tcgen05_layout_type()
++        slice_byte_offset = a_params.slice_byte_offset
++        is_sliced = not isinstance(slice_byte_offset, int) or slice_byte_offset != 0
++        A_base_ptr = self._as_buffer(A_buf).access_ptr("r")
+ 
+         @T.macro
+-        def _init_a(desc_a, A_ptr):
+-            T.initialize_tcgen05_descriptor(desc_a, A_ptr, lbo, sbo, 0, False, swizzle_mode)
++        def _init_a(desc_a, A_base_ptr):
++            # Build from the buffer base (uniform cvta), then advance to the slice origin.
++            T.initialize_tcgen05_descriptor(desc_a, A_base_ptr, lbo, sbo, 0, False, swizzle_mode)
++            if is_sliced:
++                T.increase_descriptor_offset(desc_a, slice_byte_offset)
+ 
+-        return _init_a(desc_a, A_ptr)
++        return _init_a(desc_a, A_base_ptr)
+ 
+     # -- Instruction descriptor computation --
+ 
+diff --git a/tilelang/cuda/intrinsics/macro/wgmma_macro_generator.py b/tilelang/cuda/intrinsics/macro/wgmma_macro_generator.py
+index eea4599b8d..38b004aeff 100644
+--- a/tilelang/cuda/intrinsics/macro/wgmma_macro_generator.py
++++ b/tilelang/cuda/intrinsics/macro/wgmma_macro_generator.py
+@@ -1,19 +1,17 @@
+ from __future__ import annotations
+ import tilelang.language as T
+ from dataclasses import dataclass
+-from enum import IntEnum
+ from collections.abc import Callable
+ from .mma_macro_generator import TensorCoreIntrinEmitter as MMAIntrinEmitter
+ from tvm import DataType
+ from tvm.tirx import PrimExpr, Buffer, Var, IndexMap, BufferRegion
+-from tilelang.utils import is_fragment, retrive_ptr_from_buffer_region, is_full_region
++from tilelang import tvm as tvm
++from tilelang.utils import is_fragment, is_full_region
+ from math import gcd
+ from tilelang.layout import (
+     Layout,
+-    make_full_bank_swizzled_layout,
+-    make_half_bank_swizzled_layout,
+-    make_quarter_bank_swizzled_layout,
+-    make_linear_layout,
++    SwizzleMode,
++    cute,
+ )
+ from tvm.runtime import convert
+ from tilelang.cuda.intrinsics.layout.mma_layout import (
+@@ -25,16 +23,22 @@
+ lift = convert
+ 
+ 
++def _min_leaf_stride(stride) -> int:
++    """Smallest leaf stride within a (possibly nested) stride tuple."""
++    if isinstance(stride, tuple):
++        return min(_min_leaf_stride(s) for s in stride)
++    return int(stride)
++
++
+ @dataclass(frozen=True)
+ class WGMMADescriptorParams:
+-    """Pre-computed parameters for WGMMA descriptor initialization and atom offset computation.
+-
+-    Returned by ``compute_wgmma_*_desc_params()`` and consumed by
+-    ``init_wgmma_*_desc()`` and ``wgmma_*_atom()`` methods.
++    """Pre-computed WGMMA descriptor parameters, produced by
++    :func:`compute_gmma_descriptor` (a port of CuTe ``make_gmma_desc``) and
++    consumed by ``init_wgmma_*_desc()`` and ``wgmma_*_atom()``.
+     """
+ 
+-    swizzle_mode: int
+-    """SwizzleMode enum value (passed directly to ``T.initialize_wgmma_descriptor``)."""
++    swizzle_mode: SwizzleMode
++    """Canonical swizzle mode; project to the descriptor field via ``wgmma_layout_type()``."""
+     leading_byte_offset: int
+     """LBO >> 4, ready to pass to ``T.initialize_wgmma_descriptor``."""
+     stride_byte_offset: int
+@@ -47,46 +51,134 @@ class WGMMADescriptorParams:
+     """Byte width of a single element: ``DataType(dtype).bits // 8``."""
+     is_k_major: bool
+     """Whether the matrix is stored in K-major order (affects offset formula branching)."""
+-
+-
+-class SwizzleMode(IntEnum):
+-    # SWIZZLE_NONE = 0, SWIZZLE_32B = 3, SWIZZLE_64B = 2, SWIZZLE_128B = 1
+-    NONE = 0
+-    SWIZZLE_128B = 1
+-    SWIZZLE_64B = 2
+-    SWIZZLE_32B = 3
+-
+-    def is_none(self) -> bool:
+-        return self == SwizzleMode.NONE
+-
+-    def is_swizzle_32b(self) -> bool:
+-        return self == SwizzleMode.SWIZZLE_32B
+-
+-    def is_swizzle_64b(self) -> bool:
+-        return self == SwizzleMode.SWIZZLE_64B
+-
+-    def is_swizzle_128b(self) -> bool:
+-        return self == SwizzleMode.SWIZZLE_128B
+-
+-    def swizzle_byte_size(self) -> int:
+-        if self.is_swizzle_32b():
+-            return 32
+-        elif self.is_swizzle_64b():
+-            return 64
+-        elif self.is_swizzle_128b():
+-            return 128
+-        else:
+-            return 1
+-
+-    def swizzle_atom_size(self) -> int:
+-        if self.is_swizzle_32b():
+-            return 32 // 16
+-        elif self.is_swizzle_64b():
+-            return 64 // 16
+-        elif self.is_swizzle_128b():
+-            return 128 // 16
+-        else:
+-            return 1
++    slice_byte_offset: object = 0
++    """Physical byte offset (raw bytes) of the operand slice origin within its
++    buffer; passed to ``T.increase_descriptor_offset`` after building the
++    descriptor from the buffer base. ``0`` for a whole-buffer / base-origin
++    operand. Computed by :func:`compute_gmma_descriptor` from the CuTe layout."""
++
++
++def compute_gmma_descriptor(tl_layout, buffer, transposed: bool, micro_size_k: int = 16, region=None) -> WGMMADescriptorParams:
++    """Port of CuTe ``make_gmma_desc``.
++
++    Decode an arbitrary shared-memory ``tl_layout`` for ``buffer`` and compute the
++    WGMMA descriptor parameters, accepting *any* WGMMA-canonical layout -- not
++    just the four "maker" layouts. A non-GMMA-canonical layout is a programming
++    error, so the canonicity checks assert (mirroring CuTe's ``static_assert``s).
++
++    ``transposed`` selects which logical axis is MN vs K (shape only): default
++    ``[MN, K]``, transposed ``[K, MN]``. The operand is required to be row-major,
++    i.e. K-major iff ``not transposed``; the contiguity detected from the layout
++    (the GMMA mode owning the stride-1 sub-mode) is asserted to agree.
++
++    ``region`` is the operand's per-axis ranges (one :class:`tvm.ir.Range` per
++    logical buffer mode), used to restrict the decoded layout to a sliced
++    operand (e.g. ``B[:, j*64:...]``). It may be ``None`` for a full-buffer
++    operand or the atom-level API.
++    """
++    elems_in_bytes = int(DataType(buffer.dtype).bits) // 8
++    bits = int(DataType(buffer.dtype).bits)
++    # One decode in element space; the byte- and u128-address variants are pure
++    # recasts of it (no second from_tilelang).
++    composed_elem = cute.ComposedLayout.from_tilelang(tl_layout)
++    assert composed_elem is not None, f"WGMMA operand layout is not decodable by the CuTe analyzer: {tl_layout}"
++    # Swizzle is read in BYTE space (canonical atom Sw<b,4,3>, m_base==4).
++    byte_swizzle = composed_elem.recast(bits, 8).swizzle
++    swizzle_mode = byte_swizzle.to_swizzle_mode()
++
++    # Restrict the (possibly hierarchical, swizzle-split) element-space layout to
++    # the operand's slice. ``restrict`` reshapes each mode to its logical extent
++    # via with_shape -- collapsing the split sub-modes back to the logical tile,
++    # and skipping extent-1 modes (e.g. a software-pipeline stage the region pins
++    # to one element) so the result is the bare (MN, K) operand. It also returns
++    # the slice origin's physical element offset, which we scale to raw bytes for
++    # increase_descriptor_offset: the descriptor is built from the buffer base, so
++    # this advance lands it on the slice origin while keeping the cvta operand
++    # (the base) loop-invariant => warp-uniform. With no region (atom API) the
++    # layout is already the bare operand.
++    tile = composed_elem.layout
++    slice_byte_offset = 0
++    if region is not None:
++        slice_off_elems, tile = cute.restrict(composed_elem.layout, region)
++        # A statically-zero origin is a plain int 0; a runtime origin is a PrimExpr.
++        if slice_off_elems != 0:
++            slice_byte_offset = tvm.arith.Analyzer().simplify(slice_off_elems * bits // 8)
++    assert cute.rank(tile) == 2, f"WGMMA operand tile must be rank-2 (MN, K), got rank {cute.rank(tile)}"
++
++    # Present in GMMA (MN, K) order, then recast the swizzled element layout to
++    # uint128_t (exactly CuTe's recast<uint128_t const>(tensor)).
++    mn_idx = 1 if transposed else 0
++    k_idx = 1 - mn_idx
++    mn_dim = int(cute.size(tile[mn_idx]))
++    mnk = cute.make_layout([tile[mn_idx], tile[k_idx]])
++    u128 = cute.ComposedLayout(composed_elem.swizzle, composed_elem.offset, mnk).recast(bits, 128)
++    mn_mode, k_mode = u128.layout[0], u128.layout[1]
++
++    # Row-major only: K-major iff not transposed. Assert the contiguity detected
++    # from the layout (K mode owns the stride-1 sub-mode) agrees with that.
++    k_major = not transposed
++    detected_k_major = _min_leaf_stride(k_mode.stride) == 1
++    assert detected_k_major == k_major, (
++        f"WGMMA operand layout contiguity (k_major={detected_k_major}) disagrees with "
++        f"the row-major expectation (k_major={k_major} for transposed={transposed}); "
++        f"only row-major operand layouts are supported."
++    )
++
++    # W per CuTe LayoutType (INTERLEAVE->1, B32->2, B64->4, B128->8) = 1 << b_bits.
++    W = 1 << byte_swizzle.b_bits
++    swizzled = not swizzle_mode.is_none()
++
++    # CuTe make_gmma_desc logical_divides each u128 (MN, K) mode by the canonical
++    # tiler:
++    #   MN-major: ((W,m),(8,k)):((1,LBO),(W,SBO))   [INTERLEAVE: ((1,m),(8,k)):((X,SBO),(1,LBO))]
++    #   K-major : ((8,m),(2,k)):((8,SBO),(1,2))
++    # Each divided mode is (tile, rest) and its strides read directly as scalars.
++    if k_major:
++        d_mn = cute.logical_divide(mn_mode, cute.make_layout(8, 1))
++        d_k = cute.logical_divide(k_mode, cute.make_layout(2, 1))
++    else:
++        d_mn = cute.logical_divide(mn_mode, cute.make_layout(W, 1))
++        d_k = cute.logical_divide(k_mode, cute.make_layout(8, 1))
++    # The MN mode is always a clean (tile, rest) scalar pair. So is the K mode's
++    # tile (stride<1,0>); only the K *rest* (stride<1,1>) may stay multi-atom for
++    # a whole operand (CuTe's tensor is one K atom), and K-major never reads it.
++    assert cute.congruent(d_mn.shape, (1, 1)) and cute.congruent(d_k[0].shape, 1), (
++        f"WGMMA operand is not a canonical GMMA layout: divided MN={d_mn.shape}, K-tile={d_k[0].shape}"
++    )
++    s00, s01 = d_mn.stride
++    s10 = d_k.stride[0]
++
++    if k_major:
++        # Canonical ((8,m),(2,k)):((8,SBO),(1,2)). stride<0,0>==W; stride<1,0> is
++        # the INTERLEAVE pass-through or 1 when swizzled. SBO=stride<0,1>, LBO=1.
++        assert s00 == W, f"Not a canonical GMMA_K layout: stride<0,0>={s00} != W={W}"
++        assert not (swizzled and s10 != 1), f"Not a canonical GMMA_K layout: stride<1,0>={s10} != 1"
++        sbo = s01
++        lbo = s10
++    else:
++        # Canonical ((W,m),(8,k)). stride<1,0>==W, and stride<0,0>==1 when swizzled
++        # (INTERLEAVE passes through). Rejects layouts CuTe itself rejects (e.g.
++        # tilelang's K-oriented maker used as an MN operand).
++        assert cute.congruent(d_k.shape, (1, 1)), f"WGMMA MN-major operand is not a canonical GMMA layout: divided K={d_k.shape}"
++        s11 = d_k.stride[1]
++        assert not (swizzled and s00 != 1), f"Not a canonical GMMA_MN layout: stride<0,0>={s00} != 1"
++        assert s10 == W, f"Not a canonical GMMA_MN layout: stride<1,0>={s10} != W={W}"
++        sbo = s11 if swizzled else s01
++        lbo = s01 if swizzled else s11
++
++    # Elements per swizzle atom along the non-K (MN) dimension; the unswizzled
++    # case spans the whole MN tile.
++    swizzle_atom_elems = mn_dim if swizzle_mode.is_none() else swizzle_mode.swizzle_byte_size() // elems_in_bytes
++    return WGMMADescriptorParams(
++        swizzle_mode=swizzle_mode,
++        leading_byte_offset=int(lbo),
++        stride_byte_offset=int(sbo),
++        swizzle_atom_elems=swizzle_atom_elems,
++        k_atom_size=max(swizzle_atom_elems // micro_size_k, 1),
++        elems_in_bytes=elems_in_bytes,
++        is_k_major=k_major,
++        slice_byte_offset=slice_byte_offset,
++    )
+ 
+ 
+ # derive from MMAIntrinEmitter as some layouts are the same
+@@ -187,19 +279,6 @@ def _initialize_micro_size(self, m_dim: int = 16, k_dim: int = 16):
+         self.micro_size_x = m_dim
+         self.micro_size_k = k_dim
+ 
+-    def _determinate_swizzle_mode(self, buffer: Buffer, layout: Layout) -> SwizzleMode:
+-        # same behavior to src/layout/gemm_layouts.cc::MakeGemmABLayoutHopper
+-        if layout is None or layout.is_equal(make_linear_layout(buffer)):
+-            return SwizzleMode.NONE
+-        elif layout.is_equal(make_quarter_bank_swizzled_layout(buffer)):
+-            return SwizzleMode.SWIZZLE_32B
+-        elif layout.is_equal(make_half_bank_swizzled_layout(buffer)):
+-            return SwizzleMode.SWIZZLE_64B
+-        elif layout.is_equal(make_full_bank_swizzled_layout(buffer)):
+-            return SwizzleMode.SWIZZLE_128B
+-        else:
+-            raise ValueError(f"Unsupported swizzle mode: {layout}")
+-
+     def wgmma(
+         self, A_region: BufferRegion, B_region: BufferRegion, C_region: BufferRegion, clear_accum: PrimExpr = False, wg_wait: int = 0
+     ):
+@@ -315,87 +394,31 @@ def wgmma_accum_regs(self) -> int:
+     def compute_wgmma_b_desc_params(self, B_region: BufferRegion) -> WGMMADescriptorParams:
+         """Compute B descriptor parameters from the B shared buffer region.
+ 
+-        This is a pure-Python helper -- no TIR code is emitted.
+-        The returned ``WGMMADescriptorParams`` is passed to
+-        ``init_wgmma_b_desc()`` and ``wgmma_*_atom()`` methods.
++        Pure-Python helper (no TIR emitted); the returned ``WGMMADescriptorParams``
++        is consumed by ``init_wgmma_b_desc()`` and ``wgmma_*_atom()``.
+         """
+-        n_dim = self.block_col_warps * self.warp_col_tiles
+-        k_dim = self.chunk
+-        micro_size_k = self.micro_size_k
+-        elems_in_bytes = DataType(self.a_dtype).bits // 8
+-        b_is_k_major = self.b_transposed
+-
+-        b_swizzle_mode = self._determinate_swizzle_mode(B_region, self.b_shared_layout)
+-        b_swizzle_atom_elems = n_dim if b_swizzle_mode.is_none() else b_swizzle_mode.swizzle_byte_size() // elems_in_bytes
+-
+-        b_leading_byte_offset = (8 * 8 * elems_in_bytes) if b_is_k_major else (8 * n_dim * elems_in_bytes)
+-        b_stride_byte_offset = (8 * k_dim * elems_in_bytes) if b_is_k_major else (0 if n_dim == 8 else (8 * 8 * elems_in_bytes))
+-        if not b_swizzle_mode.is_none():
+-            if b_is_k_major:
+-                b_leading_byte_offset = 16
+-                b_stride_byte_offset = 8 * b_swizzle_mode.swizzle_byte_size()
+-            else:
+-                b_n_axis_atoms = n_dim // b_swizzle_atom_elems
+-                if b_n_axis_atoms <= 1:
+-                    b_leading_byte_offset = 0
+-                else:
+-                    b_leading_byte_offset = 8 * 8 * elems_in_bytes * k_dim
+-                if b_n_axis_atoms <= 1:
+-                    b_stride_byte_offset = 8 * elems_in_bytes * n_dim
+-                else:
+-                    b_stride_byte_offset = 8 * elems_in_bytes * b_swizzle_atom_elems
+-
+-        return WGMMADescriptorParams(
+-            swizzle_mode=int(b_swizzle_mode),
+-            leading_byte_offset=int(b_leading_byte_offset >> 4),
+-            stride_byte_offset=int(b_stride_byte_offset >> 4),
+-            swizzle_atom_elems=b_swizzle_atom_elems,
+-            k_atom_size=max(b_swizzle_atom_elems // micro_size_k, 1),
+-            elems_in_bytes=elems_in_bytes,
+-            is_k_major=b_is_k_major,
++        assert self.b_shared_layout is not None, "WGMMA B operand has no shared layout to decode"
++        return compute_gmma_descriptor(
++            self.b_shared_layout,
++            B_region.buffer if isinstance(B_region, BufferRegion) else B_region,
++            transposed=not self.b_transposed,
++            micro_size_k=self.micro_size_k,
++            region=list(B_region.region) if isinstance(B_region, BufferRegion) else None,
+         )
+ 
+     def compute_wgmma_a_desc_params(self, A_region: BufferRegion) -> WGMMADescriptorParams:
+         """Compute A descriptor parameters from the A shared buffer region (SS variant).
+ 
+-        This is a pure-Python helper -- no TIR code is emitted.
+-        The returned ``WGMMADescriptorParams`` is passed to
+-        ``init_wgmma_a_desc()`` and ``wgmma_ss_atom()`` methods.
++        Pure-Python helper (no TIR emitted); the returned ``WGMMADescriptorParams``
++        is consumed by ``init_wgmma_a_desc()`` and ``wgmma_ss_atom()``.
+         """
+-        m_dim = self.block_row_warps * self.warp_row_tiles
+-        k_dim = self.chunk
+-        micro_size_k = self.micro_size_k
+-        elems_in_bytes = DataType(self.a_dtype).bits // 8
+-        a_is_k_major = not self.a_transposed
+-
+-        a_swizzle_mode = self._determinate_swizzle_mode(A_region, self.a_shared_layout)
+-        a_swizzle_atom_elems = a_swizzle_mode.swizzle_byte_size() // elems_in_bytes
+-
+-        a_leading_byte_offset = (8 * 8 * elems_in_bytes) if a_is_k_major else (8 * m_dim * elems_in_bytes)
+-        a_stride_byte_offset = (8 * k_dim * elems_in_bytes) if a_is_k_major else (8 * 8 * elems_in_bytes)
+-        if not a_swizzle_mode.is_none():
+-            if a_is_k_major:
+-                a_leading_byte_offset = 16
+-                a_stride_byte_offset = 8 * a_swizzle_mode.swizzle_byte_size()
+-            else:
+-                a_m_axis_atoms = m_dim // a_swizzle_atom_elems
+-                if a_m_axis_atoms <= 1:
+-                    a_leading_byte_offset = 0
+-                else:
+-                    a_leading_byte_offset = 8 * a_swizzle_mode.swizzle_atom_size() * (a_swizzle_mode.swizzle_byte_size() // elems_in_bytes)
+-                if a_m_axis_atoms <= 1:
+-                    a_stride_byte_offset = 8 * elems_in_bytes * m_dim
+-                else:
+-                    a_stride_byte_offset = 8 * elems_in_bytes * a_swizzle_atom_elems
+-
+-        return WGMMADescriptorParams(
+-            swizzle_mode=int(a_swizzle_mode),
+-            leading_byte_offset=int(a_leading_byte_offset >> 4),
+-            stride_byte_offset=int(a_stride_byte_offset >> 4),
+-            swizzle_atom_elems=a_swizzle_atom_elems,
+-            k_atom_size=max(a_swizzle_atom_elems // micro_size_k, 1),
+-            elems_in_bytes=elems_in_bytes,
+-            is_k_major=a_is_k_major,
++        assert self.a_shared_layout is not None, "WGMMA A operand has no shared layout to decode"
++        return compute_gmma_descriptor(
++            self.a_shared_layout,
++            A_region.buffer if isinstance(A_region, BufferRegion) else A_region,
++            transposed=self.a_transposed,
++            micro_size_k=self.micro_size_k,
++            region=list(A_region.region) if isinstance(A_region, BufferRegion) else None,
+         )
+ 
+     # -- Descriptor initialization (emit TIR) --
+@@ -417,16 +440,25 @@ def init_wgmma_b_desc(
+         b_params : WGMMADescriptorParams
+             Pre-computed parameters from ``compute_wgmma_b_desc_params()``.
+         """
+-        B_ptr = retrive_ptr_from_buffer_region(B_region)
+-        swizzle_mode = b_params.swizzle_mode
++        B_buf = B_region.buffer if isinstance(B_region, BufferRegion) else B_region
++        B_base_ptr = B_buf.access_ptr("r")
++        slice_byte_offset = b_params.slice_byte_offset
++        is_sliced = not isinstance(slice_byte_offset, int) or slice_byte_offset != 0
++        swizzle_mode = b_params.swizzle_mode.wgmma_layout_type()
+         lbo = b_params.leading_byte_offset
+         sbo = b_params.stride_byte_offset
+ 
+         @T.macro
+-        def _init_b_desc(desc_b, B_ptr):
+-            T.initialize_wgmma_descriptor(desc_b, B_ptr, swizzle_mode, lbo, sbo)
++        def _init_b_desc(desc_b, B_base_ptr):
++            # Build from the buffer base (loop-invariant => uniform cvta), then
++            # advance start_address_ to the slice origin via the descriptor's
++            # in-place add. Keeps the descriptor warp-uniform (no per-thread cvta
++            # of a slice pointer carrying an induction variable).
++            T.initialize_wgmma_descriptor(desc_b, B_base_ptr, swizzle_mode, lbo, sbo)
++            if is_sliced:
++                T.increase_descriptor_offset(desc_b, slice_byte_offset)
+ 
+-        return _init_b_desc(desc_b, B_ptr)
++        return _init_b_desc(desc_b, B_base_ptr)
+ 
+     def init_wgmma_a_desc(
+         self,
+@@ -445,16 +477,23 @@ def init_wgmma_a_desc(
+         a_params : WGMMADescriptorParams
+             Pre-computed parameters from ``compute_wgmma_a_desc_params()``.
+         """
+-        A_ptr = retrive_ptr_from_buffer_region(A_region)
+-        swizzle_mode = a_params.swizzle_mode
++        A_buf = A_region.buffer if isinstance(A_region, BufferRegion) else A_region
++        A_base_ptr = A_buf.access_ptr("r")
++        slice_byte_offset = a_params.slice_byte_offset
++        is_sliced = not isinstance(slice_byte_offset, int) or slice_byte_offset != 0
++        swizzle_mode = a_params.swizzle_mode.wgmma_layout_type()
+         lbo = a_params.leading_byte_offset
+         sbo = a_params.stride_byte_offset
+ 
+         @T.macro
+-        def _init_a_desc(desc_a, A_ptr):
+-            T.initialize_wgmma_descriptor(desc_a, A_ptr, swizzle_mode, lbo, sbo)
+-
+-        return _init_a_desc(desc_a, A_ptr)
++        def _init_a_desc(desc_a, A_base_ptr):
++            # Build from the buffer base (uniform cvta), then advance to the slice
++            # origin (see init_wgmma_b_desc).
++            T.initialize_wgmma_descriptor(desc_a, A_base_ptr, swizzle_mode, lbo, sbo)
++            if is_sliced:
++                T.increase_descriptor_offset(desc_a, slice_byte_offset)
++
++        return _init_a_desc(desc_a, A_base_ptr)
+ 
+     # -- Fence / Arrive / Commit / Wait primitives --
+ 
+diff --git a/tilelang/cuda/intrinsics/macro/wgmma_sp_macro_generator.py b/tilelang/cuda/intrinsics/macro/wgmma_sp_macro_generator.py
+index b66b14ea5c..9ccc7ce5f9 100644
+--- a/tilelang/cuda/intrinsics/macro/wgmma_sp_macro_generator.py
++++ b/tilelang/cuda/intrinsics/macro/wgmma_sp_macro_generator.py
+@@ -1,22 +1,16 @@
+ from __future__ import annotations
+-from tilelang.cuda.intrinsics.macro.wgmma_macro_generator import SwizzleMode, gcd
++from tilelang.cuda.intrinsics.macro.wgmma_macro_generator import gcd, compute_gmma_descriptor, WGMMADescriptorParams
+ from tilelang.cuda.intrinsics.macro.mma_sp_macro_generator import SparseTensorCoreIntrinEmitter
+ import tilelang.language as T
+ from tvm import DataType
+ from tvm.tirx import PrimExpr, Buffer, Var, BufferRegion, IndexMap
+-from tilelang.utils import is_fragment, is_shared, retrive_ptr_from_buffer_region, is_full_region
++from tilelang.utils import is_fragment, is_shared, is_full_region
+ from tilelang.cuda.intrinsics.layout.mma_layout import (
+     shared_16x8_to_mma_32x4_layout_sr_a,
+     shared_16x16_to_mma_32x8_layout_sr_a,
+     shared_16x32_to_mma_32x16_layout_sr_a,
+ )
+-from tilelang.layout import (
+-    Layout,
+-    make_full_bank_swizzled_layout,
+-    make_half_bank_swizzled_layout,
+-    make_quarter_bank_swizzled_layout,
+-    make_linear_layout,
+-)
++from tilelang.layout import Layout
+ from tilelang.cuda.intrinsics.layout.mma_sp_layout import (
+     metadata_8bit_load_32x4_to_shared_16x4_layout_32bit,
+     metadata_16bit_load_32x2_to_shared_16x2_layout_32bit,
+@@ -101,18 +95,39 @@ def _initialize_wgmma_prefix(self, n_dim: int = 16):
+         self.wgmma_inst_n = inst_n
+         self.wgmma_prefix = f"m{inst_m}n{inst_n}k{inst_k}"
+ 
+-    def _determinate_swizzle_mode(self, buffer: Buffer, layout: Layout) -> SwizzleMode:
+-        # same behavior to src/layout/gemm_layouts.cc::MakeGemmABLayoutHopper
+-        if layout is None or layout.is_equal(make_linear_layout(buffer)):
+-            return SwizzleMode.NONE
+-        elif layout.is_equal(make_quarter_bank_swizzled_layout(buffer)):
+-            return SwizzleMode.SWIZZLE_32B
+-        elif layout.is_equal(make_half_bank_swizzled_layout(buffer)):
+-            return SwizzleMode.SWIZZLE_64B
+-        elif layout.is_equal(make_full_bank_swizzled_layout(buffer)):
+-            return SwizzleMode.SWIZZLE_128B
+-        else:
+-            raise ValueError(f"Unsupported swizzle mode: {layout}")
++    # -- Descriptor parameter computation (pure Python, no TIR) --
++
++    def compute_wgmma_a_desc_params(self, A_region: BufferRegion) -> WGMMADescriptorParams:
++        """Compute A descriptor parameters from the A shared buffer region (SS variant).
++
++        A is sparse: its physical (compressed) K extent is ``micro_size_k //
++        SPARSE_FACTOR``, passed as ``micro_size_k`` for the K-atom accounting.
++        Pure-Python helper (no TIR emitted); the returned ``WGMMADescriptorParams``
++        is consumed by ``wgmma_ss()``.
++        """
++        assert self.a_shared_layout is not None, "WGMMA sparse A operand has no shared layout to decode"
++        return compute_gmma_descriptor(
++            self.a_shared_layout,
++            A_region.buffer if isinstance(A_region, BufferRegion) else A_region,
++            transposed=self.a_transposed,
++            micro_size_k=self.micro_size_k // self.SPARSE_FACTOR,
++            region=list(A_region.region) if isinstance(A_region, BufferRegion) else None,
++        )
++
++    def compute_wgmma_b_desc_params(self, B_region: BufferRegion) -> WGMMADescriptorParams:
++        """Compute B descriptor parameters from the B shared buffer region.
++
++        Pure-Python helper (no TIR emitted); the returned ``WGMMADescriptorParams``
++        is consumed by ``wgmma_ss()`` and ``wgmma_rs()``.
++        """
++        assert self.b_shared_layout is not None, "WGMMA sparse B operand has no shared layout to decode"
++        return compute_gmma_descriptor(
++            self.b_shared_layout,
++            B_region.buffer if isinstance(B_region, BufferRegion) else B_region,
++            transposed=not self.b_transposed,
++            micro_size_k=self.micro_size_k,
++            region=list(B_region.region) if isinstance(B_region, BufferRegion) else None,
++        )
+ 
+     def wgmma_ss(
+         self,
+@@ -145,80 +160,43 @@ def wgmma_ss(
+         a_is_k_major = not self.a_transposed
+         b_is_k_major = self.b_transposed
+ 
+-        a_swizzle_mode = self._determinate_swizzle_mode(A_region, self.a_shared_layout)
+-        b_swizzle_mode = self._determinate_swizzle_mode(B_region, self.b_shared_layout)
+-
+         elems_in_bits = DataType(self.a_dtype).bits
+         elems_in_bytes = elems_in_bits // 8
+ 
+-        a_swizzle_atom_elems = a_swizzle_mode.swizzle_byte_size() // elems_in_bytes
+-        b_swizzle_atom_elems = n_dim if b_swizzle_mode.is_none() else b_swizzle_mode.swizzle_byte_size() // elems_in_bytes
++        # Decode each operand's shared layout via the CuTe make_gmma_desc port.
++        a_params = self.compute_wgmma_a_desc_params(A_region)
++        b_params = self.compute_wgmma_b_desc_params(B_region)
++        a_swizzle_mode = a_params.swizzle_mode
++        b_swizzle_mode = b_params.swizzle_mode
++        a_swizzle_atom_elems = a_params.swizzle_atom_elems
++        b_swizzle_atom_elems = b_params.swizzle_atom_elems
++        a_slice_byte_offset = a_params.slice_byte_offset
++        b_slice_byte_offset = b_params.slice_byte_offset
++        a_is_sliced = not isinstance(a_slice_byte_offset, int) or a_slice_byte_offset != 0
++        b_is_sliced = not isinstance(b_slice_byte_offset, int) or b_slice_byte_offset != 0
++
+         accum_bits = DataType(accum_dtype).bits
+         accum_regs = ((m_dim // 64) * warp_cols * local_size_out * accum_bits + 31) // 32
+ 
+-        a_leading_byte_offset = (8 * 8 * elems_in_bytes) if a_is_k_major else (8 * m_dim * elems_in_bytes)
+-        a_stride_byte_offset = (8 * k_dim * elems_in_bytes) if a_is_k_major else (8 * 8 * elems_in_bytes)
+-
+-        if not a_swizzle_mode.is_none():
+-            # swizzle mode doesn't require LBO/SBO to be 1
+-            # https://docs.nvidia.com/cuda/parallel-thread-execution/#asynchronous-warpgroup-level-leading-dimension-byte-offset
+-            if a_is_k_major:
+-                a_leading_byte_offset = 16
+-                a_stride_byte_offset = 8 * a_swizzle_mode.swizzle_byte_size()
+-            else:
+-                # MN Major
+-                # LBO represents the distance between two atoms along the M dimension
+-                # SBO represents the distance between two atoms along the K dimension
+-                a_m_axis_atoms = m_dim // a_swizzle_atom_elems
+-                if a_m_axis_atoms <= 1:
+-                    a_leading_byte_offset = 0
+-                else:
+-                    a_leading_byte_offset = 8 * a_swizzle_mode.swizzle_atom_size() * (a_swizzle_mode.swizzle_byte_size() // elems_in_bytes)
+-
+-                if a_m_axis_atoms <= 1:
+-                    a_stride_byte_offset = 8 * elems_in_bytes * m_dim
+-                else:
+-                    a_stride_byte_offset = 8 * elems_in_bytes * a_swizzle_atom_elems
+-
+-        b_leading_byte_offset = (8 * 8 * elems_in_bytes) if b_is_k_major else (8 * n_dim * elems_in_bytes)
+-        b_stride_byte_offset = (8 * k_dim * elems_in_bytes) if b_is_k_major else (0 if n_dim == 8 else (8 * 8 * elems_in_bytes))
+-        if not b_swizzle_mode.is_none():
+-            # swizzle mode doesn't require LBO/SBO to be 1
+-            # https://docs.nvidia.com/cuda/parallel-thread-execution/#asynchronous-warpgroup-level-leading-dimension-byte-offset
+-            if b_is_k_major:
+-                b_leading_byte_offset = 16
+-                b_stride_byte_offset = 8 * b_swizzle_mode.swizzle_byte_size()
+-            else:
+-                # MN Major, K * N
+-                # LBO represents the distance between two atoms along the N dimension
+-                # SBO represents the distance between two atoms along the K dimension
+-                b_n_axis_atoms = n_dim // b_swizzle_atom_elems
+-                if b_n_axis_atoms <= 1:
+-                    b_leading_byte_offset = 0
+-                else:
+-                    b_leading_byte_offset = 8 * 8 * elems_in_bytes * k_dim
+-                if b_n_axis_atoms <= 1:
+-                    b_stride_byte_offset = 8 * elems_in_bytes * n_dim
+-                else:
+-                    b_stride_byte_offset = 8 * elems_in_bytes * b_swizzle_atom_elems
+-
+         # for example, if [n, k] where k is 128, we should split it into 2 atoms
+         # where max specially handles the case when n_dim is 8.
+-        ak_atom_size = max(a_swizzle_atom_elems // (micro_size_k // self.SPARSE_FACTOR), 1)
+-        bk_atom_size = max(b_swizzle_atom_elems // micro_size_k, 1)
++        ak_atom_size = a_params.k_atom_size
++        bk_atom_size = b_params.k_atom_size
+         wgmma_inst_m, wgmma_inst_n = self.wgmma_inst_m, self.wgmma_inst_n
+         num_inst_m = 4 * self.warp_row_tiles // wgmma_inst_m
+         num_inst_n = self.warp_col_tiles // wgmma_inst_n
+ 
+         thread_binding = self.get_thread_binding()
+ 
+-        A_ptr = retrive_ptr_from_buffer_region(A_region)
+-        B_ptr = retrive_ptr_from_buffer_region(B_region)
++        A_buf = A_region.buffer if isinstance(A_region, BufferRegion) else A_region
++        B_buf = B_region.buffer if isinstance(B_region, BufferRegion) else B_region
++        A_base_ptr = A_buf.access_ptr("r")
++        B_base_ptr = B_buf.access_ptr("r")
+         assert is_full_region(C_region), "Fragment output C must be a full region"
+         C_buf = C_region.buffer
+ 
+         @T.macro
+-        def _warp_mma(A_ptr, B_ptr, C_buf):
++        def _warp_mma(A_base_ptr, B_base_ptr, C_buf):
+             tx, warp_n, warp_m = self.extract_thread_binding(thread_binding)
+             k_blocks = k_dim // micro_size_k
+             e_stage_elems = self.warp_rows * self.local_size_e
+@@ -226,8 +204,20 @@ def _warp_mma(A_ptr, B_ptr, C_buf):
+ 
+             desc_a = T.alloc_wgmma_desc()
+             desc_b = T.alloc_wgmma_desc()
+-            T.initialize_wgmma_descriptor(desc_a, A_ptr, a_swizzle_mode, int(a_leading_byte_offset >> 4), int(a_stride_byte_offset >> 4))
+-            T.initialize_wgmma_descriptor(desc_b, B_ptr, b_swizzle_mode, int(b_leading_byte_offset >> 4), int(b_stride_byte_offset >> 4))
++            # Build each descriptor from the buffer base (loop-invariant => uniform
++            # cvta), then advance start_address_ to the slice origin via the
++            # descriptor's in-place add. Keeps the descriptor warp-uniform (no
++            # per-thread cvta of a slice pointer carrying an induction variable).
++            T.initialize_wgmma_descriptor(
++                desc_a, A_base_ptr, a_swizzle_mode.wgmma_layout_type(), a_params.leading_byte_offset, a_params.stride_byte_offset
++            )
++            if a_is_sliced:
++                T.increase_descriptor_offset(desc_a, a_slice_byte_offset)
++            T.initialize_wgmma_descriptor(
++                desc_b, B_base_ptr, b_swizzle_mode.wgmma_layout_type(), b_params.leading_byte_offset, b_params.stride_byte_offset
++            )
++            if b_is_sliced:
++                T.increase_descriptor_offset(desc_b, b_slice_byte_offset)
+ 
+             for ki in T.unroll(k_blocks):
+                 for i in T.unroll(num_inst_m):
+@@ -290,7 +280,7 @@ def _warp_mma(A_ptr, B_ptr, C_buf):
+                 T.warpgroup_wait(wg_wait)
+             T.warpgroup_fence_operand(C_buf, num_regs=accum_regs)
+ 
+-        return _warp_mma(A_ptr, B_ptr, C_buf)
++        return _warp_mma(A_base_ptr, B_base_ptr, C_buf)
+ 
+     def wgmma_rs(
+         self,
+@@ -328,27 +318,12 @@ def wgmma_rs(
+         accum_regs = ((m_dim // 64) * warp_cols * local_size_out * accum_bits + 31) // 32
+         b_is_k_major = self.b_transposed
+ 
+-        b_swizzle_mode = self._determinate_swizzle_mode(B_region, self.b_shared_layout)
+-        b_swizzle_atom_elems = n_dim if b_swizzle_mode.is_none() else b_swizzle_mode.swizzle_byte_size() // elems_in_bytes
+-
+-        b_leading_byte_offset = (8 * 8 * elems_in_bytes) if b_is_k_major else (8 * n_dim * elems_in_bytes)
+-        b_stride_byte_offset = (8 * k_dim * elems_in_bytes) if b_is_k_major else (0 if n_dim == 8 else (8 * 8 * elems_in_bytes))
+-        if not b_swizzle_mode.is_none():
+-            if b_is_k_major:
+-                b_leading_byte_offset = 16
+-                b_stride_byte_offset = 8 * b_swizzle_mode.swizzle_byte_size()
+-            else:
+-                b_n_axis_atoms = n_dim // b_swizzle_atom_elems
+-                if b_n_axis_atoms <= 1:
+-                    b_leading_byte_offset = 0
+-                else:
+-                    b_leading_byte_offset = 8 * 8 * elems_in_bytes * k_dim
+-                if b_n_axis_atoms <= 1:
+-                    b_stride_byte_offset = 8 * elems_in_bytes * n_dim
+-                else:
+-                    b_stride_byte_offset = 8 * elems_in_bytes * b_swizzle_atom_elems
+-
+-        bk_atom_size = max(b_swizzle_atom_elems // micro_size_k, 1)
++        b_params = self.compute_wgmma_b_desc_params(B_region)
++        b_swizzle_mode = b_params.swizzle_mode
++        b_swizzle_atom_elems = b_params.swizzle_atom_elems
++        b_slice_byte_offset = b_params.slice_byte_offset
++        b_is_sliced = not isinstance(b_slice_byte_offset, int) or b_slice_byte_offset != 0
++        bk_atom_size = b_params.k_atom_size
+         wgmma_inst_m, wgmma_inst_n = self.wgmma_inst_m, self.wgmma_inst_n
+         num_inst_m = 4 * self.warp_row_tiles // wgmma_inst_m
+         num_inst_n = self.warp_col_tiles // wgmma_inst_n
+@@ -358,19 +333,25 @@ def wgmma_rs(
+         assert is_full_region(A_region), "Fragment input A must be a full region"
+         assert is_full_region(C_region), "Fragment output C must be a full region"
+         A_buf = A_region.buffer
+-        B_ptr = retrive_ptr_from_buffer_region(B_region)
++        B_buf = B_region.buffer if isinstance(B_region, BufferRegion) else B_region
++        B_base_ptr = B_buf.access_ptr("r")
+         C_buf = C_region.buffer
+ 
+         k_blocks = k_dim // micro_size_k
+         e_stage_elems = self.warp_rows * self.local_size_e
+ 
+         @T.macro
+-        def _warp_mma(A_buf, B_ptr, C_buf):
++        def _warp_mma(A_buf, B_base_ptr, C_buf):
+             _, warp_n, warp_m = self.extract_thread_binding(thread_binding)
+             E_local = T.alloc_local((k_blocks * e_stage_elems), self.e_dtype)
+ 
+             desc_b = T.alloc_wgmma_desc()
+-            T.initialize_wgmma_descriptor(desc_b, B_ptr, b_swizzle_mode, int(b_leading_byte_offset >> 4), int(b_stride_byte_offset >> 4))
++            # Build from the buffer base (uniform cvta), then advance to the slice origin.
++            T.initialize_wgmma_descriptor(
++                desc_b, B_base_ptr, b_swizzle_mode.wgmma_layout_type(), b_params.leading_byte_offset, b_params.stride_byte_offset
++            )
++            if b_is_sliced:
++                T.increase_descriptor_offset(desc_b, b_slice_byte_offset)
+ 
+             for ki in T.unroll(k_blocks):
+                 for i in T.unroll(num_inst_m):
+@@ -426,7 +407,7 @@ def _warp_mma(A_buf, B_ptr, C_buf):
+             T.warpgroup_fence_operand(C_buf, num_regs=accum_regs)
+             T.warpgroup_fence_operand(A_buf, num_regs=a_regs)
+ 
+-        return _warp_mma(A_buf, B_ptr, C_buf)
++        return _warp_mma(A_buf, B_base_ptr, C_buf)
+ 
+     def ldmatrix_e(self, E_local_buf: Buffer, E_shared_buf: Buffer, inst_i: PrimExpr, warp_m: PrimExpr, ki: PrimExpr, ki_slot: PrimExpr):
+         num_inst_m = 4 * self.warp_row_tiles // self.wgmma_inst_m
+diff --git a/tilelang/layout/__init__.py b/tilelang/layout/__init__.py
+index 4174927e55..c6f892bb8f 100644
+--- a/tilelang/layout/__init__.py
++++ b/tilelang/layout/__init__.py
+@@ -17,4 +17,5 @@
+     make_fully_replicated_layout_fragment,  # noqa: F401
+ )
+ from .gemm_sp import make_cutlass_metadata_layout  # noqa: F401
++from .swizzle_mode import SwizzleMode  # noqa: F401
+ from . import cute  # noqa: F401  (registers tl.cute.* FFI objects on import)
+diff --git a/tilelang/layout/cute.py b/tilelang/layout/cute.py
+index 089ae57e82..3929f425de 100644
+--- a/tilelang/layout/cute.py
++++ b/tilelang/layout/cute.py
+@@ -8,12 +8,13 @@
+ 
+ import tvm
+ import tvm_ffi
+-from tvm.ir import PrimExpr
++from tvm.ir import PrimExpr, Range
+ from tvm.ir.base import Node
+ from tvm.runtime import Scriptable
+ 
+ from tilelang._typing import BufferLikeType
+ from . import _cute_ffi_api
++from .swizzle_mode import SwizzleMode
+ 
+ PyIntTuple = Union[int, PrimExpr, "ScaledBasis", tuple]
+ IntTupleLike = Union[int, PrimExpr, "ScaledBasis", Sequence, "IntTuple"]
+@@ -61,6 +62,9 @@ def is_swizzled(self) -> bool:
+     def recast(self, old_bits: int, new_bits: int) -> Swizzle:
+         return _cute_ffi_api.swizzle_recast(self, int(old_bits), int(new_bits))
+ 
++    def to_swizzle_mode(self) -> SwizzleMode:
++        return _cute_ffi_api.swizzle_to_swizzle_mode(self)
++
+ 
+ @tvm_ffi.register_object("tl.cute.IntTuple")
+ class IntTuple(Node, Scriptable):
+@@ -149,6 +153,9 @@ def __getitem__(self, idx: int) -> Layout:
+     def __call__(self, coord: IntTupleLike):
+         return to_python(_cute_ffi_api.layout_eval(self, from_python(coord)))
+ 
++    def with_shape(self, shape: IntTupleLike) -> Layout:
++        return _cute_ffi_api.with_shape(self, from_python(shape))
++
+     @staticmethod
+     def from_tilelang(layout) -> Layout | None:
+         return _cute_ffi_api.layout_from_tilelang(layout)
+@@ -182,21 +189,44 @@ def composition(lhs: Layout, rhs: Layout) -> Layout:
+     return _cute_ffi_api.composition(lhs, rhs)
+ 
+ 
+-def make_layout(shape: PyIntTuple, stride=None) -> Layout:
++def filter(layout: Layout) -> Layout:  # noqa: A001 - mirrors CuTe `filter`
++    return _cute_ffi_api.filter(layout)
++
++
++def congruent(a: IntTupleLike, b: IntTupleLike) -> bool:
++    return bool(_cute_ffi_api.congruent(from_python(a), from_python(b)))
++
++
++def cosize(layout: Layout) -> int:
++    return to_python(_cute_ffi_api.cosize(layout))
++
++
++def complement(layout: Layout, cotarget: int) -> Layout:
++    return _cute_ffi_api.complement(layout, int(cotarget))
++
++
++def logical_divide(layout: Layout, tiler: Layout) -> Layout:
++    return _cute_ffi_api.logical_divide(layout, tiler)
++
++
++def make_layout(shape: IntTupleLike, stride=None) -> Layout:
++    # Concat: make_layout([layout0, layout1, ...])
++    if stride is None and isinstance(shape, (tuple, list)) and shape and all(isinstance(x, Layout) for x in shape):
++        return _cute_ffi_api.make_layout_concat(list(shape))
+     if stride is None:
+         return _cute_ffi_api.make_column_major_layout(from_python(shape))
+     return _cute_ffi_api.make_layout(from_python(shape), from_python(stride))
+ 
+ 
+-def make_column_major_layout(shape: PyIntTuple) -> Layout:
++def make_column_major_layout(shape: IntTupleLike) -> Layout:
+     return _cute_ffi_api.make_column_major_layout(from_python(shape))
+ 
+ 
+-def make_row_major_layout(shape: PyIntTuple) -> Layout:
++def make_row_major_layout(shape: IntTupleLike) -> Layout:
+     return _cute_ffi_api.make_row_major_layout(from_python(shape))
+ 
+ 
+-def make_identity_layout(shape: PyIntTuple) -> Layout:
++def make_identity_layout(shape: IntTupleLike) -> Layout:
+     return _cute_ffi_api.make_identity_layout(from_python(shape))
+ 
+ 
+@@ -218,3 +248,8 @@ def from_tilelang(layout, buffer: BufferLikeType = None) -> ComposedLayout | Non
+ 
+         _, _, dtype = _get_buffer_info(buffer)
+         return mode.recast(int(tvm.DataType(dtype).bits), 8)
++
++
++def restrict(layout: Layout, region: Sequence[Range]) -> tuple[PyIntTuple, Layout]:
++    offset, sublayout = _cute_ffi_api.restrict(layout, list(region))
++    return to_python(offset), sublayout
+diff --git a/tilelang/layout/swizzle_mode.py b/tilelang/layout/swizzle_mode.py
+new file mode 100644
+index 0000000000..d38fbc1714
+--- /dev/null
++++ b/tilelang/layout/swizzle_mode.py
+@@ -0,0 +1,53 @@
++"""Shared memory swizzle mode."""
++
++from __future__ import annotations
++
++from typing import ClassVar
++
++from tvm_ffi.dataclasses import Enum
++
++from tilelang import _ffi_api
++
++
++class SwizzleMode(Enum, type_key="tl.SwizzleMode"):
++    # Bare ClassVar binders attach to the C++-registered variants.
++    NONE: ClassVar[SwizzleMode]
++    SWIZZLE_32B: ClassVar[SwizzleMode]
++    SWIZZLE_64B: ClassVar[SwizzleMode]
++    SWIZZLE_128B: ClassVar[SwizzleMode]
++
++    def is_none(self) -> bool:
++        return self.same_as(SwizzleMode.NONE)
++
++    def is_swizzle_32b(self) -> bool:
++        return self.same_as(SwizzleMode.SWIZZLE_32B)
++
++    def is_swizzle_64b(self) -> bool:
++        return self.same_as(SwizzleMode.SWIZZLE_64B)
++
++    def is_swizzle_128b(self) -> bool:
++        return self.same_as(SwizzleMode.SWIZZLE_128B)
++
++    def wgmma_layout_type(self) -> int:
++        """WGMMA descriptor ``layout_type_`` field (none->0, 32B->3, 64B->2, 128B->1)."""
++        return int(_ffi_api.swizzle_mode_wgmma_layout_type(self))
++
++    def tcgen05_layout_type(self) -> int:
++        """TCGEN05 descriptor swizzle field (none->0, 32B->6, 64B->4, 128B->2)."""
++        return int(_ffi_api.swizzle_mode_tcgen05_layout_type(self))
++
++    def swizzle_byte_size(self) -> int:
++        """Swizzle size in bytes (none->1, else 32/64/128)."""
++        return int(_ffi_api.swizzle_mode_byte_width(self))
++
++    def swizzle_atom_size(self) -> int:
++        """Swizzle size in 16-byte vectors (none->1, else 2/4/8)."""
++        return self.swizzle_byte_size() // 16 if not self.is_none() else 1
++
++    def smem_alignment(self) -> int:
++        """Required shared-memory base alignment in bytes (none->128, else 256/512/1024)."""
++        return int(_ffi_api.swizzle_mode_smem_alignment(self))
++
++    @staticmethod
++    def from_ordinal(ordinal: int) -> SwizzleMode:
++        return _ffi_api.swizzle_mode_from_ordinal(int(ordinal))
+diff --git a/tilelang/tileop/gemm/gemm_base.py b/tilelang/tileop/gemm/gemm_base.py
+index 598f8afef8..f0cb6e792f 100644
+--- a/tilelang/tileop/gemm/gemm_base.py
++++ b/tilelang/tileop/gemm/gemm_base.py
+@@ -106,7 +106,7 @@ def accum_dtype(self) -> str:
+ 
+     @property
+     def chunk(self) -> int:
+-        return self.A.shape[-2] if self.trans_A else self.A.shape[-1]
++        return self.K
+ 
+     @property
+     def A(self) -> tirx.Buffer:

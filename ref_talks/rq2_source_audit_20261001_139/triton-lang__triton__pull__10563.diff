@@ -1,0 +1,285 @@
+diff --git a/test/TritonGPU/amd/accelerate-amd-matmul-wmma-gen1.mlir b/test/TritonGPU/amd/accelerate-amd-matmul-wmma-gen1.mlir
+index 0333f6538aa0..1fdc4c1ea8f1 100644
+--- a/test/TritonGPU/amd/accelerate-amd-matmul-wmma-gen1.mlir
++++ b/test/TritonGPU/amd/accelerate-amd-matmul-wmma-gen1.mlir
+@@ -1,7 +1,7 @@
+ // RUN: triton-opt %s -split-input-file --tritonamdgpu-accelerate-matmul="gfx-arch=gfx1100 matrix-instruction-size=0" | FileCheck %s
+ 
+ // CHECK: #[[DOT_OP_PARENT:.+]] = #ttg.blocked<{{.*}}>
+-// CHECK: #[[WMMA_0:.+]] = #ttg.amd_wmma<{version = 1, isTranspose = true, ctaLayout = {warp = {{\[\[0, 1\], \[0, 2\]\]}}}}>
++// CHECK: #[[WMMA_0:.+]] = #ttg.amd_wmma<{version = 1, isTranspose = false, ctaLayout = {warp = {{\[\[0, 1\], \[0, 2\]\]}}}}>
+ #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+   tt.func public @wmma_dot_cf32(
+@@ -32,7 +32,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
+ // -----
+ 
+ // CHECK: #[[DOT_OP_PARENT:.+]] = #ttg.blocked<{{.*}}>
+-// CHECK: #[[WMMA_1:.+]] = #ttg.amd_wmma<{version = 1, isTranspose = true, ctaLayout = {warp = {{\[\[0, 1\], \[1, 0\]\]}}}}>
++// CHECK: #[[WMMA_1:.+]] = #ttg.amd_wmma<{version = 1, isTranspose = false, ctaLayout = {warp = {{\[\[0, 1\], \[1, 0\]\]}}}}>
+ #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+   tt.func public @wmma_dot_cf16(
+@@ -66,7 +66,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
+ // -----
+ 
+ // CHECK: #[[DOT_OP_PARENT:.+]] = #ttg.blocked<{{.*}}>
+-// CHECK: #[[WMMA_0:.+]] = #ttg.amd_wmma<{version = 1, isTranspose = true, ctaLayout = {warp = {{\[\[0, 1\], \[0, 2\]\]}}}}>
++// CHECK: #[[WMMA_0:.+]] = #ttg.amd_wmma<{version = 1, isTranspose = false, ctaLayout = {warp = {{\[\[0, 1\], \[0, 2\]\]}}}}>
+ #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+   tt.func public @wmma_dot_ab8_cf16(
+@@ -104,7 +104,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
+ // -----
+ 
+ // CHECK: #[[DOT_OP_PARENT:.+]] = #ttg.blocked<{{.*}}>
+-// CHECK: #[[WMMA_1:.+]] = #ttg.amd_wmma<{version = 1, isTranspose = true, ctaLayout = {warp = {{\[\[0, 1\], \[1, 0\]\]}}}}>
++// CHECK: #[[WMMA_1:.+]] = #ttg.amd_wmma<{version = 1, isTranspose = false, ctaLayout = {warp = {{\[\[0, 1\], \[1, 0\]\]}}}}>
+ #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+   tt.func public @wmma_dot_i8_i32(
+@@ -157,3 +157,45 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
+     tt.return
+   }
+ }
++
++// -----
++
++// Column-major output store (order = [0, 1]): for WMMA v1 the result layout is
++// isTranspose = true, which lets the 16-lane group coalesce on write-back.
++// CHECK: #[[BLOCKED_COL:.+]] = #ttg.blocked<{{.*}}order = {{\[0, 1\]}}}>
++// CHECK: #[[WMMA:.+]] = #ttg.amd_wmma<{version = 1, isTranspose = true,{{.*}}}>
++#blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
++#blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
++module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
++  tt.func public @wmma_dot_cf32_colmajor(
++   %0: tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #blocked}>>,
++   %1: tensor<64x256xf16, #ttg.dot_op<{opIdx = 1, parent = #blocked}>>,
++   %2: tensor<128x256x!tt.ptr<f32>, #blocked1>) {
++    %3 = arith.constant dense<0.000000e+00> : tensor<128x256xf32, #blocked>
++    // CHECK: tt.dot {{.*}} -> tensor<128x256xf32, #[[WMMA]]>
++    %4 = tt.dot %0, %1, %3 : tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #blocked}>> * tensor<64x256xf16, #ttg.dot_op<{opIdx = 1, parent = #blocked}>> -> tensor<128x256xf32, #blocked>
++    // CHECK: tt.store {{.*}} : tensor<128x256x!tt.ptr<f32>, #[[BLOCKED_COL]]>
++    %5 = ttg.convert_layout %4 : tensor<128x256xf32, #blocked> -> tensor<128x256xf32, #blocked1>
++    tt.store %2, %5 : tensor<128x256x!tt.ptr<f32>, #blocked1>
++    tt.return
++  }
++}
++
++// -----
++
++// No reachable store (the result is returned): getConsumerStoreOrder yields
++// nothing, so the default layout is kept (isTranspose = version > 1, i.e. false
++// for v1).
++// CHECK: #[[WMMA:.+]] = #ttg.amd_wmma<{version = 1, isTranspose = false,{{.*}}}>
++#blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
++module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
++  tt.func public @wmma_dot_cf32_no_store(
++   %0: tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #blocked}>>,
++   %1: tensor<64x256xf16, #ttg.dot_op<{opIdx = 1, parent = #blocked}>>)
++   -> tensor<128x256xf32, #blocked> {
++    %2 = arith.constant dense<0.000000e+00> : tensor<128x256xf32, #blocked>
++    // CHECK: tt.dot {{.*}} -> tensor<128x256xf32, #[[WMMA]]>
++    %3 = tt.dot %0, %1, %2 : tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #blocked}>> * tensor<64x256xf16, #ttg.dot_op<{opIdx = 1, parent = #blocked}>> -> tensor<128x256xf32, #blocked>
++    tt.return %3 : tensor<128x256xf32, #blocked>
++  }
++}
+diff --git a/test/TritonGPU/amd/accelerate-amd-matmul-wmma-gen2.mlir b/test/TritonGPU/amd/accelerate-amd-matmul-wmma-gen2.mlir
+index a7da9166908e..eb9e655b8c06 100644
+--- a/test/TritonGPU/amd/accelerate-amd-matmul-wmma-gen2.mlir
++++ b/test/TritonGPU/amd/accelerate-amd-matmul-wmma-gen2.mlir
+@@ -189,3 +189,45 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
+     tt.return
+   }
+ }
++
++// -----
++
++// Column-major output store (order = [0, 1]): for WMMA v2 the result layout is
++// isTranspose = false, matching the store's in-memory order for vectorization.
++// CHECK: #[[BLOCKED_COL:.+]] = #ttg.blocked<{{.*}}order = {{\[0, 1\]}}}>
++// CHECK: #[[WMMA:.+]] = #ttg.amd_wmma<{version = 2, isTranspose = false,{{.*}}}>
++#blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
++#blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
++module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
++  tt.func public @wmma_dot_cf32_colmajor(
++   %0: tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #blocked}>>,
++   %1: tensor<64x256xf16, #ttg.dot_op<{opIdx = 1, parent = #blocked}>>,
++   %2: tensor<128x256x!tt.ptr<f32>, #blocked1>) {
++    %3 = arith.constant dense<0.000000e+00> : tensor<128x256xf32, #blocked>
++    // CHECK: tt.dot {{.*}} -> tensor<128x256xf32, #[[WMMA]]>
++    %4 = tt.dot %0, %1, %3 : tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #blocked}>> * tensor<64x256xf16, #ttg.dot_op<{opIdx = 1, parent = #blocked}>> -> tensor<128x256xf32, #blocked>
++    // CHECK: tt.store {{.*}} : tensor<128x256x!tt.ptr<f32>, #[[BLOCKED_COL]]>
++    %5 = ttg.convert_layout %4 : tensor<128x256xf32, #blocked> -> tensor<128x256xf32, #blocked1>
++    tt.store %2, %5 : tensor<128x256x!tt.ptr<f32>, #blocked1>
++    tt.return
++  }
++}
++
++// -----
++
++// No reachable store (the result is returned): getConsumerStoreOrder yields
++// nothing, so the default layout is kept (isTranspose = version > 1, i.e. true
++// for v2).
++// CHECK: #[[WMMA:.+]] = #ttg.amd_wmma<{version = 2, isTranspose = true,{{.*}}}>
++#blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
++module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
++  tt.func public @wmma_dot_cf32_no_store(
++   %0: tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #blocked}>>,
++   %1: tensor<64x256xf16, #ttg.dot_op<{opIdx = 1, parent = #blocked}>>)
++   -> tensor<128x256xf32, #blocked> {
++    %2 = arith.constant dense<0.000000e+00> : tensor<128x256xf32, #blocked>
++    // CHECK: tt.dot {{.*}} -> tensor<128x256xf32, #[[WMMA]]>
++    %3 = tt.dot %0, %1, %2 : tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #blocked}>> * tensor<64x256xf16, #ttg.dot_op<{opIdx = 1, parent = #blocked}>> -> tensor<128x256xf32, #blocked>
++    tt.return %3 : tensor<128x256xf32, #blocked>
++  }
++}
+diff --git a/test/TritonGPU/amd/accelerate-amd-matmul-wmma-gfx1250.mlir b/test/TritonGPU/amd/accelerate-amd-matmul-wmma-gfx1250.mlir
+index 0efdcbf37c34..910d3817ee07 100644
+--- a/test/TritonGPU/amd/accelerate-amd-matmul-wmma-gfx1250.mlir
++++ b/test/TritonGPU/amd/accelerate-amd-matmul-wmma-gfx1250.mlir
+@@ -467,3 +467,54 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
+     tt.return
+   }
+ }
++
++// -----
++
++// Column-major output store (order = [0, 1]): for WMMA v3 the result layout is
++// isTranspose = false, matching the store's in-memory order for vectorization.
++// CHECK: #[[BLOCKED_COL:.+]] = #ttg.blocked<{{.*}}order = {{\[0, 1\]}}}>
++// CHECK: #[[WMMA:.+]] = #ttg.amd_wmma<{version = 3, isTranspose = false,{{.*}}}>
++#blocked = #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0] }>
++#blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
++#op0 = #ttg.dot_op<{opIdx = 0, parent = #blocked}>
++#op1 = #ttg.dot_op<{opIdx = 1, parent = #blocked}>
++module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
++  tt.func public @wmma_dot_f16_f32_colmajor(
++      %arg0: tensor<32x8x!tt.ptr<f16>, #op0>,
++      %arg1: tensor<8x32x!tt.ptr<f16>, #op1>,
++      %arg2: tensor<32x32x!tt.ptr<f32>, #blocked1>
++      ) {
++    %a = tt.load %arg0 : tensor<32x8x!tt.ptr<f16>, #op0>
++    %b = tt.load %arg1 : tensor<8x32x!tt.ptr<f16>, #op1>
++    %c = arith.constant dense<0.000000e+00> : tensor<32x32xf32, #blocked>
++    // CHECK: tt.dot {{.*}} -> tensor<32x32xf32, #[[WMMA]]>
++    %res = tt.dot %a, %b, %c : tensor<32x8xf16, #op0> * tensor<8x32xf16, #op1> -> tensor<32x32xf32, #blocked>
++    // CHECK: tt.store {{.*}} : tensor<32x32x!tt.ptr<f32>, #[[BLOCKED_COL]]>
++    %cvt = ttg.convert_layout %res : tensor<32x32xf32, #blocked> -> tensor<32x32xf32, #blocked1>
++    tt.store %arg2, %cvt : tensor<32x32x!tt.ptr<f32>, #blocked1>
++    tt.return
++  }
++}
++
++// -----
++
++// No reachable store (the result is returned): getConsumerStoreOrder yields
++// nothing, so the default layout is kept (isTranspose = version > 1, i.e. true
++// for v3).
++// CHECK: #[[WMMA:.+]] = #ttg.amd_wmma<{version = 3, isTranspose = true,{{.*}}}>
++#blocked = #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0] }>
++#op0 = #ttg.dot_op<{opIdx = 0, parent = #blocked}>
++#op1 = #ttg.dot_op<{opIdx = 1, parent = #blocked}>
++module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
++  tt.func public @wmma_dot_f16_f32_no_store(
++      %arg0: tensor<32x8x!tt.ptr<f16>, #op0>,
++      %arg1: tensor<8x32x!tt.ptr<f16>, #op1>
++      ) -> tensor<32x32xf32, #blocked> {
++    %a = tt.load %arg0 : tensor<32x8x!tt.ptr<f16>, #op0>
++    %b = tt.load %arg1 : tensor<8x32x!tt.ptr<f16>, #op1>
++    %c = arith.constant dense<0.000000e+00> : tensor<32x32xf32, #blocked>
++    // CHECK: tt.dot {{.*}} -> tensor<32x32xf32, #[[WMMA]]>
++    %res = tt.dot %a, %b, %c : tensor<32x8xf16, #op0> * tensor<8x32xf16, #op1> -> tensor<32x32xf32, #blocked>
++    tt.return %res : tensor<32x32xf32, #blocked>
++  }
++}
+diff --git a/third_party/amd/lib/TritonAMDGPUTransforms/AccelerateAMDMatmul.cpp b/third_party/amd/lib/TritonAMDGPUTransforms/AccelerateAMDMatmul.cpp
+index f9e674fbcd3d..2cc6e302311a 100644
+--- a/third_party/amd/lib/TritonAMDGPUTransforms/AccelerateAMDMatmul.cpp
++++ b/third_party/amd/lib/TritonAMDGPUTransforms/AccelerateAMDMatmul.cpp
+@@ -2,6 +2,7 @@
+ #include "TritonAMDGPUTransforms/Passes.h"
+ #include "TritonAMDGPUTransforms/WmmaGroup.h"
+ #include "mlir/Dialect/Arith/IR/Arith.h"
++#include "mlir/Dialect/SCF/IR/SCF.h"
+ #include "mlir/IR/TypeUtilities.h"
+ #include "mlir/Support/LogicalResult.h"
+ #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+@@ -1437,6 +1438,54 @@ FailureOr<WmmaIntrinsic> chooseWmmaInstruction(tt::DotOp dot,
+       operandTypes[1], operandTypes[2], dot.getA().getType().getShape().back());
+ }
+ 
++// Follow the dot result forward to the global store(s) that consume it and
++// return the store's in-memory `order` (set by Coalesce from the pointer
++// contiguity; it lives on the stored value, not the dot result). The walk
++// follows every non-dot user forward, crossing out of loops/conditionals via
++// scf.yield, and stops at another dot (a chain-dot head keeps its default
++// layout). Only same-shaped stores count. Returns std::nullopt when no store is
++// reachable or when reachable stores disagree.
++static std::optional<SmallVector<unsigned>> getConsumerStoreOrder(Value root) {
++  ArrayRef<int64_t> rootShape =
++      cast<RankedTensorType>(root.getType()).getShape();
++  std::optional<SmallVector<unsigned>> order;
++  SmallVector<Value> worklist{root};
++  llvm::SmallPtrSet<Value, 8> seen;
++
++  while (!worklist.empty()) {
++    Value v = worklist.pop_back_val();
++    if (!seen.insert(v).second)
++      continue;
++
++    for (OpOperand &use : v.getUses()) {
++      Operation *user = use.getOwner();
++
++      if (auto storeOp = dyn_cast<tt::StoreOp>(user)) {
++        auto ty = dyn_cast<RankedTensorType>(storeOp.getValue().getType());
++        // The blocked `order` attribute is the in-memory contiguity order.
++        auto enc =
++            ty ? dyn_cast<ttg::BlockedEncodingAttr>(ty.getEncoding()) : nullptr;
++        if (!enc || ty.getShape() != rootShape)
++          continue;
++        SmallVector<unsigned> storeOrder = llvm::to_vector(enc.getOrder());
++        if (order && *order != storeOrder)
++          return std::nullopt; // conflicting stores
++        order = std::move(storeOrder);
++      } else if (auto yieldOp = dyn_cast<scf::YieldOp>(user)) {
++        // A yielded value becomes the tied parent result. Only scf.for/scf.if
++        // map yield operand index to result index (not scf.while).
++        if (isa<scf::ForOp, scf::IfOp>(yieldOp->getParentOp()))
++          worklist.push_back(
++              yieldOp->getParentOp()->getResult(use.getOperandNumber()));
++      } else if (!isa<tt::DotOpInterface>(user)) {
++        // Follow the value through any other (elementwise/cast/convert) op.
++        worklist.append(user->result_begin(), user->result_end());
++      }
++    }
++  }
++  return order;
++}
++
+ class BlockedToWMMA : public OpRewritePattern<tt::DotOp> {
+   int wmmaVersion;
+ 
+@@ -1509,9 +1558,19 @@ class BlockedToWMMA : public OpRewritePattern<tt::DotOp> {
+     auto warpsPerTile =
+         planWarps(dotOp, retShapePerCTA, numWarps, {mDim, nDim});
+ 
+-    // Use transposed wmma layout to enable larger vectorization for global
+-    // store instructions.
+-    bool isTransposed = true;
++    // Pick the result transposition to best vectorize/coalesce the consuming
++    // store. v2/3 vectorize per-lane with a transposed layout; v1 can't (padded
++    // 32-bit VGPRs) and instead coalesces the 16-lane group, so the choice
++    // flips with version and store order:
++    //   row-major store (N fastest): isTransposed = (version > 1)
++    //   col-major store (M fastest): isTransposed = (version == 1)
++    // With no consuming store (e.g. a chain-dot head), keep the default.
++    bool isTransposed = (wmmaVersion > 1);
++    if (auto storeOrder = getConsumerStoreOrder(dotOp.getResult())) {
++      bool outRowMajor =
++          storeOrder->front() == static_cast<unsigned>(retShape.size() - 1);
++      isTransposed = outRowMajor ? (wmmaVersion > 1) : (wmmaVersion == 1);
++    }
+     SmallVector<unsigned> tilesPerWarp(retShape.size(), 1u);
+     auto ctaLayout = ttg::chooseWmmaCTALinearLayout(ctx, retShape.size(),
+                                                     warpsPerTile, tilesPerWarp);

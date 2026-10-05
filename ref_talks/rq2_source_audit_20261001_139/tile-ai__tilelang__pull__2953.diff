@@ -1,0 +1,565 @@
+diff --git a/src/cuda/transform/lower_shared_tmem.cc b/src/cuda/transform/lower_shared_tmem.cc
+index 758d9a9618..1c4aba528c 100644
+--- a/src/cuda/transform/lower_shared_tmem.cc
++++ b/src/cuda/transform/lower_shared_tmem.cc
+@@ -609,11 +609,9 @@ class SharedTmemRewriter : public StmtExprMutator {
+       auto new_buffer = buffer_remap_[load->buffer];
+       return BufferLoad(new_buffer, {0}) + GetArenaTmemOffset(buffer, indices);
+     } else if (var_remap_.count(buffer->data)) {
+-      auto new_buffer = Buffer(
+-          var_remap_[buffer->data], tmem_dtype_, buffer->shape, buffer->strides,
+-          buffer->elem_offset, buffer->name, buffer->data_alignment,
+-          buffer->offset_factor, buffer->buffer_type);
+-      return BufferLoad(new_buffer, {0}) + GetArenaTmemOffset(buffer, indices);
++      Buffer arena_buffer = buffer_data_to_buffer_.at(var_remap_[buffer->data]);
++      return BufferLoad(arena_buffer, {0}) +
++             GetArenaTmemOffset(buffer, indices);
+     }
+     return load;
+   }
+diff --git a/src/layout/layout.cc b/src/layout/layout.cc
+index 725cc0addf..be34d087ee 100644
+--- a/src/layout/layout.cc
++++ b/src/layout/layout.cc
+@@ -119,31 +119,47 @@ PrimExpr RestoreInputPlaceholders(const PrimExpr &expr,
+   return restored;
+ }
+ 
+-Layout TryPackedSubtypeReshape(const LayoutNode *layout_node,
+-                               const Array<PrimExpr> &shape,
+-                               arith::Analyzer *analyzer,
+-                               const PrimExpr &old_elem_bits_expr,
+-                               const PrimExpr &new_elem_bits_expr) {
++/*!
++ * \brief Derive the layout of a reinterpreting view (same storage, new
++ *        element width).
++ *
++ * Layout outputs are measured in the buffer's own elements, so aliases of
++ * one storage are compatible iff they induce the same storage-bit map,
++ * bit(k) = flat_output(k) * elem_bits. Deriving a view's layout is unit
++ * conversion through that map, and the directions are not symmetric:
++ *  - Narrowing by a factor f: old element q becomes new elements
++ *    f*q .. f*q+f-1; always representable, as last_output * f + lane.
++ *  - Widening by f: representable only when every aligned group of f old
++ *    elements sits contiguously in one aligned slot, which is proven here;
++ *    a layout that interleaves storage below the new element width (e.g.
++ *    the pack::16b TMEM form) has no compatible view layout, a hard error.
++ *
++ * Returns an undefined Layout when the widths match: the generic flat-index
++ * reshape is exact then, and only then.
++ */
++Layout TryReinterpretReshape(const LayoutNode *layout_node,
++                             const Array<PrimExpr> &shape,
++                             arith::Analyzer *analyzer,
++                             const PrimExpr &old_elem_bits_expr,
++                             const PrimExpr &new_elem_bits_expr) {
+   const int64_t *old_elem_bits = as_const_int(old_elem_bits_expr);
+   const int64_t *new_elem_bits = as_const_int(new_elem_bits_expr);
+-  if (old_elem_bits == nullptr || new_elem_bits == nullptr) {
+-    return Layout();
+-  }
+-  if (*old_elem_bits <= 0 || *new_elem_bits <= 0) {
++  if (old_elem_bits == nullptr || new_elem_bits == nullptr ||
++      *old_elem_bits == *new_elem_bits) {
+     return Layout();
+   }
++  ICHECK_GT(*old_elem_bits, 0);
++  ICHECK_GT(*new_elem_bits, 0);
+ 
+   const Array<PrimExpr> &input_shape = layout_node->InputShape();
++  Array<Var> new_vars = CreateReshapeVars(shape, analyzer);
++  PrimExpr flat_index = ComputeFlatIndex(shape, new_vars);
+ 
+-  // Narrower target element, e.g. uint8 -> fp4.
+-  // One old logical element now contains `pack_factor` new logical elements.
+-  // The generic flat-index reshape would lose this packed-storage structure, so
+-  // we materialize it as an extra trailing output dimension ("pack lane").
+-  if (*old_elem_bits > *new_elem_bits && *old_elem_bits % *new_elem_bits == 0 &&
+-      *new_elem_bits < 8) {
++  if (*old_elem_bits > *new_elem_bits) {
++    ICHECK_EQ(*old_elem_bits % *new_elem_bits, 0)
++        << "cannot reinterpret " << *old_elem_bits << "-bit elements as "
++        << *new_elem_bits << "-bit elements";
+     int64_t pack_factor = *old_elem_bits / *new_elem_bits;
+-    Array<Var> new_vars = CreateReshapeVars(shape, analyzer);
+-    PrimExpr flat_index = ComputeFlatIndex(shape, new_vars);
+     PrimExpr old_flat_index = floordiv(flat_index, Integer(pack_factor));
+     PrimExpr lane_in_pack = floormod(flat_index, Integer(pack_factor));
+ 
+@@ -152,70 +168,90 @@ Layout TryPackedSubtypeReshape(const LayoutNode *layout_node,
+     Array<PrimExpr> new_forward_index =
+         SubstituteForwardIndex(layout_node->GetForwardIndex(), input_shape,
+                                original_indices, analyzer);
+-    new_forward_index.push_back(analyzer->Simplify(lane_in_pack));
++    ICHECK(!new_forward_index.empty());
++    PrimExpr last = new_forward_index.back();
++    new_forward_index.Set(
++        new_forward_index.size() - 1,
++        analyzer->Simplify(last * Integer(pack_factor) + lane_in_pack));
+     new_forward_index = RestoreInputPlaceholders(new_forward_index, new_vars);
+     return Layout(shape, new_forward_index);
+-  }
+-
+-  // Wider target element, e.g. fp4 -> uint8.
+-  // This is only valid if the current layout already exposes the packed
+-  // sub-elements as its last output dimension.  We collapse that trailing pack
+-  // lane back into the logical element index of the wider dtype.
+-  if (*old_elem_bits < *new_elem_bits && *new_elem_bits % *old_elem_bits == 0 &&
+-      *old_elem_bits < 8) {
++  } else { // *old_elem_bits < *new_elem_bits
++    ICHECK_EQ(*new_elem_bits % *old_elem_bits, 0)
++        << "cannot reinterpret " << *old_elem_bits << "-bit elements as "
++        << *new_elem_bits << "-bit elements";
+     int64_t pack_factor = *new_elem_bits / *old_elem_bits;
+-    Array<PrimExpr> output_shape = layout_node->OutputShape();
+-    if (output_shape.empty() ||
+-        !analyzer->CanProveEqual(output_shape.back(), Integer(pack_factor))) {
+-      return Layout();
+-    }
+ 
+-    Array<Var> new_vars = CreateReshapeVars(shape, analyzer);
+-    PrimExpr flat_index = ComputeFlatIndex(shape, new_vars);
+-    PrimExpr old_flat_index = flat_index * Integer(pack_factor);
+-    Array<PrimExpr> original_indices =
+-        RecoverOriginalIndices(input_shape, old_flat_index);
+-
+-    Array<PrimExpr> expanded_forward_index =
+-        SubstituteForwardIndex(layout_node->GetForwardIndex(), input_shape,
+-                               original_indices, analyzer);
+-    ICHECK_GT(expanded_forward_index.size(), 0);
+-    Array<PrimExpr> new_forward_index;
+-    new_forward_index.reserve(expanded_forward_index.size() - 1);
+-    for (size_t i = 0; i + 1 < expanded_forward_index.size(); ++i) {
+-      new_forward_index.push_back(expanded_forward_index[i]);
++    Var lane("_lane", flat_index.dtype());
++    analyzer->Bind(lane, Range(0, Integer(pack_factor)));
++    Array<PrimExpr> base = SubstituteForwardIndex(
++        layout_node->GetForwardIndex(), input_shape,
++        RecoverOriginalIndices(input_shape, flat_index * Integer(pack_factor)),
++        analyzer);
++    Array<PrimExpr> probe = SubstituteForwardIndex(
++        layout_node->GetForwardIndex(), input_shape,
++        RecoverOriginalIndices(input_shape,
++                               flat_index * Integer(pack_factor) + lane),
++        analyzer);
++    ICHECK(!base.empty());
++    PrimExpr slot = floordiv(base.back(), Integer(pack_factor));
++    bool compatible = analyzer->CanProveEqual(
++        probe.back(), slot * Integer(pack_factor) + lane);
++    for (size_t i = 0; compatible && i + 1 < base.size(); ++i) {
++      compatible = analyzer->CanProveEqual(probe[i], base[i]);
+     }
++    ICHECK(compatible)
++        << "cannot reinterpret layout " << layout_node->DebugOutput() << " as "
++        << *new_elem_bits << "-bit elements: aliasing buffers must induce the "
++        << "same storage layout, and this one interleaves storage below the "
++        << "new element width";
++    Array<PrimExpr> new_forward_index = base;
++    new_forward_index.Set(new_forward_index.size() - 1,
++                          analyzer->Simplify(slot));
+     new_forward_index = RestoreInputPlaceholders(new_forward_index, new_vars);
+     return Layout(shape, new_forward_index);
+   }
+-
+-  return Layout();
+ }
+ 
+-Fragment TryPackedSubtypeReshape(const FragmentNode *fragment_node,
+-                                 const Array<PrimExpr> &shape,
+-                                 arith::Analyzer *analyzer,
+-                                 const PrimExpr &old_elem_bits_expr,
+-                                 const PrimExpr &new_elem_bits_expr) {
++/*!
++ * \brief The Fragment counterpart of TryReinterpretReshape above: the same
++ *        unit conversion over the per-thread value index, with the thread
++ *        mapping required to be invariant inside each widened group.
++ */
++Fragment TryReinterpretReshape(const FragmentNode *fragment_node,
++                               const Array<PrimExpr> &shape,
++                               arith::Analyzer *analyzer,
++                               const PrimExpr &old_elem_bits_expr,
++                               const PrimExpr &new_elem_bits_expr) {
+   const int64_t *old_elem_bits = as_const_int(old_elem_bits_expr);
+   const int64_t *new_elem_bits = as_const_int(new_elem_bits_expr);
+-  if (old_elem_bits == nullptr || new_elem_bits == nullptr) {
+-    return Fragment();
+-  }
+-  if (*old_elem_bits <= 0 || *new_elem_bits <= 0) {
++  if (old_elem_bits == nullptr || new_elem_bits == nullptr ||
++      *old_elem_bits == *new_elem_bits) {
+     return Fragment();
+   }
++  ICHECK_GT(*old_elem_bits, 0);
++  ICHECK_GT(*new_elem_bits, 0);
+ 
+   const Array<PrimExpr> &input_shape = fragment_node->InputShape();
++  Array<Var> new_vars = CreateReshapeVars(shape, analyzer);
++  PrimExpr flat_index = ComputeFlatIndex(shape, new_vars);
+ 
+-  // Same idea as Layout::Reshape above: preserve packed sub-byte storage by
+-  // making the pack lane explicit in the fragment mapping instead of silently
+-  // flattening it away.
+-  if (*old_elem_bits > *new_elem_bits && *old_elem_bits % *new_elem_bits == 0 &&
+-      *new_elem_bits < 8) {
++  auto make_fragment = [&](Array<PrimExpr> forward_index,
++                           PrimExpr forward_thread) {
++    forward_index = RestoreInputPlaceholders(forward_index, new_vars);
++    forward_thread = RestoreInputPlaceholders(forward_thread, new_vars);
++    Fragment reshaped(shape, forward_index, forward_thread,
++                      fragment_node->ReplicateExtent(), std::nullopt);
++    if (fragment_node->ThreadRange().defined()) {
++      reshaped = reshaped->BindThreadRange(fragment_node->ThreadRange());
++    }
++    return reshaped;
++  };
++
++  if (*old_elem_bits > *new_elem_bits) {
++    ICHECK_EQ(*old_elem_bits % *new_elem_bits, 0)
++        << "cannot reinterpret " << *old_elem_bits << "-bit elements as "
++        << *new_elem_bits << "-bit elements";
+     int64_t pack_factor = *old_elem_bits / *new_elem_bits;
+-    Array<Var> new_vars = CreateReshapeVars(shape, analyzer);
+-    PrimExpr flat_index = ComputeFlatIndex(shape, new_vars);
+     PrimExpr old_flat_index = floordiv(flat_index, Integer(pack_factor));
+     PrimExpr lane_in_pack = floormod(flat_index, Integer(pack_factor));
+ 
+@@ -224,62 +260,56 @@ Fragment TryPackedSubtypeReshape(const FragmentNode *fragment_node,
+     Array<PrimExpr> new_forward_index =
+         SubstituteForwardIndex(fragment_node->GetForwardIndex(), input_shape,
+                                original_indices, analyzer);
+-    new_forward_index.push_back(analyzer->Simplify(lane_in_pack));
+-
++    ICHECK(!new_forward_index.empty());
++    PrimExpr last = new_forward_index.back();
++    new_forward_index.Set(
++        new_forward_index.size() - 1,
++        analyzer->Simplify(last * Integer(pack_factor) + lane_in_pack));
+     PrimExpr new_forward_thread =
+         SubstituteReshapedExpr(fragment_node->GetForwardThread(), input_shape,
+                                original_indices, analyzer);
+-    new_forward_index = RestoreInputPlaceholders(new_forward_index, new_vars);
+-    new_forward_thread = RestoreInputPlaceholders(new_forward_thread, new_vars);
+-
+-    Fragment reshaped(shape, new_forward_index, new_forward_thread,
+-                      fragment_node->ReplicateExtent(), std::nullopt);
+-    if (fragment_node->ThreadRange().defined()) {
+-      reshaped = reshaped->BindThreadRange(fragment_node->ThreadRange());
+-    }
+-    return reshaped;
+-  }
+-
+-  if (*old_elem_bits < *new_elem_bits && *new_elem_bits % *old_elem_bits == 0 &&
+-      *old_elem_bits < 8) {
++    return make_fragment(new_forward_index, new_forward_thread);
++  } else { // *old_elem_bits < *new_elem_bits
++    ICHECK_EQ(*new_elem_bits % *old_elem_bits, 0)
++        << "cannot reinterpret " << *old_elem_bits << "-bit elements as "
++        << *new_elem_bits << "-bit elements";
+     int64_t pack_factor = *new_elem_bits / *old_elem_bits;
+-    Array<PrimExpr> output_shape = fragment_node->OutputShape();
+-    if (output_shape.empty() ||
+-        !analyzer->CanProveEqual(output_shape.back(), Integer(pack_factor))) {
+-      return Fragment();
+-    }
+-
+-    Array<Var> new_vars = CreateReshapeVars(shape, analyzer);
+-    PrimExpr flat_index = ComputeFlatIndex(shape, new_vars);
+-    PrimExpr old_flat_index = flat_index * Integer(pack_factor);
+     Array<PrimExpr> original_indices =
+-        RecoverOriginalIndices(input_shape, old_flat_index);
++        RecoverOriginalIndices(input_shape, flat_index * Integer(pack_factor));
+ 
+-    Array<PrimExpr> expanded_forward_index =
++    Var lane("_lane", flat_index.dtype());
++    analyzer->Bind(lane, Range(0, Integer(pack_factor)));
++    Array<PrimExpr> probe_indices = RecoverOriginalIndices(
++        input_shape, flat_index * Integer(pack_factor) + lane);
++    Array<PrimExpr> base =
+         SubstituteForwardIndex(fragment_node->GetForwardIndex(), input_shape,
+                                original_indices, analyzer);
+-    ICHECK_GT(expanded_forward_index.size(), 0);
+-    Array<PrimExpr> new_forward_index;
+-    new_forward_index.reserve(expanded_forward_index.size() - 1);
+-    for (size_t i = 0; i + 1 < expanded_forward_index.size(); ++i) {
+-      new_forward_index.push_back(expanded_forward_index[i]);
+-    }
+-
+-    PrimExpr new_forward_thread =
++    Array<PrimExpr> probe = SubstituteForwardIndex(
++        fragment_node->GetForwardIndex(), input_shape, probe_indices, analyzer);
++    PrimExpr thread_base =
+         SubstituteReshapedExpr(fragment_node->GetForwardThread(), input_shape,
+                                original_indices, analyzer);
+-    new_forward_index = RestoreInputPlaceholders(new_forward_index, new_vars);
+-    new_forward_thread = RestoreInputPlaceholders(new_forward_thread, new_vars);
+-
+-    Fragment reshaped(shape, new_forward_index, new_forward_thread,
+-                      fragment_node->ReplicateExtent(), std::nullopt);
+-    if (fragment_node->ThreadRange().defined()) {
+-      reshaped = reshaped->BindThreadRange(fragment_node->ThreadRange());
++    PrimExpr thread_probe =
++        SubstituteReshapedExpr(fragment_node->GetForwardThread(), input_shape,
++                               probe_indices, analyzer);
++    ICHECK(!base.empty());
++    PrimExpr slot = floordiv(base.back(), Integer(pack_factor));
++    bool compatible = analyzer->CanProveEqual(
++                          probe.back(), slot * Integer(pack_factor) + lane) &&
++                      analyzer->CanProveEqual(thread_probe, thread_base);
++    for (size_t i = 0; compatible && i + 1 < base.size(); ++i) {
++      compatible = analyzer->CanProveEqual(probe[i], base[i]);
+     }
+-    return reshaped;
++    ICHECK(compatible)
++        << "cannot reinterpret fragment " << fragment_node->DebugOutput()
++        << " as " << *new_elem_bits << "-bit elements: aliasing buffers must "
++        << "induce the same storage layout, and this one interleaves storage "
++        << "or threads below the new element width";
++    Array<PrimExpr> new_forward_index = base;
++    new_forward_index.Set(new_forward_index.size() - 1,
++                          analyzer->Simplify(slot));
++    return make_fragment(new_forward_index, thread_base);
+   }
+-
+-  return Fragment();
+ }
+ 
+ } // namespace
+@@ -873,14 +903,13 @@ Layout LayoutNode::Reshape(const Array<PrimExpr> &shape,
+       << "InputShape() = " << InputShape() << " shape = " << shape
+       << ", rescale_num = " << rescale_num << ", rescale_den = " << rescale_den;
+ 
+-  // The generic reshape below only reasons about a flat logical element index.
+-  // For subtype-changing views on packed sub-byte dtypes, that is not enough:
+-  // we must preserve which sub-element inside a packed storage slot is being
+-  // referenced.  Handle that first, then fall back to the ordinary reshape.
+-  if (auto packed =
+-          TryPackedSubtypeReshape(this, shape, az, rescale_num, rescale_den);
+-      packed.defined()) {
+-    return packed;
++  // The generic reshape below only reasons about a flat logical element
++  // index, which is exact only when the element width is unchanged.
++  // Reinterpreting views are handled first.
++  if (auto reinterpreted =
++          TryReinterpretReshape(this, shape, az, rescale_num, rescale_den);
++      reinterpreted.defined()) {
++    return reinterpreted;
+   }
+ 
+   // Step 2. Create new forward indices by reshaping
+@@ -927,12 +956,12 @@ Layout FragmentNode::Reshape(const Array<PrimExpr> &shape,
+       << ", rescale_num = " << rescale_num << ", rescale_den = " << rescale_den
+       << " input fragment layout is = " << DebugOutput();
+ 
+-  // Fragments need the same special handling as plain layouts so that packed
+-  // subtype views keep a stable thread/data mapping through reshape.
+-  if (auto packed =
+-          TryPackedSubtypeReshape(this, shape, az, rescale_num, rescale_den);
+-      packed.defined()) {
+-    return packed;
++  // Fragments need the same special handling as plain layouts so that
++  // reinterpreting views keep a stable thread/data mapping through reshape.
++  if (auto reinterpreted =
++          TryReinterpretReshape(this, shape, az, rescale_num, rescale_den);
++      reinterpreted.defined()) {
++    return reinterpreted;
+   }
+ 
+   // 2) Build flat index from new-shape indices
+diff --git a/src/layout/layout.h b/src/layout/layout.h
+index 01593ace9f..f9c5820c67 100644
+--- a/src/layout/layout.h
++++ b/src/layout/layout.h
+@@ -101,9 +101,9 @@ class LayoutNode : public ffi::Object {
+   //   new_num_elems = old_num_elems * factor
+   // For example, f32->i8 (32b -> 8b) uses rescale_num=32, rescale_den=8.
+   // i8->f32 (8b -> 32b) uses rescale_num=8, rescale_den=32.
+-  // For sub-byte subtype views, the output layout may temporarily gain or drop
+-  // a trailing "pack lane" dimension so that the layout still describes how
+-  // multiple logical elements share the same physical storage slot.
++  // Reinterpreting views rescale the last (stride-1) output mode, keeping
++  // the output in the view dtype's element units; widening requires storage
++  // to be contiguous and aligned at the new element width.
+   virtual Layout Reshape(const ffi::Array<PrimExpr> &shape,
+                          arith::Analyzer *analyzer = nullptr,
+                          const PrimExpr rescale_num = Integer(1),
+diff --git a/src/transform/layout_inference.cc b/src/transform/layout_inference.cc
+index 038d259b02..af5c9c5ada 100644
+--- a/src/transform/layout_inference.cc
++++ b/src/transform/layout_inference.cc
+@@ -49,7 +49,7 @@ int64_t GetElementStorageBits(DataType dtype) {
+   // Layout aliasing must be reasoned about in logical storage bits per element,
+   // not in bytes.  For sub-byte dtypes such as fp4, `dtype.bytes()` rounds up
+   // to 1 and loses the "two fp4 values share one byte" relationship that
+-  // subtype-changing views rely on.
++  // reinterpreting views rely on.
+   return static_cast<int64_t>(dtype.bits()) * dtype.lanes();
+ }
+ 
+diff --git a/testing/python/language/test_tilelang_language_tcgen05_gemm.py b/testing/python/language/test_tilelang_language_tcgen05_gemm.py
+index 5b735d41ba..080fca6b8d 100644
+--- a/testing/python/language/test_tilelang_language_tcgen05_gemm.py
++++ b/testing/python/language/test_tilelang_language_tcgen05_gemm.py
+@@ -148,6 +148,42 @@ def main():
+     return main
+ 
+ 
++def _make_ts_gemm_through_punned_view_kernel():
++    """A bf16 operand overlaying the upper half of an f32 TMEM buffer.
++
++    The FA4-style P-in-S overlay: the dtype-punned view's layout must
++    preserve the sub-element position (pack lane) of the base buffer, and
++    its addresses must resolve through the base's tcgen05.alloc word.
++    """
++
++    @T.prim_func
++    def main(
++        P: T.Tensor((128, 128), T.bfloat16),
++        V: T.Tensor((128, 128), T.bfloat16),
++        D: T.Tensor((128, 128), T.float32),
++    ):
++        with T.Kernel(1, threads=128):
++            P_shared = T.alloc_shared((128, 128), T.bfloat16)
++            V_shared = T.alloc_shared((128, 128), T.bfloat16)
++            P_frag = T.alloc_fragment((128, 128), T.bfloat16)
++            O_frag = T.alloc_fragment((128, 128), T.float32)
++            S_tmem = T.alloc_tmem((128, 128), T.float32)
++            O_tmem = T.alloc_tmem((128, 128), T.float32)
++            P_view = T.view(S_tmem, shape=(128, 256), dtype=T.bfloat16)
++            done = T.alloc_barrier(1)
++
++            T.copy(P, P_shared)
++            T.copy(P_shared, P_frag)
++            T.copy(P_frag, P_view[:, 128:256])
++            T.copy(V, V_shared)
++            T.gemm(P_view[:, 128:256], V_shared, O_tmem, mbar=done, clear_accum=True)
++            T.mbarrier_wait_parity(done, 0)
++            T.copy(O_tmem, O_frag)
++            T.copy(O_frag, D)
++
++    return main
++
++
+ def _make_explicit_2cta_gemm_kernel():
+     """Explicit two-CTA GEMM: user-scheduled operand publish and completion.
+ 
+@@ -319,6 +355,21 @@ def test_sync_gemm_preserves_sliced_ts_operands_for_sm100_selection():
+     assert "increase_descriptor_offset" in source
+ 
+ 
++@tilelang.testing.requires_cuda
++@tilelang.testing.requires_cuda_compute_version(10)
++@tilelang.testing.requires_cuda_compute_version_lt(11)
++def test_ts_gemm_through_dtype_punned_view():
++    import torch
++
++    kernel = tilelang.compile(_make_ts_gemm_through_punned_view_kernel(), target="cuda")
++    torch.manual_seed(0)
++    p = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
++    v = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
++    d = torch.empty(128, 128, device="cuda", dtype=torch.float32)
++    kernel(p, v, d)
++    torch.testing.assert_close(d, p.float() @ v.float(), rtol=1e-2, atol=1e-2)
++
++
+ @tilelang.testing.requires_cuda
+ @tilelang.testing.requires_cuda_compute_version(10)
+ @tilelang.testing.requires_cuda_compute_version_lt(11)
+diff --git a/testing/python/language/test_tilelang_language_tmem_copy.py b/testing/python/language/test_tilelang_language_tmem_copy.py
+index 70a59771c3..3724f8371e 100644
+--- a/testing/python/language/test_tilelang_language_tmem_copy.py
++++ b/testing/python/language/test_tilelang_language_tmem_copy.py
+@@ -356,6 +356,38 @@ def test_tmem_copy_roundtrip_sliced_batch(name, shape, forward, threads):
+     _run_roundtrip(_make_batch_sliced_roundtrip_kernel(shape, forward, threads), shape)
+ 
+ 
++def _make_widening_view_of_interleaved_layout_kernel():
++    """pack::16b keeps each bf16 in its own b32 slot (column stride 2), so
++    bf16 pairs are not stored contiguously and a float32 view of the buffer
++    has no compatible layout."""
++
++    @T.prim_func
++    def main():
++        with T.Kernel(1, threads=128):
++            frag16 = T.alloc_fragment((128, 64), T.bfloat16)
++            frag32 = T.alloc_fragment((128, 32), T.float32)
++            tmem = T.alloc_tmem((128, 64), T.bfloat16)
++            view = T.view(tmem, shape=(128, 32), dtype=T.float32)
++
++            T.annotate_layout({tmem: T.Layout((128, 64), lambda i, j: [i, 2 * j])})
++            T.copy(frag16, tmem)
++            T.copy(view, frag32)
++
++    return main
++
++
++@tilelang.testing.requires_cuda
++@tilelang.testing.requires_cuda_compute_version(10)
++@tilelang.testing.requires_cuda_compute_version_lt(11)
++def test_widening_view_of_interleaved_layout_is_rejected():
++    with pytest.raises(Exception, match="cannot reinterpret"):
++        tilelang.compile(
++            _make_widening_view_of_interleaved_layout_kernel(),
++            target="cuda",
++            pass_configs=PASS_CONFIGS,
++        )
++
++
+ @tilelang.testing.requires_cuda
+ @tilelang.testing.requires_cuda_compute_version(10)
+ @tilelang.testing.requires_cuda_compute_version_lt(11)
+diff --git a/testing/python/language/test_tilelang_language_view.py b/testing/python/language/test_tilelang_language_view.py
+index c3f0395cc1..e23507502a 100644
+--- a/testing/python/language/test_tilelang_language_view.py
++++ b/testing/python/language/test_tilelang_language_view.py
+@@ -151,5 +151,51 @@ def test_annotated_layout_on_dtype_changing_view_compile():
+     assert kernel.get_kernel_source()
+ 
+ 
++def shared_reinterpret_view_test(shape, dtype, new_shape, new_dtype, swizzled):
++    """Write through the shared allocation, read through its reinterpreting
++    view: the view's derived layout must induce the same storage-bit map as
++    the allocation's. The swizzled variant additionally covers the widening
++    contiguity proof and the TMA descriptor encoding of the derived layout."""
++
++    @T.prim_func
++    def main(
++        A: T.Tensor(shape, dtype),
++        B: T.Tensor(new_shape, new_dtype),
++    ):
++        with T.Kernel(1, threads=128):
++            A_shared = T.alloc_shared(shape, dtype)
++            A_view = T.view(A_shared, new_shape, dtype=new_dtype)
++            if swizzled:
++                T.annotate_layout({A_shared: tilelang.layout.make_swizzled_layout(A_shared)})
++            T.copy(A, A_shared)
++            T.copy(A_view, B)
++
++    return main
++
++
++def run_shared_reinterpret_view(shape, dtype, new_shape, new_dtype, swizzled):
++    program = shared_reinterpret_view_test(shape, dtype, new_shape, new_dtype, swizzled)
++    jit_kernel = tl.compile(program, out_idx=-1)
++
++    torch_dtype = T.dtype(dtype).as_torch()
++    lanes = torch.randn(shape[0], shape[1] * torch_dtype.itemsize // 2, device="cuda", dtype=torch.bfloat16)
++    a = lanes.view(dtype=torch_dtype)
++    d = jit_kernel(a)
++    ref = a.view(dtype=T.dtype(new_dtype).as_torch()).view(new_shape)
++    torch.testing.assert_close(d.view(torch.int16), ref.view(torch.int16), rtol=0, atol=0)
++
++
++@tilelang.testing.requires_cuda
++@pytest.mark.parametrize("swizzled", [False, True], ids=["linear", "swizzled"])
++def test_shared_view_narrowing_numeric(swizzled):
++    run_shared_reinterpret_view((64, 64), T.float32, (64, 128), T.bfloat16, swizzled)
++
++
++@tilelang.testing.requires_cuda
++@pytest.mark.parametrize("swizzled", [False, True], ids=["linear", "swizzled"])
++def test_shared_view_widening_numeric(swizzled):
++    run_shared_reinterpret_view((64, 128), T.bfloat16, (64, 64), T.float32, swizzled)
++
++
+ if __name__ == "__main__":
+     tilelang.testing.main()

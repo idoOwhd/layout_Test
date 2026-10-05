@@ -1,0 +1,1297 @@
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 0cff2235d1d..a25d9ea7672 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -682,6 +682,7 @@ Used by `flashinfer.trace` / `fi_trace`.
+ | `FLASHINFER_NVFP4_QUANTIZE_USE_TMA` | unset | `flashinfer/quantization/kernels/nvfp4_quantize.py` | Overrides the NVFP4 CuTe-DSL TMA-kernel heuristic: `0` forces the vectorized-load kernel, `1` enables the shape heuristic on every architecture and input dtype. Unset, TMA is used only where it was measured to win (SM107 with FP16/BF16 input, layout-specific M/K crossovers). For benchmarking and re-tuning on new hardware. |
+ | `FLASHINFER_TOPK_ALGO` | unset | `flashinfer/topk.py` | Force a specific top-k backend (otherwise the dispatcher chooses based on shape/dtype/mode via benefit gates): `default` (radix), `clusters` (SM100), `cub` (cub::DeviceBatchedTopK; bypasses the benefit gates). Used for benchmarking / regression bisection. |
+ | `FLASHINFER_USE_CUDA_NORM` | `0` | `flashinfer/norm/__init__.py` | `1` switches the norm path from the default backend to the legacy CUDA-only kernels. Diagnostic toggle. |
++| `FLASHINFER_SPECIALIZED_KERNEL_DISABLE` | unset | `flashinfer/mla_kv_pack.py` | `1` forces `concat_mla_kv_quant_fp8` onto its composable PyTorch fallback (two fp8 casts + two strided copies, same bytes) instead of the fused MLA K/V pack kernel. Read at call time; the kill switch for A/B testing the fused path. |
+ | `FLASHINFER_ROUTING_FORCE_BLOCK_PER_TOKEN` | unset | `csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom.cuh` | Forces the TRT-LLM MoE custom-routing kernel into "one-block-per-token" mode regardless of the active routing policy. Mainly used to reproduce specific perf points. |
+ | `FLASHINFER_B12X_MICRO_SHARE_INPUT` | `1` | `flashinfer/fused_moe/cute_dsl/blackwell_sm12x/moe_dispatch.py` | `0` disables the B12x MoE micro-batch input-sharing optimization. Internal/experimental — leave at the default unless investigating an SM12x MoE regression. |
+ | `FLASHINFER_B12X_FORCE_MOE_W4A16` | unset | `flashinfer/fused_moe/cute_dsl/blackwell_sm12x/moe_dispatch.py` | When set (any non-empty value), forces the SM12x MoE dispatcher onto the W4A16 kernel path regardless of weight dtype. Internal/experimental — used to reproduce W4A16-specific issues. |
+diff --git a/csrc/mla_kv_pack_fp8.cu b/csrc/mla_kv_pack_fp8.cu
+new file mode 100644
+index 00000000000..06e6f9c2b74
+--- /dev/null
++++ b/csrc/mla_kv_pack_fp8.cu
+@@ -0,0 +1,82 @@
++/*
++ * Copyright (c) 2026 by FlashInfer team.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++#include <flashinfer/mla_kv_pack_fp8.cuh>
++
++#include "tvm_ffi_utils.h"
++
++using namespace flashinfer;
++
++/*!
++ * \brief Fused MLA context K/V pack with saturating fp8 e4m3 cast.
++ *
++ * Input:
++ *   - kv_nope: [num_tokens, num_heads, 256] bf16 ([k_nope(128) | v(128)] per head)
++ *   - k_pe:    [num_tokens, 64] bf16 (shared across heads)
++ * Output (pre-allocated, contiguous):
++ *   - key:   [num_tokens, num_heads, 192] fp8 e4m3 = [k_nope | k_pe broadcast]
++ *   - value: [num_tokens, num_heads, 128] fp8 e4m3 = v
++ */
++void concat_mla_kv_quant_fp8(TensorView kv_nope, TensorView k_pe, TensorView key,
++                             TensorView value) {
++  using namespace mla_kv_pack;
++  CHECK_INPUT(kv_nope);
++  CHECK_INPUT(k_pe);
++  CHECK_INPUT(key);
++  CHECK_INPUT(value);
++  CHECK_DEVICE(kv_nope, k_pe);
++  CHECK_DEVICE(kv_nope, key);
++  CHECK_DEVICE(kv_nope, value);
++  CHECK_DIM(3, kv_nope);  // [num_tokens, num_heads, 256]
++  CHECK_DIM(2, k_pe);     // [num_tokens, 64]
++  CHECK_DIM(3, key);      // [num_tokens, num_heads, 192]
++  CHECK_DIM(3, value);    // [num_tokens, num_heads, 128]
++  CHECK_INPUT_TYPE(kv_nope, dl_bfloat16);
++  CHECK_INPUT_TYPE(k_pe, dl_bfloat16);
++  CHECK_INPUT_TYPE(key, dl_float8_e4m3fn);
++  CHECK_INPUT_TYPE(value, dl_float8_e4m3fn);
++
++  const int64_t num_tokens = kv_nope.size(0);
++  const int64_t num_heads = kv_nope.size(1);
++  TVM_FFI_ICHECK_EQ(kv_nope.size(2), kKVDim) << "kv_nope last dim must be 256 (nope 128 | v 128)";
++  TVM_FFI_ICHECK_EQ(k_pe.size(0), num_tokens) << "k_pe and kv_nope must have the same num_tokens";
++  TVM_FFI_ICHECK_EQ(k_pe.size(1), kRopeDim) << "k_pe last dim must be 64";
++  TVM_FFI_ICHECK_EQ(key.size(0), num_tokens) << "key and kv_nope must have the same num_tokens";
++  TVM_FFI_ICHECK_EQ(key.size(1), num_heads) << "key and kv_nope must have the same num_heads";
++  TVM_FFI_ICHECK_EQ(key.size(2), kQKDim) << "key last dim must be 192 (nope 128 | rope 64)";
++  TVM_FFI_ICHECK_EQ(value.size(0), num_tokens) << "value and kv_nope must have the same num_tokens";
++  TVM_FFI_ICHECK_EQ(value.size(1), num_heads) << "value and kv_nope must have the same num_heads";
++  TVM_FFI_ICHECK_EQ(value.size(2), kVDim) << "value last dim must be 128";
++  TVM_FFI_ICHECK(num_heads > 0 && num_heads <= 1024) << "num_heads out of range";
++  // 16 B vectorized loads/stores: every row start must be 16 B aligned.
++  TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(kv_nope.data_ptr()) % 16, 0)
++      << "kv_nope must be 16-byte aligned";
++  TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(k_pe.data_ptr()) % 16, 0)
++      << "k_pe must be 16-byte aligned";
++  TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(key.data_ptr()) % 16, 0)
++      << "key must be 16-byte aligned";
++  TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(value.data_ptr()) % 16, 0)
++      << "value must be 16-byte aligned";
++
++  ffi::CUDADeviceGuard device_guard(kv_nope.device().device_id);
++  const cudaStream_t stream = get_stream(kv_nope.device());
++  cudaError_t status =
++      MLAKVPackFP8(kv_nope.data_ptr(), k_pe.data_ptr(), key.data_ptr(), value.data_ptr(),
++                   num_tokens, static_cast<int>(num_heads), stream);
++  TVM_FFI_ICHECK(status == cudaSuccess)
++      << "MLAKVPackFP8 failed with error: " << cudaGetErrorString(status);
++}
++
++TVM_FFI_DLL_EXPORT_TYPED_FUNC(concat_mla_kv_quant_fp8, concat_mla_kv_quant_fp8);
+diff --git a/docs/api/concat_ops.rst b/docs/api/concat_ops.rst
+index 55f5fa6b76d..033990913ab 100644
+--- a/docs/api/concat_ops.rst
++++ b/docs/api/concat_ops.rst
+@@ -13,3 +13,25 @@ sites.
+     :toctree: ../generated
+ 
+     concat_mla_k
++
++flashinfer.mla_kv_pack
++======================
++
++.. currentmodule:: flashinfer.mla_kv_pack
++
++Fused MLA context K/V pack with fp8 e4m3 quantization (``key = [k_nope ‖ k_pe]``,
++``value = v``) for ragged MLA prefill kernels that take separate fp8 Q/K/V.
++
++.. autosummary::
++    :toctree: ../generated
++
++    concat_mla_kv_quant_fp8
++
++The fused kernel serves bf16 inputs with head geometry nope 128 | rope 64 |
++v 128 on compute capability >= 10.0 within the package-data allowlist
++``flashinfer/mla_kv_pack_fp8_workloads.json``; every other call takes a
++composable torch path with the same saturating e4m3 numerics
++(``torch >= 2.13`` ``Tensor.to(float8_e4m3fn)``). Setting
++``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read at call time) forces the
++composable path; ``mla_kv_pack._concat_mla_kv_quant_fp8_stats()`` reports
++the dispatch counters.
+diff --git a/flashinfer/__init__.py b/flashinfer/__init__.py
+index ff5eb485bea..b6878f1ee79 100644
+--- a/flashinfer/__init__.py
++++ b/flashinfer/__init__.py
+@@ -347,6 +347,7 @@ def __dir__() -> list[str]:
+     prepare_low_latency_gemm_weights as prepare_low_latency_gemm_weights,
+ )
+ from .utils import next_positive_power_of_2 as next_positive_power_of_2
++from .mla_kv_pack import concat_mla_kv_quant_fp8 as concat_mla_kv_quant_fp8
+ from .xqa import xqa as xqa
+ from .xqa import xqa_mla as xqa_mla
+ from . import mamba as mamba
+diff --git a/flashinfer/aot.py b/flashinfer/aot.py
+index 0b20a658e86..8ef8dc60c80 100644
+--- a/flashinfer/aot.py
++++ b/flashinfer/aot.py
+@@ -172,6 +172,7 @@
+     gen_mla_module,
+     gen_sparse_mla_sm120_module,
+ )
++from .jit.mla_kv_pack import gen_mla_kv_pack_fp8_module
+ from .jit.api_log_stats import gen_api_log_stats_module
+ from .jit.norm import gen_norm_module
+ from .jit.rmsnorm_silu import (
+@@ -861,6 +862,9 @@ def gen_all_modules(
+         )
+         if has_sm100a_exact or has_sm103a_exact:
+             jit_specs.append(gen_alphamoe_sm100_module())
++        if has_sm100 or has_sm103 or has_sm107 or has_sm110 or has_sm120 or has_sm121:
++            # Fused MLA context K/V pack (dispatched on compute capability 10.0+).
++            jit_specs.append(gen_mla_kv_pack_fp8_module())
+         if has_sm103:
+             jit_specs.append(gen_fp4_quantization_sm103_module())
+             jit_specs.append(gen_cutlass_fused_moe_sm103_module())
+diff --git a/flashinfer/jit/mla_kv_pack.py b/flashinfer/jit/mla_kv_pack.py
+new file mode 100644
+index 00000000000..2fdcf5ff1d6
+--- /dev/null
++++ b/flashinfer/jit/mla_kv_pack.py
+@@ -0,0 +1,12 @@
++from . import env as jit_env
++from .core import JitSpec, gen_jit_spec
++
++
++def gen_mla_kv_pack_fp8_module() -> JitSpec:
++    """JIT spec for the fused bf16 -> saturating-fp8 MLA context K/V pack."""
++    return gen_jit_spec(
++        "mla_kv_pack_fp8",
++        [
++            jit_env.FLASHINFER_CSRC_DIR / "mla_kv_pack_fp8.cu",
++        ],
++    )
+diff --git a/flashinfer/mla_kv_pack.py b/flashinfer/mla_kv_pack.py
+new file mode 100644
+index 00000000000..cea851b779b
+--- /dev/null
++++ b/flashinfer/mla_kv_pack.py
+@@ -0,0 +1,335 @@
++"""
++Copyright (c) 2026 by FlashInfer team.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++  http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++"""
++
++import functools
++import json
++import logging
++import os
++import threading
++from importlib import resources
++from typing import Any, Dict, Optional, Tuple
++
++import torch
++
++from .api_logging import flashinfer_api
++from .trace.templates.attention import concat_mla_kv_quant_fp8_trace
++from .utils import get_compute_capability
++
++logger = logging.getLogger(__name__)
++
++# Kill switch shared by FlashInfer's specialized kernels: read at CALL time.
++_DISABLE_ENV = "FLASHINFER_SPECIALIZED_KERNEL_DISABLE"
++
++# Fixed head geometry of the fused kernel (DeepSeek/Kimi MLA).
++NOPE_DIM = 128
++ROPE_DIM = 64
++V_DIM = 128
++_KV_DIM = NOPE_DIM + V_DIM
++# Largest finite float8_e4m3fn magnitude; the fused kernel saturates to it.
++_FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
++_QK_DIM = NOPE_DIM + ROPE_DIM
++
++# Dispatch surface of the fused kernel (package data; see the file's note).
++_WORKLOAD_FILE = "mla_kv_pack_fp8_workloads.json"
++
++
++@functools.cache
++def _load_allowlist() -> Optional[dict]:
++    """Load the fused kernel's dispatch surface; ``None`` => never dispatch."""
++    try:
++        payload = json.loads(
++            resources.files("flashinfer").joinpath(_WORKLOAD_FILE).read_text()
++        )
++        return {
++            "min_cc": tuple(int(v) for v in payload["min_compute_capability"]),
++            "heads": (
++                int(payload["num_heads"]["min"]),
++                int(payload["num_heads"]["max"]),
++            ),
++            "tokens": (
++                int(payload["num_tokens"]["min"]),
++                int(payload["num_tokens"]["max"]),
++            ),
++            "unrolled_heads": tuple(int(v) for v in payload["unrolled_num_heads"]),
++        }
++    except (
++        FileNotFoundError,
++        ModuleNotFoundError,
++        json.JSONDecodeError,
++        KeyError,
++        TypeError,
++        ValueError,
++    ) as exc:
++        logger.warning(
++            "flashinfer.concat_mla_kv_quant_fp8: workload allowlist unavailable "
++            "(%s: %s); using the composable torch path",
++            type(exc).__name__,
++            str(exc)[:200],
++        )
++        return None
++
++
++_module = None
++_module_lock = threading.Lock()
++_module_error: Optional[str] = None
++_stats: Dict[str, Any] = {
++    "calls": 0,
++    "specialized_dispatches": 0,
++    "fallback_dispatches": 0,
++    "fallback_reasons": {},
++    "module_loaded": False,
++    "module_error": None,
++}
++_marker_logged = False
++
++
++def _bump_fallback(reason: str) -> None:
++    _stats["fallback_dispatches"] += 1
++    reasons = _stats["fallback_reasons"]
++    reasons[reason] = reasons.get(reason, 0) + 1
++
++
++def _get_module():
++    """Build/load the JIT module once; never inside a CUDA-graph capture."""
++    global _module, _module_error
++    if _module is not None:
++        return _module
++    with _module_lock:
++        if _module is None and _module_error is None:
++            try:
++                from .jit.mla_kv_pack import gen_mla_kv_pack_fp8_module
++
++                _module = gen_mla_kv_pack_fp8_module().build_and_load()
++                _stats["module_loaded"] = True
++            except Exception as exc:  # noqa: BLE001 - guard must never break the stock path
++                _module_error = f"{type(exc).__name__}: {exc}"[:500]
++                _stats["module_error"] = _module_error
++                logger.warning(
++                    "flashinfer.concat_mla_kv_quant_fp8: JIT build failed, using the "
++                    "composable torch path: %s",
++                    _module_error,
++                )
++    return _module
++
++
++def _concat_mla_kv_quant_fp8_stats() -> dict:
++    """Diagnostics: dispatch counters, JIT state and the compile footprint.
++
++    The module holds exactly two kernel instantiations for the whole allowlist
++    (12 heads unrolled + runtime head count); nothing is compiled per shape,
++    so one JIT build (first non-capturing dispatch) precompiles everything.
++    """
++    allowlist = _load_allowlist()
++    return {
++        **_stats,
++        "fallback_reasons": dict(_stats["fallback_reasons"]),
++        "allowlist_loaded": allowlist is not None,
++        "allowlist": allowlist,
++        "compiled_variants": 2 if _stats["module_loaded"] else 0,
++        "distinct_kernels_for_allowlist": 2,
++        "distinct_kernels": "num_heads==12 (unrolled) + runtime-heads variant",
++        "precompiled": _stats["module_loaded"],
++    }
++
++
++def _fallback(
++    kv_nope: torch.Tensor,
++    k_pe: torch.Tensor,
++    key: torch.Tensor,
++    value: torch.Tensor,
++    nope_dim: int,
++) -> Tuple[torch.Tensor, torch.Tensor]:
++    """Composable stock path: two casts + two strided copies (any geometry).
++
++    Finite values are clamped to the e4m3fn range before ``Tensor.to``: torch
++    < 2.13 encodes finite overflow as NaN, while the fused kernel saturates to
++    +/-448. NaN passes through the clamp unchanged (both encode it as 0x7F), so
++    the fallback is byte-identical to the kernel on every supported torch.
++    """
++    num_tokens = kv_nope.shape[0]
++    kv_fp8 = kv_nope.clamp(-_FP8_MAX, _FP8_MAX).to(key.dtype)
++    key[..., :nope_dim].copy_(kv_fp8[..., :nope_dim])
++    key[..., nope_dim:].copy_(
++        k_pe.clamp(-_FP8_MAX, _FP8_MAX)
++        .reshape(num_tokens, 1, k_pe.shape[-1])
++        .to(key.dtype)
++        .expand(num_tokens, kv_nope.shape[1], k_pe.shape[-1])
++    )
++    value.copy_(kv_fp8[..., nope_dim:])
++    return key, value
++
++
++def _specialized_supported(
++    kv_nope: torch.Tensor,
++    k_pe: torch.Tensor,
++    key: torch.Tensor,
++    value: torch.Tensor,
++    nope_dim: int,
++) -> Optional[str]:
++    """Return None when the fused kernel serves this call, else the reason."""
++    if os.environ.get(_DISABLE_ENV) == "1":
++        return "kill_switch"
++    # Semantics / geometry first (GPU-free), device last.
++    if kv_nope.dtype != torch.bfloat16 or k_pe.dtype != torch.bfloat16:
++        return "input_dtype"
++    if key.dtype != torch.float8_e4m3fn or value.dtype != torch.float8_e4m3fn:
++        return "output_dtype"
++    if (
++        nope_dim != NOPE_DIM
++        or kv_nope.shape[-1] != _KV_DIM
++        or k_pe.shape[-1] != ROPE_DIM
++    ):
++        return "head_geometry"
++    if key.shape[-1] != _QK_DIM or value.shape[-1] != V_DIM:
++        return "output_geometry"
++    if not (
++        kv_nope.is_contiguous()
++        and k_pe.is_contiguous()
++        and key.is_contiguous()
++        and value.is_contiguous()
++    ):
++        return "non_contiguous"
++    if any(t.data_ptr() % 16 for t in (kv_nope, k_pe, key, value)):
++        return "alignment"
++    allowlist = _load_allowlist()
++    if allowlist is None:
++        return "allowlist_unavailable"
++    num_tokens, num_heads = kv_nope.shape[0], kv_nope.shape[1]
++    if not allowlist["heads"][0] <= num_heads <= allowlist["heads"][1]:
++        return "num_heads_not_allowlisted"
++    if not allowlist["tokens"][0] <= num_tokens <= allowlist["tokens"][1]:
++        return "num_tokens_not_allowlisted"
++    if not kv_nope.is_cuda:
++        return "device"
++    if get_compute_capability(kv_nope.device) < allowlist["min_cc"]:
++        return "compute_capability"
++    if torch.cuda.is_current_stream_capturing() and _module is None:
++        # Never compile/load inside a capture; the stock path is capture-safe.
++        return "capturing_before_jit"
++    return None
++
++
++@flashinfer_api(trace=concat_mla_kv_quant_fp8_trace)
++def concat_mla_kv_quant_fp8(
++    kv_nope: torch.Tensor,
++    k_pe: torch.Tensor,
++    key: Optional[torch.Tensor] = None,
++    value: Optional[torch.Tensor] = None,
++    *,
++    nope_dim: int = NOPE_DIM,
++) -> Tuple[torch.Tensor, torch.Tensor]:
++    r"""Fused MLA context K/V pack with fp8 e4m3 quantization.
++
++    Turns the per-head ``kv_b_proj`` output ``kv_nope = [k_nope | v]`` and the
++    shared, already-RoPE'd ``k_pe`` into the fp8 ``key = [k_nope | k_pe]`` /
++    ``value = v`` buffers a ragged MLA prefill kernel consumes (e.g.
++    :func:`trtllm_ragged_attention_deepseek` with separate Q/K/V), in one
++    memory pass instead of two casts and two strided copies.
++
++    Numerics: the cast is the saturating e4m3 conversion (round to nearest
++    even; finite overflow and ``+-inf`` -> ``+-448``; NaN -> ``0x7F``), which
++    is what ``Tensor.to(torch.float8_e4m3fn)`` produces on the GPU since
++    torch 2.13. Output is bit-exact with that cast plus slice copies.
++
++    The fused kernel serves bf16 inputs with head geometry
++    ``nope_dim=128, rope_dim=64, v_dim=128`` on contiguous, 16-byte-aligned
++    tensors, on compute capability 10.0+ devices, within the head-count and
++    token-count surface of the package's ``mla_kv_pack_fp8_workloads.json``
++    (1..128 heads with 12 local heads as the unrolled fast path, 1..131072
++    tokens); every other call takes the composable torch path.
++    ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` forces the composable path
++    (read at call time).
++
++    Parameters
++    ----------
++    kv_nope : torch.Tensor
++        ``[num_tokens, num_heads, nope_dim + v_dim]`` bf16 (contiguous for the
++        fused path).
++    k_pe : torch.Tensor
++        ``[num_tokens, rope_dim]`` or ``[num_tokens, 1, rope_dim]`` bf16,
++        shared across heads.
++    key : Optional[torch.Tensor]
++        ``[num_tokens, num_heads, nope_dim + rope_dim]`` float8_e4m3fn output;
++        allocated when ``None``.
++    value : Optional[torch.Tensor]
++        ``[num_tokens, num_heads, v_dim]`` float8_e4m3fn output; allocated
++        when ``None``.
++    nope_dim : int
++        Split point of ``kv_nope``'s last dim (default 128).
++
++    Returns
++    -------
++    Tuple[torch.Tensor, torch.Tensor]
++        ``(key, value)``.
++    """
++    global _marker_logged
++    if kv_nope.dim() != 3:
++        raise ValueError("kv_nope must be [num_tokens, num_heads, nope_dim + v_dim]")
++    num_tokens, num_heads, kv_dim = kv_nope.shape
++    if k_pe.dim() == 3:
++        if k_pe.shape[1] != 1:
++            raise ValueError(
++                "k_pe must be [num_tokens, rope_dim] or [num_tokens, 1, rope_dim]"
++            )
++        k_pe = k_pe.reshape(num_tokens, k_pe.shape[-1])
++    elif k_pe.dim() != 2:
++        raise ValueError(
++            "k_pe must be [num_tokens, rope_dim] or [num_tokens, 1, rope_dim]"
++        )
++    if k_pe.shape[0] != num_tokens:
++        raise ValueError("k_pe and kv_nope must have the same num_tokens")
++    if not 0 < nope_dim < kv_dim:
++        raise ValueError("nope_dim must split kv_nope's last dim")
++    rope_dim = k_pe.shape[-1]
++    v_dim = kv_dim - nope_dim
++    fp8 = torch.float8_e4m3fn
++    if key is None:
++        key = torch.empty(
++            num_tokens, num_heads, nope_dim + rope_dim, dtype=fp8, device=kv_nope.device
++        )
++    if value is None:
++        value = torch.empty(
++            num_tokens, num_heads, v_dim, dtype=fp8, device=kv_nope.device
++        )
++    if key.shape != (num_tokens, num_heads, nope_dim + rope_dim):
++        raise ValueError("key has the wrong shape")
++    if value.shape != (num_tokens, num_heads, v_dim):
++        raise ValueError("value has the wrong shape")
++    if key.dtype != fp8 or value.dtype != fp8:
++        raise ValueError("key and value must have dtype torch.float8_e4m3fn")
++
++    _stats["calls"] += 1
++    reason = _specialized_supported(kv_nope, k_pe, key, value, nope_dim)
++    if reason is None and num_tokens > 0:
++        module = _get_module()
++        if module is None:
++            reason = "jit_unavailable"
++    if reason is not None:
++        _bump_fallback(reason)
++        return _fallback(kv_nope, k_pe, key, value, nope_dim)
++    if num_tokens == 0:
++        return key, value
++    module.concat_mla_kv_quant_fp8(kv_nope, k_pe, key, value)
++    _stats["specialized_dispatches"] += 1
++    if not _marker_logged:
++        _marker_logged = True
++        logger.info(
++            "flashinfer.concat_mla_kv_quant_fp8: fused kernel dispatched "
++            "(num_heads=%d, num_tokens=%d)",
++            num_heads,
++            num_tokens,
++        )
++    return key, value
+diff --git a/flashinfer/mla_kv_pack_fp8_workloads.json b/flashinfer/mla_kv_pack_fp8_workloads.json
+new file mode 100644
+index 00000000000..1d2324adcbc
+--- /dev/null
++++ b/flashinfer/mla_kv_pack_fp8_workloads.json
+@@ -0,0 +1,22 @@
++{
++  "op": "concat_mla_kv_quant_fp8",
++  "kernel": "fused bf16 -> saturating e4m3 MLA context K/V pack (one HBM pass)",
++  "note": "Dispatch surface of the fused kernel; every call outside it takes the composable torch path (same numerics on torch >= 2.13). num_tokens covers the captured chunked-prefill rows (1..66048 in serving; 1..131072 validated); measured_num_tokens are the timed rows the kernel beat the previous fused implementation on. Head geometry is fixed (DeepSeek/Kimi MLA); the head count is a runtime kernel argument with a fully unrolled variant for 12 local heads (96 heads / TP8, the measured configuration).",
++  "dtypes": {
++    "kv_nope": "bfloat16",
++    "k_pe": "bfloat16",
++    "key": "float8_e4m3fn",
++    "value": "float8_e4m3fn"
++  },
++  "head_geometry": {"nope_dim": 128, "rope_dim": 64, "v_dim": 128},
++  "min_compute_capability": [10, 0],
++  "num_heads": {"min": 1, "max": 128},
++  "unrolled_num_heads": [12],
++  "measured_num_heads": [12],
++  "num_tokens": {"min": 1, "max": 131072},
++  "measured_num_tokens": [
++    66048, 66038, 62592, 62262, 56320, 50688, 34742, 33792, 33206, 31168,
++    30898, 23936, 21312, 18432, 16896, 9344, 5504, 1536
++  ],
++  "correctness_num_tokens": [1, 3, 17, 127, 129]
++}
+diff --git a/flashinfer/trace/templates/attention.py b/flashinfer/trace/templates/attention.py
+index ab2ba0a2740..dcb1bc585fc 100644
+--- a/flashinfer/trace/templates/attention.py
++++ b/flashinfer/trace/templates/attention.py
+@@ -4786,6 +4786,114 @@ def _concat_mla_k_init(
+ )
+ 
+ 
++# ── Concat + fp8 quantize MLA K/V (DeepSeek / Kimi context chunks) ───────────
++
++
++@torch.no_grad()
++def _concat_mla_kv_quant_fp8_reference(
++    kv_nope, k_pe, key=None, value=None, nope_dim=128, **_unused
++):
++    """Reference for concat_mla_kv_quant_fp8: saturating fp8 e4m3 cast of
++    ``kv_nope = [k_nope | v]`` and of the head-shared ``k_pe``, laid out as
++    ``key = [k_nope ‖ broadcast(k_pe)]`` and ``value = v``.
++
++    Layouts:
++      - kv_nope: [num_tokens, num_heads, nope_dim + v_dim]  bf16
++      - k_pe:    [num_tokens, rope_dim]                     bf16 (shared across heads)
++      - key:     [num_tokens, num_heads, nope_dim + rope_dim]  float8_e4m3fn
++      - value:   [num_tokens, num_heads, v_dim]                float8_e4m3fn
++    ``Tensor.to(float8_e4m3fn)`` saturates on torch >= 2.13 (finite overflow
++    and +-inf -> +-448, NaN -> NaN); the kernel is byte-exact with that cast.
++    """
++    fp8 = torch.float8_e4m3fn
++    num_tokens, num_heads, _ = kv_nope.shape
++    k_pe = k_pe.reshape(num_tokens, 1, k_pe.shape[-1])
++    kv_fp8 = kv_nope.to(fp8)
++    key_out = torch.cat(
++        [kv_fp8[..., :nope_dim], k_pe.to(fp8).expand(num_tokens, num_heads, -1)],
++        dim=-1,
++    )
++    value_out = kv_fp8[..., nope_dim:].contiguous()
++    if key is not None:
++        key.copy_(key_out)
++        key_out = key
++    if value is not None:
++        value.copy_(value_out)
++        value_out = value
++    return key_out, value_out
++
++
++def _concat_mla_kv_quant_fp8_init(
++    *,
++    num_tokens: int,
++    num_heads: int = 12,
++    kv_dim: int = 256,
++    rope_dim: int = 64,
++    qk_dim: int = 0,  # derived: nope_dim + rope_dim
++    v_dim: int = 0,  # derived: kv_dim - nope_dim
++    device: str = "cuda",
++    seed: int = 0,
++):
++    """Build inputs for ``flashinfer.concat_mla_kv_quant_fp8``."""
++    del qk_dim, v_dim
++    torch.manual_seed(seed)
++    kv_nope = torch.randn(
++        num_tokens, num_heads, kv_dim, dtype=torch.bfloat16, device=device
++    )
++    k_pe = torch.randn(num_tokens, rope_dim, dtype=torch.bfloat16, device=device)
++    return {"kv_nope": kv_nope, "k_pe": k_pe}
++
++
++concat_mla_kv_quant_fp8_trace = TraceTemplate(
++    op_type="mla_paged",
++    name_prefix="concat_mla_kv_quant_fp8",
++    description=(
++        "MLA context K/V pack with fp8 e4m3 quantization: casts the per-head "
++        "``kv_nope = [k_nope | v]`` projection and the head-shared RoPE key "
++        "``k_pe`` to float8_e4m3fn (saturating) and writes ``key = [k_nope ‖ "
++        "k_pe]`` and ``value = v`` as contiguous buffers for a ragged MLA "
++        "prefill kernel, in one memory pass."
++    ),
++    axes={
++        "num_tokens": Var(),
++        "num_heads": Const(abbrev="h"),
++        "kv_dim": Const(
++            description="nope_dim + v_dim (kv_nope last dim).", abbrev="kv"
++        ),
++        "rope_dim": Const(abbrev="rope"),
++        # Output-only dims (derived: qk_dim = nope_dim + rope_dim, v_dim =
++        # kv_dim - nope_dim; nope_dim defaults to 128).
++        "qk_dim": Var(description="nope_dim + rope_dim (key last dim)."),
++        "v_dim": Var(description="kv_dim - nope_dim (value last dim)."),
++    },
++    inputs={
++        "kv_nope": Tensor(
++            ["num_tokens", "num_heads", "kv_dim"],
++            description="[k_nope | v] per head, bf16.",
++        ),
++        "k_pe": Tensor(
++            ["num_tokens", "rope_dim"],
++            description="RoPE'd key shared across heads, bf16.",
++        ),
++    },
++    outputs={
++        "key": Tensor(
++            ["num_tokens", "num_heads", "qk_dim"],
++            dtype="float8_e4m3fn",
++            description="[k_nope ‖ k_pe] per head, saturating e4m3.",
++        ),
++        "value": Tensor(
++            ["num_tokens", "num_heads", "v_dim"],
++            dtype="float8_e4m3fn",
++            description="v per head, saturating e4m3.",
++        ),
++    },
++    tags=["status:verified", "mla"],
++    reference=_concat_mla_kv_quant_fp8_reference,
++    init=_concat_mla_kv_quant_fp8_init,
++)
++
++
+ # ── cuDNN paged attention ─────────────────────────────────────────────────────
+ 
+ _CUDNN_PAGED_AXES: dict[str, Var | Const] = {
+diff --git a/include/flashinfer/mla_kv_pack_fp8.cuh b/include/flashinfer/mla_kv_pack_fp8.cuh
+new file mode 100644
+index 00000000000..9d2c29d3652
+--- /dev/null
++++ b/include/flashinfer/mla_kv_pack_fp8.cuh
+@@ -0,0 +1,166 @@
++/*
++ * Copyright (c) 2026 by FlashInfer team.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++#ifndef FLASHINFER_MLA_KV_PACK_FP8_CUH_
++#define FLASHINFER_MLA_KV_PACK_FP8_CUH_
++
++#include <cuda_bf16.h>
++#include <cuda_fp8.h>
++#include <cuda_runtime.h>
++#include <stdint.h>
++
++namespace flashinfer {
++
++// Fused MLA context K/V pack: bf16 [k_nope | v] per head + shared bf16 k_pe
++// -> fp8 e4m3 key = [k_nope | k_pe broadcast] and fp8 e4m3 value = v, in one
++// pass over HBM. The conversion is the saturating e4m3 cast
++// (cvt.rn.satfinite: RNE, finite overflow and +-inf -> +-448, NaN -> 0x7F),
++// i.e. torch >= 2.13 Tensor.to(float8_e4m3fn) on the GPU.
++//
++// Head geometry is fixed at (nope 128 | v 128) x rope 64 (DeepSeek/Kimi MLA);
++// the head COUNT is a runtime argument, with a fully unrolled instantiation
++// for 12 local heads (96 heads / TP8).
++namespace mla_kv_pack {
++
++constexpr int kNopeDim = 128;
++constexpr int kRopeDim = 64;
++constexpr int kVDim = 128;
++constexpr int kKVDim = kNopeDim + kVDim;     // 256 bf16 per head in
++constexpr int kQKDim = kNopeDim + kRopeDim;  // 192 fp8 per head out
++constexpr int kWarpsPerBlock = 8;
++constexpr int kThreads = 32 * kWarpsPerBlock;
++
++// 16 B granules per head/row.
++constexpr int kKVUint4PerHead = kKVDim * 2 / 16;     // 32
++constexpr int kKeyUint2PerHead = kQKDim / 8;         // 24
++constexpr int kValUint2PerHead = kVDim / 8;          // 16
++constexpr int kRopeUint4PerRow = kRopeDim * 2 / 16;  // 8
++
++// Eight bf16 (one 16 B load) -> eight e4m3 (saturating RNE), packed into 8 B.
++// bf16 -> f32 is an exact bit shift, so the f32-source cvt (PTX ISA 7.8+,
++// every CUDA >= 11.8 toolkit) gives the same bytes as a bf16x2-source cvt
++// while building on the deployment toolkit; the first source operand lands in
++// the high byte (element 1). The four 16-bit results are packed with explicit
++// mov.b32 register pairs instead of shift/or arithmetic.
++__device__ __forceinline__ uint2 cvt_octet_satfinite(const uint4 bits) {
++  uint2 out;
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 890
++  // No fp8 cvt before sm_89; the Python guard never dispatches here. The asm
++  // is excluded (not just skipped) so ptxas never sees it for older targets.
++  __trap();
++  out = make_uint2(0u, 0u);
++#else
++  asm("{\n\t"
++      ".reg .b16 p0, p1, p2, p3;\n\t"
++      "cvt.rn.satfinite.e4m3x2.f32 p0, %2, %3;\n\t"
++      "cvt.rn.satfinite.e4m3x2.f32 p1, %4, %5;\n\t"
++      "cvt.rn.satfinite.e4m3x2.f32 p2, %6, %7;\n\t"
++      "cvt.rn.satfinite.e4m3x2.f32 p3, %8, %9;\n\t"
++      "mov.b32 %0, {p0, p1};\n\t"
++      "mov.b32 %1, {p2, p3};\n\t"
++      "}"
++      : "=r"(out.x), "=r"(out.y)
++      : "f"(__uint_as_float(bits.x & 0xFFFF0000u)), "f"(__uint_as_float(bits.x << 16)),
++        "f"(__uint_as_float(bits.y & 0xFFFF0000u)), "f"(__uint_as_float(bits.y << 16)),
++        "f"(__uint_as_float(bits.z & 0xFFFF0000u)), "f"(__uint_as_float(bits.z << 16)),
++        "f"(__uint_as_float(bits.w & 0xFFFF0000u)), "f"(__uint_as_float(bits.w << 16)));
++#endif
++  return out;
++}
++
++// One warp per token. Lanes 0-15 handle even heads, 16-31 odd heads; within a
++// half-warp, lanes 0-7 write the key nope part and 8-15 the value part, each
++// lane converting 16 bf16 (two 16 B loads) into one fully covered 16 B store.
++// The rope row is converted once per token by lanes 0-7 and shuffle-broadcast
++// to every head. kHeadsStatic > 0 fixes the head count at compile time.
++template <int kHeadsStatic>
++__global__ __launch_bounds__(kThreads, 2) void MLAKVPackFP8Kernel(
++    const uint4* __restrict__ kv, const uint4* __restrict__ pe, uint2* __restrict__ key,
++    uint2* __restrict__ value, int64_t tokens, int num_heads_rt) {
++  const int num_heads = kHeadsStatic > 0 ? kHeadsStatic : num_heads_rt;
++  const int lane = threadIdx.x & 31;
++  const int warp = threadIdx.x >> 5;
++  int64_t token = static_cast<int64_t>(blockIdx.x) * kWarpsPerBlock + warp;
++  const int64_t token_stride = static_cast<int64_t>(gridDim.x) * kWarpsPerBlock;
++
++  const int rope_piece = lane & 7;
++  const int rope_head_group = lane >> 3;
++  const int head_select = lane >> 4;
++  const int sub = lane & 15;
++  const int is_value = sub >> 3;
++  const int piece = sub & 7;
++
++  for (; token < tokens; token += token_stride) {
++    const uint4* kv_row = kv + token * (num_heads * kKVUint4PerHead);
++    uint2* key_row = key + token * (num_heads * kKeyUint2PerHead);
++    uint2* value_row = value + token * (num_heads * kValUint2PerHead);
++
++    uint2 rope = make_uint2(0, 0);
++    if (lane < 8) rope = cvt_octet_satfinite(pe[token * kRopeUint4PerRow + lane]);
++
++#pragma unroll
++    for (int head = head_select; head < num_heads; head += 2) {
++      const uint4* src = kv_row + head * kKVUint4PerHead + sub * 2;
++      const uint2 lo = cvt_octet_satfinite(src[0]);
++      const uint2 hi = cvt_octet_satfinite(src[1]);
++      const uint4 packed = make_uint4(lo.x, lo.y, hi.x, hi.y);
++      if (is_value) {
++        *reinterpret_cast<uint4*>(value_row + head * kValUint2PerHead + piece * 2) = packed;
++      } else {
++        *reinterpret_cast<uint4*>(key_row + head * kKeyUint2PerHead + piece * 2) = packed;
++      }
++    }
++
++    uint2 rope_piece_value;
++    rope_piece_value.x = __shfl_sync(0xffffffffu, rope.x, rope_piece);
++    rope_piece_value.y = __shfl_sync(0xffffffffu, rope.y, rope_piece);
++#pragma unroll
++    for (int head = rope_head_group; head < num_heads; head += 4) {
++      key_row[head * kKeyUint2PerHead + (kNopeDim / 8) + rope_piece] = rope_piece_value;
++    }
++  }
++}
++
++}  // namespace mla_kv_pack
++
++/*!
++ * \brief Launch the fused bf16 -> saturating-e4m3 MLA context K/V pack.
++ * \param kv_nope [tokens, num_heads, 256] bf16, contiguous ([k_nope | v] per head)
++ * \param k_pe    [tokens, 64] bf16, contiguous (shared across heads)
++ * \param key     [tokens, num_heads, 192] fp8 e4m3, contiguous (out)
++ * \param value   [tokens, num_heads, 128] fp8 e4m3, contiguous (out)
++ */
++inline cudaError_t MLAKVPackFP8(const void* kv_nope, const void* k_pe, void* key, void* value,
++                                int64_t tokens, int num_heads, cudaStream_t stream) {
++  using namespace mla_kv_pack;
++  if (tokens <= 0) return cudaSuccess;
++  if (num_heads <= 0) return cudaErrorInvalidValue;
++  const int64_t blocks64 = (tokens + kWarpsPerBlock - 1) / kWarpsPerBlock;
++  const unsigned blocks = static_cast<unsigned>(blocks64 > 0x7fffffffLL ? 0x7fffffffLL : blocks64);
++  const uint4* kv = static_cast<const uint4*>(kv_nope);
++  const uint4* pe = static_cast<const uint4*>(k_pe);
++  uint2* k = static_cast<uint2*>(key);
++  uint2* v = static_cast<uint2*>(value);
++  if (num_heads == 12) {
++    MLAKVPackFP8Kernel<12><<<blocks, kThreads, 0, stream>>>(kv, pe, k, v, tokens, num_heads);
++  } else {
++    MLAKVPackFP8Kernel<0><<<blocks, kThreads, 0, stream>>>(kv, pe, k, v, tokens, num_heads);
++  }
++  return cudaGetLastError();
++}
++
++}  // namespace flashinfer
++
++#endif  // FLASHINFER_MLA_KV_PACK_FP8_CUH_
+diff --git a/pyproject.toml b/pyproject.toml
+index e3d63f57381..f5441728d4b 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -73,7 +73,7 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
+ 
+ [tool.setuptools.package-data]
+ "flashinfer.experimental.nvfp4_attention" = ["csrc/**"]
+-"flashinfer" = ["_build_meta.py"]
++"flashinfer" = ["_build_meta.py", "mla_kv_pack_fp8_workloads.json"]
+ "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe" = ["*.md"]
+ "flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe" = ["*.md"]
+ "flashinfer.prims_ts.moe" = ["prims_ts_moe_configs.json"]
+diff --git a/tests/trace/example.py b/tests/trace/example.py
+index 5f32a345377..89c7658919c 100644
+--- a/tests/trace/example.py
++++ b/tests/trace/example.py
+@@ -2531,6 +2531,15 @@ def example_dsv41_fp4_cache():
+     _cmk_k_rope = torch.randn(_cmk_T, 1, _cmk_rope, dtype=torch.bfloat16, device=device)
+     _concat_mla_k(_cmk_k, _cmk_k_nope, _cmk_k_rope)
+ 
++# concat_mla_kv_quant_fp8 (MLA context K/V pack + fp8 cast, 12 local heads).
++with contextlib.suppress(Exception):
++    from flashinfer import concat_mla_kv_quant_fp8 as _concat_mla_kv_quant_fp8
++
++    _ckv_T, _ckv_H = 2048, 12
++    _ckv_kv_nope = torch.randn(_ckv_T, _ckv_H, 256, dtype=torch.bfloat16, device=device)
++    _ckv_k_pe = torch.randn(_ckv_T, 64, dtype=torch.bfloat16, device=device)
++    _concat_mla_kv_quant_fp8(_ckv_kv_nope, _ckv_k_pe)
++
+ # xqa_batch_decode_with_kv_cache (SM100+ XQA decode wrapper, NHD 5-D cache).
+ with contextlib.suppress(Exception):
+     import math as _math2
+diff --git a/tests/trace/fi_trace_out/concat_mla_kv_quant_fp8_h12_kv256_rope64.json b/tests/trace/fi_trace_out/concat_mla_kv_quant_fp8_h12_kv256_rope64.json
+new file mode 100644
+index 00000000000..4855535d35d
+--- /dev/null
++++ b/tests/trace/fi_trace_out/concat_mla_kv_quant_fp8_h12_kv256_rope64.json
+@@ -0,0 +1,78 @@
++{
++  "name": "concat_mla_kv_quant_fp8_h12_kv256_rope64",
++  "description": "MLA context K/V pack with fp8 e4m3 quantization: casts the per-head ``kv_nope = [k_nope | v]`` projection and the head-shared RoPE key ``k_pe`` to float8_e4m3fn (saturating) and writes ``key = [k_nope \u2016 k_pe]`` and ``value = v`` as contiguous buffers for a ragged MLA prefill kernel, in one memory pass.",
++  "op_type": "mla_paged",
++  "tags": [
++    "fi_api:flashinfer.mla_kv_pack.concat_mla_kv_quant_fp8",
++    "status:verified",
++    "mla"
++  ],
++  "axes": {
++    "num_tokens": {
++      "type": "var"
++    },
++    "num_heads": {
++      "type": "const",
++      "value": 12
++    },
++    "kv_dim": {
++      "type": "const",
++      "value": 256,
++      "description": "nope_dim + v_dim (kv_nope last dim)."
++    },
++    "rope_dim": {
++      "type": "const",
++      "value": 64
++    },
++    "qk_dim": {
++      "type": "var",
++      "description": "nope_dim + rope_dim (key last dim)."
++    },
++    "v_dim": {
++      "type": "var",
++      "description": "kv_dim - nope_dim (value last dim)."
++    }
++  },
++  "inputs": {
++    "kv_nope": {
++      "shape": [
++        "num_tokens",
++        "num_heads",
++        "kv_dim"
++      ],
++      "dtype": "bfloat16",
++      "description": "[k_nope | v] per head, bf16."
++    },
++    "k_pe": {
++      "shape": [
++        "num_tokens",
++        "rope_dim"
++      ],
++      "dtype": "bfloat16",
++      "description": "RoPE'd key shared across heads, bf16."
++    }
++  },
++  "outputs": {
++    "key": {
++      "shape": [
++        "num_tokens",
++        "num_heads",
++        "qk_dim"
++      ],
++      "dtype": "float8_e4m3fn",
++      "description": "[k_nope \u2016 k_pe] per head, saturating e4m3."
++    },
++    "value": {
++      "shape": [
++        "num_tokens",
++        "num_heads",
++        "v_dim"
++      ],
++      "dtype": "float8_e4m3fn",
++      "description": "v per head, saturating e4m3."
++    }
++  },
++  "reference": "from __future__ import annotations\nimport math\nimport torch\nimport torch.nn.functional as F\n\n@torch.no_grad()\ndef _concat_mla_kv_quant_fp8_reference(\n    kv_nope, k_pe, key=None, value=None, nope_dim=128, **_unused\n):\n    \"\"\"Reference for concat_mla_kv_quant_fp8: saturating fp8 e4m3 cast of\n    ``kv_nope = [k_nope | v]`` and of the head-shared ``k_pe``, laid out as\n    ``key = [k_nope \u2016 broadcast(k_pe)]`` and ``value = v``.\n\n    Layouts:\n      - kv_nope: [num_tokens, num_heads, nope_dim + v_dim]  bf16\n      - k_pe:    [num_tokens, rope_dim]                     bf16 (shared across heads)\n      - key:     [num_tokens, num_heads, nope_dim + rope_dim]  float8_e4m3fn\n      - value:   [num_tokens, num_heads, v_dim]                float8_e4m3fn\n    ``Tensor.to(float8_e4m3fn)`` saturates on torch >= 2.13 (finite overflow\n    and +-inf -> +-448, NaN -> NaN); the kernel is byte-exact with that cast.\n    \"\"\"\n    fp8 = torch.float8_e4m3fn\n    num_tokens, num_heads, _ = kv_nope.shape\n    k_pe = k_pe.reshape(num_tokens, 1, k_pe.shape[-1])\n    kv_fp8 = kv_nope.to(fp8)\n    key_out = torch.cat(\n        [kv_fp8[..., :nope_dim], k_pe.to(fp8).expand(num_tokens, num_heads, -1)],\n        dim=-1,\n    )\n    value_out = kv_fp8[..., nope_dim:].contiguous()\n    if key is not None:\n        key.copy_(key_out)\n        key_out = key\n    if value is not None:\n        value.copy_(value_out)\n        value_out = value\n    return key_out, value_out\n",
++  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n",
++  "init": "from __future__ import annotations\nimport math\nimport torch\n\n# ----- shared init helpers -----\n# Copyright (c) 2025 by FlashInfer team.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#   http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Shared helpers used by ``TraceTemplate.init`` functions.\n\nThis module contains the small set of input-construction patterns that\nrecur across many templates (paged-KV cache index arrays, ragged indptr,\nRoPE pos_ids and cos/sin caches, sampling probs). Each helper is short and\ndocumented; init functions in ``templates/<category>.py`` call into here so\nthe per-template init bodies stay focused on shape/dtype, not boilerplate.\n\nThe full source of this module is **inlined into every dumped JSON's\n``\"init\"`` field** by ``flashinfer/trace/template.py:_render_init_source``,\nso downstream consumers don't need flashinfer installed to re-run the init\nsnippets.\n\"\"\"\n\n\nfrom typing import Optional, Tuple\n\nimport torch\n\n\ndef make_paged_kv_indices(\n    batch_size: int,\n    num_pages_per_seq: int,\n    page_size: int,\n    *,\n    device: str = \"cuda\",\n) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:\n    \"\"\"Return ``(kv_indptr, kv_indices, kv_last_page_len)`` for a uniform batch.\n\n    Every sequence is assigned exactly ``num_pages_per_seq`` pages, fully\n    populated (last-page length == page_size).\n\n    Invariants\n    ----------\n    - ``kv_indptr.shape == (batch_size + 1,)``, dtype int32, monotonic, [0]=0.\n    - ``kv_indices == arange(0, batch_size * num_pages_per_seq)``, int32.\n    - ``kv_last_page_len == full(batch_size, page_size)``, int32.\n    \"\"\"\n    total_pages = batch_size * num_pages_per_seq\n    kv_indptr = (\n        torch.arange(batch_size + 1, dtype=torch.int32, device=device)\n        * num_pages_per_seq\n    )\n    kv_indices = torch.arange(total_pages, dtype=torch.int32, device=device)\n    kv_last_page_len = torch.full(\n        (batch_size,), page_size, dtype=torch.int32, device=device\n    )\n    return kv_indptr, kv_indices, kv_last_page_len\n\n\ndef make_ragged_indptr(\n    seg_lens,\n    *,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.int32,\n) -> torch.Tensor:\n    \"\"\"Return cumulative-sum ``indptr`` of length ``len(seg_lens)+1``.\n\n    ``seg_lens`` may be a list / tuple / 1-D tensor of segment lengths.\n    \"\"\"\n    if isinstance(seg_lens, torch.Tensor):\n        lens = seg_lens.to(device=device, dtype=dtype)\n    else:\n        lens = torch.tensor(list(seg_lens), dtype=dtype, device=device)\n    indptr = torch.zeros(lens.numel() + 1, dtype=dtype, device=device)\n    indptr[1:] = torch.cumsum(lens, dim=0).to(dtype)\n    return indptr\n\n\ndef make_uniform_qo_indptr(\n    batch_size: int,\n    qo_len: int,\n    *,\n    device: str = \"cuda\",\n) -> torch.Tensor:\n    \"\"\"Return ``[0, qo_len, 2*qo_len, ..., batch_size*qo_len]`` int32.\"\"\"\n    return torch.arange(batch_size + 1, dtype=torch.int32, device=device) * qo_len\n\n\ndef make_pos_ids(\n    nnz: int,\n    max_seq_len: Optional[int] = None,\n    *,\n    device: str = \"cuda\",\n) -> torch.Tensor:\n    \"\"\"Return ``[0, 1, ..., nnz-1] (% max_seq_len)`` as int32 on ``device``.\n\n    If ``max_seq_len`` is None, no wrapping is applied.\n    \"\"\"\n    pos = torch.arange(nnz, dtype=torch.int32, device=device)\n    if max_seq_len is not None:\n        pos = pos % max_seq_len\n    return pos\n\n\ndef make_rope_cos_sin_cache(\n    max_seq_len: int,\n    rope_dim: int,\n    *,\n    base: float = 1e4,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.float32,\n) -> torch.Tensor:\n    \"\"\"Return concatenated ``[cos | sin]`` cache of shape ``[max_seq_len, rope_dim]``.\"\"\"\n    t = torch.arange(max_seq_len, dtype=torch.float32, device=device)\n    inv = 1.0 / (\n        base\n        ** (torch.arange(0, rope_dim, 2, dtype=torch.float32, device=device) / rope_dim)\n    )\n    freqs = t.unsqueeze(-1) * inv.unsqueeze(0)\n    cache = torch.cat([torch.cos(freqs), torch.sin(freqs)], dim=-1)\n    return cache.to(dtype)\n\n\ndef make_probs(\n    batch_size: int,\n    vocab_size: int,\n    *,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.float32,\n) -> torch.Tensor:\n    \"\"\"Return a ``[batch_size, vocab_size]`` probability distribution.\n\n    Uses ``softmax(randn(...))`` so each row sums to 1.0. This mirrors the\n    pattern used throughout ``tests/utils/test_sampling.py``.\n    \"\"\"\n    return torch.softmax(\n        torch.randn(batch_size, vocab_size, dtype=torch.float32, device=device),\n        dim=-1,\n    ).to(dtype)\n\n\ndef make_logits(\n    batch_size: int,\n    vocab_size: int,\n    *,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.float32,\n) -> torch.Tensor:\n    \"\"\"Return ``randn(batch_size, vocab_size)`` logits.\"\"\"\n    return torch.randn(batch_size, vocab_size, dtype=dtype, device=device)\n\n\ndef fp8_safe_randn(\n    *shape: int,\n    scale: float = 0.1,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.bfloat16,\n) -> torch.Tensor:\n    \"\"\"``randn(*shape) * scale`` \u2014 keeps values in the FP8/FP4 representable range.\n\n    Tests for fp8/fp4 paths typically multiply ``randn`` by 0.1 to avoid\n    saturation when quantizing. Use this helper to mirror that convention.\n    \"\"\"\n    return (torch.randn(*shape, dtype=dtype, device=device) * scale).to(dtype)\n\n\ndef per_tensor_fp8_quantize(\n    x: torch.Tensor,\n    *,\n    fp8_dtype: torch.dtype = torch.float8_e4m3fn,\n) -> Tuple[torch.Tensor, torch.Tensor]:\n    \"\"\"Per-tensor FP8 quantization, mirroring ``tests/utils_fp8.py:to_float8``.\n\n    Returns ``(x_fp8, inv_scale)`` where ``inv_scale`` is the dequant\n    multiplier (``float \u2248 fp8 * inv_scale``).\n    \"\"\"\n    finfo = torch.finfo(fp8_dtype)\n    amax = x.abs().amax().clamp(min=1e-12)\n    scale = finfo.max / amax\n    x_q = (x.float() * scale).clamp(min=finfo.min, max=finfo.max).to(fp8_dtype)\n    return x_q, scale.float().reciprocal()\n\n\ndef fp8_block_quant_1d(\n    x_bf16: torch.Tensor,\n    block: int = 128,\n) -> Tuple[torch.Tensor, torch.Tensor]:\n    \"\"\"Quantize ``[T, H]`` activations into FP8 with per-``(token, block)``\n    column-block scales. Returns ``(x_fp8, scales)`` where\n    ``scales`` has shape ``[T, H // block]``.\n\n    Mirrors ``_fp8_block_quant_1d`` in\n    ``tests/moe/test_dpsk_fused_moe_fp8.py``.\n    \"\"\"\n    assert x_bf16.dim() == 2\n    T, H = x_bf16.shape\n    assert H % block == 0\n    nb = H // block\n    finfo = torch.finfo(torch.float8_e4m3fn)\n    max_fp8 = finfo.max\n    x_f32 = x_bf16.to(torch.float32)\n    x_fp8 = torch.empty((T, H), dtype=torch.float8_e4m3fn, device=x_bf16.device)\n    scales = torch.empty((T, nb), dtype=torch.float32, device=x_bf16.device)\n    for j in range(nb):\n        sl = slice(j * block, (j + 1) * block)\n        blk = x_f32[:, sl]\n        amax = torch.amax(torch.abs(blk), dim=1)\n        s = torch.where(amax > 0, amax / max_fp8, torch.ones_like(amax))\n        x_fp8[:, sl] = (blk / s.unsqueeze(1)).to(torch.float8_e4m3fn)\n        scales[:, j] = s\n    return x_fp8, scales\n\n\ndef fp8_block_quant_2d(\n    w_bf16: torch.Tensor,\n    block: int = 128,\n) -> Tuple[torch.Tensor, torch.Tensor]:\n    \"\"\"Quantize weights ``[..., R, C]`` with 2-D ``block \u00d7 block`` scales.\n\n    Returns ``(w_fp8, scales)`` where ``scales`` has shape\n    ``[..., R // block, C // block]``. Mirrors ``_fp8_block_quant_2d`` in\n    ``tests/moe/test_dpsk_fused_moe_fp8.py``.\n    \"\"\"\n    assert w_bf16.dim() >= 2\n    *prefix, R, C = w_bf16.shape\n    assert R % block == 0 and C % block == 0\n    nb_r, nb_c = R // block, C // block\n    finfo = torch.finfo(torch.float8_e4m3fn)\n    max_fp8 = finfo.max\n    w_f32 = w_bf16.to(torch.float32).contiguous()\n    prefix_ndim = len(prefix)\n    reshaped = w_f32.reshape(*prefix, nb_r, block, nb_c, block)\n    permute_dims = tuple(range(prefix_ndim)) + (\n        prefix_ndim,\n        prefix_ndim + 2,\n        prefix_ndim + 1,\n        prefix_ndim + 3,\n    )\n    blocks = reshaped.permute(permute_dims).contiguous()\n    amax = torch.amax(torch.abs(blocks), dim=(-1, -2))\n    scales = torch.where(\n        amax > 0, amax / max_fp8, torch.ones_like(amax, dtype=torch.float32)\n    )\n    q_blocks = (blocks / scales.unsqueeze(-1).unsqueeze(-1)).to(torch.float8_e4m3fn)\n    inv_permute = [0] * (prefix_ndim + 4)\n    for i, p in enumerate(permute_dims):\n        inv_permute[p] = i\n    w_fp8 = q_blocks.permute(*inv_permute).reshape(*prefix, R, C).contiguous()\n    return w_fp8, scales\n\n\n__all__ = [\n    \"make_paged_kv_indices\",\n    \"make_ragged_indptr\",\n    \"make_uniform_qo_indptr\",\n    \"make_pos_ids\",\n    \"make_rope_cos_sin_cache\",\n    \"make_probs\",\n    \"make_logits\",\n    \"fp8_safe_randn\",\n    \"per_tensor_fp8_quantize\",\n    \"fp8_block_quant_1d\",\n    \"fp8_block_quant_2d\",\n]\n\n# ----- init -----\ndef _concat_mla_kv_quant_fp8_init(\n    *,\n    num_tokens: int,\n    num_heads: int = 12,\n    kv_dim: int = 256,\n    rope_dim: int = 64,\n    qk_dim: int = 0,  # derived: nope_dim + rope_dim\n    v_dim: int = 0,  # derived: kv_dim - nope_dim\n    device: str = \"cuda\",\n    seed: int = 0,\n):\n    \"\"\"Build inputs for ``flashinfer.concat_mla_kv_quant_fp8``.\"\"\"\n    del qk_dim, v_dim\n    torch.manual_seed(seed)\n    kv_nope = torch.randn(\n        num_tokens, num_heads, kv_dim, dtype=torch.bfloat16, device=device\n    )\n    k_pe = torch.randn(num_tokens, rope_dim, dtype=torch.bfloat16, device=device)\n    return {\"kv_nope\": kv_nope, \"k_pe\": k_pe}\n"
++}
+diff --git a/tests/trace/test_concat_mla_kv_quant_fp8_reference_correctness.py b/tests/trace/test_concat_mla_kv_quant_fp8_reference_correctness.py
+new file mode 100644
+index 00000000000..006bdf88e1f
+--- /dev/null
++++ b/tests/trace/test_concat_mla_kv_quant_fp8_reference_correctness.py
+@@ -0,0 +1,29 @@
++"""Reference correctness test for the concat_mla_kv_quant_fp8 trace API."""
++
++import pytest
++import torch
++
++from tests.trace.reference_utils import _assert_finite
++
++
++@pytest.mark.parametrize(
++    "shape_kwargs",
++    [
++        dict(num_tokens=2048, num_heads=12, kv_dim=256, rope_dim=64),
++        dict(num_tokens=257, num_heads=8, kv_dim=256, rope_dim=64),
++    ],
++)
++def test_concat_mla_kv_quant_fp8_reference_correctness(shape_kwargs):
++    """flashinfer.concat_mla_kv_quant_fp8 kernel vs reference (byte-exact fp8)."""
++    from flashinfer import concat_mla_kv_quant_fp8
++    from flashinfer.trace.templates.attention import concat_mla_kv_quant_fp8_trace
++
++    inputs = concat_mla_kv_quant_fp8_trace.init(**shape_kwargs)
++    _assert_finite(inputs["kv_nope"], inputs["k_pe"])
++    key_api, value_api = concat_mla_kv_quant_fp8(**inputs)
++    key_ref, value_ref = concat_mla_kv_quant_fp8_trace.reference(**inputs)
++    # fp8 outputs: compare the byte encodings (NaN-safe), the cast is exact.
++    assert torch.equal(key_api.view(torch.uint8), key_ref.view(torch.uint8))
++    assert torch.equal(value_api.view(torch.uint8), value_ref.view(torch.uint8))
++    if torch.cuda.is_available():
++        torch.cuda.synchronize()
+diff --git a/tests/utils/test_concat_mla_kv_quant_fp8.py b/tests/utils/test_concat_mla_kv_quant_fp8.py
+new file mode 100644
+index 00000000000..d7abe0bb176
+--- /dev/null
++++ b/tests/utils/test_concat_mla_kv_quant_fp8.py
+@@ -0,0 +1,297 @@
++"""
++Tests for concat_mla_kv_quant_fp8 — the fused bf16 -> fp8 e4m3 MLA context K/V
++pack. It is a saturating cast plus pure memory movement, so the output must be
++**byte-exact** against the explicit saturating reference (and against torch's
++own GPU cast on torch >= 2.13).
++"""
++
++import pytest
++import torch
++
++import flashinfer
++from flashinfer import mla_kv_pack
++
++NOPE, ROPE, V = 128, 64, 128
++
++
++def _sat_e4m3_bytes(x: torch.Tensor) -> torch.Tensor:
++    """Explicit saturating bf16 -> e4m3fn (RNE; overflow/inf -> 448; NaN -> 0x7F)."""
++    f = x.float()
++    sign = (torch.signbit(f)).to(torch.uint8) << 7
++    a = f.abs()
++    nan = torch.isnan(f)
++    # e4m3fn grid: normals 2^-6..448, subnormals multiples of 2^-9.
++    e = torch.floor(torch.log2(a.clamp_min(2.0**-6)))
++    step = torch.pow(2.0, e - 3)
++    step = torch.where(a < 2.0**-6, torch.full_like(step, 2.0**-9), step)
++    q = torch.round(a / step)  # RNE on ties (torch.round is half-to-even)
++    val = (q * step).clamp(max=448.0)
++    val = torch.where(torch.isinf(a), torch.full_like(val, 448.0), val)
++    out = val.to(torch.float8_e4m3fn).view(torch.uint8) | sign
++    out = torch.where(nan, torch.full_like(out, 0x7F), out)
++    return out
++
++
++def _reference(kv_nope: torch.Tensor, k_pe: torch.Tensor):
++    T, H, _ = kv_nope.shape
++    kv8 = _sat_e4m3_bytes(kv_nope)
++    pe8 = _sat_e4m3_bytes(k_pe.reshape(T, ROPE))
++    key = torch.empty(T, H, NOPE + ROPE, dtype=torch.uint8, device=kv_nope.device)
++    key[..., :NOPE] = kv8[..., :NOPE]
++    key[..., NOPE:] = pe8.unsqueeze(1).expand(T, H, ROPE)
++    value = kv8[..., NOPE:].contiguous()
++    return key, value
++
++
++def _inputs(T: int, H: int, device="cuda"):
++    gen = torch.Generator(device=device).manual_seed(T * 131 + H)
++    kv = (
++        torch.randn(T, H, NOPE + V, device=device, dtype=torch.float32, generator=gen)
++        * 2.0
++    )
++    pe = torch.randn(T, ROPE, device=device, dtype=torch.float32, generator=gen) * 2.0
++    kv = kv.to(torch.bfloat16)
++    pe = pe.to(torch.bfloat16)
++    # Saturation / NaN / sign edge values on every row.
++    edges = torch.tensor(
++        [
++            466.0,
++            480.0,
++            1e4,
++            -1e4,
++            float("inf"),
++            -float("inf"),
++            float("nan"),
++            -0.0,
++            2.0**-10,
++            448.0,
++        ],
++        device=device,
++        dtype=torch.bfloat16,
++    )
++    if T:
++        n = min(T * H, 64)
++        idx = torch.randint(0, T * H * (NOPE + V), (n,), device=device, generator=gen)
++        kv.view(-1)[idx] = edges[torch.arange(n, device=device) % edges.numel()]
++        pe.view(-1)[
++            torch.randint(0, T * ROPE, (min(T, 16),), device=device, generator=gen)
++        ] = edges[0]
++    return kv, pe
++
++
++def _torch_cast_saturates() -> bool:
++    return not torch.isnan(
++        torch.tensor([1e4], device="cuda", dtype=torch.bfloat16)
++        .to(torch.float8_e4m3fn)
++        .float()
++    ).item()
++
++
++def _assert_fused_byte_exact(T, H):
++    kv, pe = _inputs(T, H)
++    ref_key, ref_value = _reference(kv, pe)
++    before = mla_kv_pack._concat_mla_kv_quant_fp8_stats()["specialized_dispatches"]
++    key, value = flashinfer.concat_mla_kv_quant_fp8(kv, pe)
++    assert key.dtype == torch.float8_e4m3fn and value.dtype == torch.float8_e4m3fn
++    assert key.shape == (T, H, NOPE + ROPE) and value.shape == (T, H, V)
++    assert torch.equal(key.view(torch.uint8), ref_key)
++    assert torch.equal(value.view(torch.uint8), ref_value)
++    stats = mla_kv_pack._concat_mla_kv_quant_fp8_stats()
++    assert stats["specialized_dispatches"] == before + 1, stats
++
++
++@pytest.mark.parametrize("T", [1, 7, 1536, 66038, 66048])
++@pytest.mark.parametrize("H", [12, 8])
++def test_byte_exact(T, H):
++    """12 heads takes the unrolled kernel, 8 heads the runtime-head-count one."""
++    _assert_fused_byte_exact(T, H)
++
++
++@pytest.mark.parametrize("T,H", [(129, 1), (127, 3), (1536, 13), (2048, 128)])
++def test_byte_exact_odd_head_counts(T, H):
++    """Runtime head count: heads below the 2-way / 4-way lane strides and the
++    allowlist's largest head count."""
++    _assert_fused_byte_exact(T, H)
++
++
++def test_matches_torch_cast_when_saturating():
++    """On torch >= 2.13 the GPU cast saturates: kernel == cast + slice copies."""
++    if not _torch_cast_saturates():
++        pytest.skip("this torch's fp8 cast is NaN-on-overflow (< 2.13)")
++    kv, pe = _inputs(4096, 12)
++    key, value = flashinfer.concat_mla_kv_quant_fp8(kv, pe)
++    kv8 = kv.to(torch.float8_e4m3fn)
++    exp_key = torch.cat(
++        [kv8[..., :NOPE], pe.to(torch.float8_e4m3fn).unsqueeze(1).expand(-1, 12, -1)],
++        -1,
++    )
++    assert torch.equal(key.view(torch.uint8), exp_key.contiguous().view(torch.uint8))
++    assert torch.equal(
++        value.view(torch.uint8), kv8[..., NOPE:].contiguous().view(torch.uint8)
++    )
++
++
++def test_all_bf16_patterns_byte_exact():
++    """Every bf16 bit pattern through the fused kernel (saturation, NaN sign
++    dropping, subnormal RNE, -0.0) against the explicit reference."""
++    allb = (
++        torch.arange(0, 65536, dtype=torch.int32)
++        .to(torch.int16)
++        .view(torch.bfloat16)
++        .cuda()
++    )
++    kv = allb.repeat(48).view(1024, 12, NOPE + V)  # 48 x 65536 = 1024 x 12 x 256
++    pe = allb.view(1024, ROPE)  # every pattern once through the rope path too
++    ref_key, ref_value = _reference(kv, pe)
++    key, value = flashinfer.concat_mla_kv_quant_fp8(kv, pe)
++    assert torch.equal(key.view(torch.uint8), ref_key)
++    assert torch.equal(value.view(torch.uint8), ref_value)
++
++
++def test_kill_switch_takes_fallback(monkeypatch):
++    kv, pe = _inputs(2048, 12)
++    ref_key, ref_value = _reference(kv, pe)
++    before = mla_kv_pack._concat_mla_kv_quant_fp8_stats()["specialized_dispatches"]
++    monkeypatch.setenv("FLASHINFER_SPECIALIZED_KERNEL_DISABLE", "1")
++    key, value = flashinfer.concat_mla_kv_quant_fp8(kv, pe)
++    stats = mla_kv_pack._concat_mla_kv_quant_fp8_stats()
++    assert stats["specialized_dispatches"] == before
++    assert stats["fallback_reasons"].get("kill_switch", 0) >= 1
++    # Fallback is torch's cast: byte-exact with the kernel only where the cast saturates.
++    if _torch_cast_saturates():
++        assert torch.equal(key.view(torch.uint8), ref_key)
++        assert torch.equal(value.view(torch.uint8), ref_value)
++
++
++def test_k_pe_3d_and_preallocated_outputs():
++    kv, pe = _inputs(512, 12)
++    key = torch.empty(512, 12, NOPE + ROPE, dtype=torch.float8_e4m3fn, device="cuda")
++    value = torch.empty(512, 12, V, dtype=torch.float8_e4m3fn, device="cuda")
++    k2, v2 = flashinfer.concat_mla_kv_quant_fp8(kv, pe.unsqueeze(1), key, value)
++    assert k2.data_ptr() == key.data_ptr() and v2.data_ptr() == value.data_ptr()
++    ref_key, ref_value = _reference(kv, pe)
++    assert torch.equal(key.view(torch.uint8), ref_key)
++    assert torch.equal(value.view(torch.uint8), ref_value)
++
++
++def test_non_contiguous_takes_fallback():
++    kv, pe = _inputs(256, 12)
++    kv_strided = torch.empty(
++        256, 12, 2 * (NOPE + V), device="cuda", dtype=torch.bfloat16
++    )[..., : NOPE + V]
++    kv_strided.copy_(kv)
++    before = mla_kv_pack._concat_mla_kv_quant_fp8_stats()["fallback_reasons"].get(
++        "non_contiguous", 0
++    )
++    key, value = flashinfer.concat_mla_kv_quant_fp8(kv_strided, pe)
++    assert (
++        mla_kv_pack._concat_mla_kv_quant_fp8_stats()["fallback_reasons"][
++            "non_contiguous"
++        ]
++        == before + 1
++    )
++    if _torch_cast_saturates():
++        ref_key, ref_value = _reference(kv, pe)
++        assert torch.equal(key.view(torch.uint8), ref_key)
++        assert torch.equal(value.view(torch.uint8), ref_value)
++
++
++def test_allowlist_guards_are_gpu_free():
++    """The allowlist is checked before the device: exercisable on CPU tensors."""
++    allowlist = mla_kv_pack._load_allowlist()
++    assert allowlist is not None
++    assert allowlist["heads"] == (1, 128) and allowlist["tokens"] == (1, 131072)
++    assert allowlist["min_cc"] == (10, 0)
++    fp8 = torch.float8_e4m3fn
++
++    def reason(T, H):
++        kv = torch.empty(T, H, NOPE + V, dtype=torch.bfloat16)
++        pe = torch.empty(T, ROPE, dtype=torch.bfloat16)
++        key = torch.empty(T, H, NOPE + ROPE, dtype=fp8)
++        value = torch.empty(T, H, V, dtype=fp8)
++        return mla_kv_pack._specialized_supported(kv, pe, key, value, NOPE)
++
++    assert reason(1024, 12) == "device"  # every GPU-free guard passed
++    assert reason(1024, 129) == "num_heads_not_allowlisted"
++    assert reason(131073, 12) == "num_tokens_not_allowlisted"
++    kv = torch.empty(8, 12, NOPE + V, dtype=torch.bfloat16)
++    pe = torch.empty(8, ROPE, dtype=torch.bfloat16)
++    key = torch.empty(8, 12, NOPE + ROPE, dtype=fp8)
++    bad_value = torch.empty(8, 12, V, dtype=torch.float8_e5m2)
++    assert mla_kv_pack._specialized_supported(kv, pe, key, bad_value, NOPE) == (
++        "output_dtype"
++    )
++    assert mla_kv_pack._specialized_supported(kv, pe, key, key, NOPE) == (
++        "output_geometry"
++    )
++
++
++def test_rejects_non_fp8_output_buffers():
++    """Caller-provided outputs must honour the float8_e4m3fn contract; a wrong
++    dtype is an error, never a silent fallback into that buffer."""
++    kv, pe = _inputs(8, 12)
++    key = torch.empty(8, 12, NOPE + ROPE, dtype=torch.float8_e4m3fn, device="cuda")
++    value_e5m2 = torch.empty(8, 12, V, dtype=torch.float8_e5m2, device="cuda")
++    with pytest.raises(ValueError, match="float8_e4m3fn"):
++        flashinfer.concat_mla_kv_quant_fp8(kv, pe, key=key, value=value_e5m2)
++    key_bf16 = torch.empty(8, 12, NOPE + ROPE, dtype=torch.bfloat16, device="cuda")
++    with pytest.raises(ValueError, match="float8_e4m3fn"):
++        flashinfer.concat_mla_kv_quant_fp8(kv, pe, key=key_bf16)
++
++
++def test_pre_blackwell_device_takes_fallback(monkeypatch):
++    """The fused kernel is dispatched on compute capability 10.0+ only."""
++    monkeypatch.setattr(mla_kv_pack, "get_compute_capability", lambda device: (9, 0))
++    kv, pe = _inputs(512, 12)
++    before = mla_kv_pack._concat_mla_kv_quant_fp8_stats()
++    key, value = flashinfer.concat_mla_kv_quant_fp8(kv, pe)
++    after = mla_kv_pack._concat_mla_kv_quant_fp8_stats()
++    assert after["specialized_dispatches"] == before["specialized_dispatches"]
++    assert after["fallback_reasons"]["compute_capability"] == (
++        before["fallback_reasons"].get("compute_capability", 0) + 1
++    )
++    if _torch_cast_saturates():
++        ref_key, ref_value = _reference(kv, pe)
++        assert torch.equal(key.view(torch.uint8), ref_key)
++        assert torch.equal(value.view(torch.uint8), ref_value)
++
++
++def test_stats_hook_reports_compile_footprint():
++    flashinfer.concat_mla_kv_quant_fp8(*_inputs(64, 12))
++    stats = mla_kv_pack._concat_mla_kv_quant_fp8_stats()
++    assert stats["module_loaded"] and stats["precompiled"]
++    assert stats["compiled_variants"] == 2
++    assert stats["distinct_kernels_for_allowlist"] == 2
++    assert stats["allowlist_loaded"]
++
++
++def test_zero_tokens():
++    kv, pe = _inputs(0, 12)
++    key, value = flashinfer.concat_mla_kv_quant_fp8(kv, pe)
++    assert key.shape == (0, 12, NOPE + ROPE) and value.shape == (0, 12, V)
++
++
++def test_cuda_graph_capture_after_warmup():
++    kv, pe = _inputs(1024, 12)
++    flashinfer.concat_mla_kv_quant_fp8(kv, pe)  # builds/loads the module
++    key = torch.empty(1024, 12, NOPE + ROPE, dtype=torch.float8_e4m3fn, device="cuda")
++    value = torch.empty(1024, 12, V, dtype=torch.float8_e4m3fn, device="cuda")
++    before = mla_kv_pack._concat_mla_kv_quant_fp8_stats()["specialized_dispatches"]
++    s = torch.cuda.Stream()
++    s.wait_stream(torch.cuda.current_stream())
++    with torch.cuda.stream(s):
++        g = torch.cuda.CUDAGraph()
++        with torch.cuda.graph(g):
++            flashinfer.concat_mla_kv_quant_fp8(kv, pe, key, value)
++    torch.cuda.current_stream().wait_stream(s)
++    assert (
++        mla_kv_pack._concat_mla_kv_quant_fp8_stats()["specialized_dispatches"]
++        == before + 1
++    )
++    key.zero_()
++    value.zero_()
++    g.replay()
++    torch.cuda.synchronize()
++    ref_key, ref_value = _reference(kv, pe)
++    assert torch.equal(key.view(torch.uint8), ref_key)
++    assert torch.equal(value.view(torch.uint8), ref_value)

@@ -1,0 +1,1709 @@
+diff --git a/benchmarks/routines/flashinfer_benchmark_utils.py b/benchmarks/routines/flashinfer_benchmark_utils.py
+index c382ea487af..327f057665b 100644
+--- a/benchmarks/routines/flashinfer_benchmark_utils.py
++++ b/benchmarks/routines/flashinfer_benchmark_utils.py
+@@ -538,6 +538,7 @@ def dtype_str_to_torch_dtype(dtype_str):
+         "9.0": [],
+         "10.0": ["cutlass", "cute-dsl", "trtllm", "cudnn"],
+         "10.3": ["cutlass", "cute-dsl", "trtllm", "cudnn"],
++        "10.7": ["cutlass", "cute-dsl", "trtllm"],
+         "11.0": ["cutlass", "cudnn"],
+         "12.0": ["cutlass", "cudnn"],
+         "12.1": ["cutlass", "cudnn"],
+diff --git a/benchmarks/routines/gemm.py b/benchmarks/routines/gemm.py
+index adff22a6f0a..77bb270d61e 100644
+--- a/benchmarks/routines/gemm.py
++++ b/benchmarks/routines/gemm.py
+@@ -1,4 +1,5 @@
+ from collections import defaultdict
++from typing import Literal, cast
+ 
+ import numpy as np
+ import torch
+@@ -60,6 +61,55 @@ def run_gemm_test(args):
+         raise ValueError(f"Unsupported routine: {args.routine}")
+ 
+ 
++def _validate_dynamic_quant_backends(
++    dynamic_quant: bool,
++    dynamic_quant_layout: str,
++    backends: list[str],
++) -> None:
++    if not dynamic_quant:
++        return
++
++    supported_backends = {
++        "auto": ("trtllm",),
++        "8x4": ("trtllm",),
++        "128x4": ("trtllm", "cute-dsl"),
++    }
++    allowed_backends = supported_backends[dynamic_quant_layout]
++    unsupported_backends = [
++        backend for backend in backends if backend not in allowed_backends
++    ]
++    if unsupported_backends:
++        raise ValueError(
++            f"--dynamic_quant_layout {dynamic_quant_layout} supports only "
++            f"{', '.join(allowed_backends)}; got {', '.join(unsupported_backends)}"
++        )
++
++
++def _dynamic_mxfp8_problem_bytes(
++    m: int,
++    n: int,
++    k: int,
++    out_itemsize: int,
++) -> int:
++    """Return logical traffic for comparing equivalent dynamic-quant workloads.
++
++    Physical scale buffers include backend-specific padding. This metric uses
++    logical scale counts so 8x4, 128x4, and adaptive runs report the same useful
++    work for a given ``(M, N, K)``.
++    """
++    activation_values = m * k * torch.float8_e4m3fn.itemsize
++    activation_scales = m * (k // 32) * torch.uint8.itemsize
++    weight_values = n * k * torch.float8_e4m3fn.itemsize
++    weight_scales = n * (k // 32) * torch.uint8.itemsize
++    return (
++        m * k * torch.bfloat16.itemsize
++        + 2 * (activation_values + activation_scales)
++        + weight_values
++        + weight_scales
++        + m * n * out_itemsize
++    )
++
++
+ def parse_gemm_args(line, parser):
+     """
+     Parse command line arguments for gemm test configuration.
+@@ -168,6 +218,19 @@ def parse_gemm_args(line, parser):
+         action="store_true",
+         help="Use 128x4 SF layout for the input and mat2.",
+     )
++    parser.add_argument(
++        "--dynamic_quant",
++        action="store_true",
++        default=False,
++        help="Measure BF16 activation quantization and MXFP8 GEMM together.",
++    )
++    parser.add_argument(
++        "--dynamic_quant_layout",
++        type=str,
++        default="8x4",
++        choices=["auto", "8x4", "128x4"],
++        help="Activation scale layout for --dynamic_quant.",
++    )
+     parser.add_argument(
+         "--use_nvfp4",
+         action="store_true",
+@@ -213,6 +276,30 @@ def parse_gemm_args(line, parser):
+     if args.routine == "mm_fp8":
+         if not has_backends_arg:
+             args.backends = ["trtllm_low_latency"]
++    if args.routine == "mm_mxfp8":
++        if args.dynamic_quant and not has_backends_arg:
++            args.backends = ["trtllm"]
++        if (
++            args.dynamic_quant
++            and args.out_dtype != "bfloat16"
++            and any(backend != "cute-dsl" for backend in args.backends)
++        ):
++            raise ValueError("MXFP8 dynamic quantization requires bfloat16 output")
++        _validate_dynamic_quant_backends(
++            args.dynamic_quant,
++            args.dynamic_quant_layout,
++            args.backends,
++        )
++        if (
++            args.dynamic_quant
++            and args.dynamic_quant_layout == "auto"
++            and not (args.autotune or getattr(args, "autotune_cache", None))
++        ):
++            raise ValueError(
++                "--dynamic_quant_layout auto requires --autotune or "
++                "--autotune_cache; without a tuned selection the API uses its "
++                "fixed 8x4 fallback"
++            )
+     if args.verbose >= 1:
+         print(f"[INFO] {args = }")
+     return args
+@@ -1838,6 +1925,12 @@ def testMmMxfp8(args):
+ 
+     ## Parse input arguments
+     backends = args.backends
++    dynamic_quant = getattr(args, "dynamic_quant", False)
++    dynamic_quant_layout = getattr(args, "dynamic_quant_layout", "auto")
++    case_tag = args.case_tag
++    if dynamic_quant:
++        dynamic_quant_tag = f"dynamic_quant={dynamic_quant_layout}"
++        case_tag = f"{case_tag};{dynamic_quant_tag}" if case_tag else dynamic_quant_tag
+     m = args.m
+     n = args.n
+     k = args.k
+@@ -1853,6 +1946,12 @@ def testMmMxfp8(args):
+     ]
+     res = []
+ 
++    _validate_dynamic_quant_backends(
++        dynamic_quant,
++        dynamic_quant_layout,
++        backends,
++    )
++
+     backends = filter_backends_by_compute_capability(backends, args.routine, device)
+     if len(backends) == 0:
+         print("[ERROR] No backends to test. Exiting.")
+@@ -1879,35 +1978,47 @@ def testMmMxfp8(args):
+         return res
+ 
+     inputs = {}
+-    input = torch.randn([m, k], device=device, dtype=torch.bfloat16)
++    input_bf16 = torch.randn([m, k], device=device, dtype=torch.bfloat16)
+     mat2 = torch.randn([n, k], device=device, dtype=torch.bfloat16)
+     for backend in backends:
+-        ## Prepare input tensors
+-        # Every backend consumes swizzled scales; trtllm optionally uses 8x4 for A.
+-        if backend == "trtllm" and not args.use_128x4_sf_layout:
+-            sf_layout_input = flashinfer.SfLayout.layout_8x4
+-        else:
+-            sf_layout_input = flashinfer.SfLayout.layout_128x4
+-        input_mxfp8, input_scale = mxfp8_quantize(
+-            input, sf_swizzle_layout=sf_layout_input
+-        )
+-        # when using trtllm, the shuffle_matrix_sf_a will swizzle the layout.
++        input_mxfp8 = None
++        input_scale = None
++        if not dynamic_quant:
++            # Every backend consumes swizzled scales; trtllm optionally uses 8x4 for A.
++            if backend == "trtllm" and not args.use_128x4_sf_layout:
++                sf_layout_input = flashinfer.SfLayout.layout_8x4
++            else:
++                sf_layout_input = flashinfer.SfLayout.layout_128x4
++            input_mxfp8, input_scale = mxfp8_quantize(
++                input_bf16, sf_swizzle_layout=sf_layout_input
++            )
++
++        # TRTLLM consumes row-shuffled weights and padded 128x4 weight scales.
+         mat2_mxfp8, mat2_scale = mxfp8_quantize(
+             mat2,
+             is_sf_swizzled_layout=backend != "trtllm",
+         )
+ 
+         if backend == "trtllm":
+-            from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
+-
+-            mat2_mxfp8 = shuffle_matrix_a(mat2_mxfp8, 128).reshape(n, k)
+-            mat2_scale = shuffle_matrix_sf_a(
+-                mat2_scale.reshape(n, k // 32),
+-                128,
+-                num_elts_per_sf=32,
++            prepared_weight, mat2_scale = flashinfer.prepare_mxfp8_trtllm_weights(
++                mat2_mxfp8,
++                mat2_scale,
+             )
+-            mat2_scale = mat2_scale.t()
++            mat2_mxfp8 = prepared_weight.T
++
++        if dynamic_quant:
++            out = torch.empty((m, n), device=device, dtype=res_dtype)
++            if args.verbose >= 2:
++                print(f"[VERBOSE] {backend}: {input_bf16.shape = }")
++                print(f"[VERBOSE] {backend}: {input_bf16.dtype = }")
++                print(f"[VERBOSE] {backend}: {mat2_mxfp8.shape = }")
++                print(f"[VERBOSE] {backend}: {mat2_mxfp8.dtype = }")
++                print(f"[VERBOSE] {backend}: {mat2_scale.shape = }")
++                print(f"[VERBOSE] {backend}: {mat2_scale.dtype = }")
++            inputs[backend] = (input_bf16, mat2_mxfp8, mat2_scale, out)
++            continue
+ 
++        assert input_mxfp8 is not None and input_scale is not None
+         if args.verbose >= 2:
+             print(f"[VERBOSE] {backend}: {input_mxfp8.shape = }")
+             print(f"[VERBOSE] {backend}: {input_mxfp8.dtype = }")
+@@ -1921,11 +2032,52 @@ def testMmMxfp8(args):
+ 
+     def run_backend(
+         backend: str,
+-        inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
++        inputs: tuple[torch.Tensor, ...],
+     ) -> torch.Tensor:
+-        assert backend in ["cutlass", "trtllm", "cute-dsl", "cudnn", "auto"], (
+-            f"Unsupported backend: {backend}"
++        assert backend in [
++            "cutlass",
++            "trtllm",
++            "cute-dsl",
++            "cudnn",
++            "b12x",
++            "auto",
++        ], f"Unsupported backend: {backend}"
++        typed_backend = cast(
++            Literal["cutlass", "trtllm", "cute-dsl", "cudnn", "b12x", "auto"],
++            backend,
+         )
++        if dynamic_quant:
++            input_bf16, mat2_mxfp8, mat2_scale, out = inputs
++            if dynamic_quant_layout == "auto":
++                return flashinfer.gemm.mm_mxfp8_dynamic_quant(
++                    a=input_bf16,
++                    b=mat2_mxfp8.t(),
++                    b_descale=mat2_scale,
++                    out=out,
++                    out_dtype=res_dtype,
++                    backend="trtllm",
++                )
++
++            sf_layout = (
++                flashinfer.SfLayout.layout_8x4
++                if dynamic_quant_layout == "8x4"
++                else flashinfer.SfLayout.layout_128x4
++            )
++            input_mxfp8, input_scale = mxfp8_quantize(
++                input_bf16,
++                sf_swizzle_layout=sf_layout,
++            )
++            return flashinfer.gemm.mm_mxfp8(
++                a=input_mxfp8,
++                b=mat2_mxfp8.t(),
++                a_descale=input_scale,
++                b_descale=mat2_scale,
++                out=out,
++                out_dtype=res_dtype,
++                backend=typed_backend,
++                use_8x4_sf_layout=dynamic_quant_layout == "8x4",
++            )
++
+         input_mxfp8, mat2_mxfp8, input_scale, mat2_scale = inputs
+         return flashinfer.gemm.mm_mxfp8(
+             a=input_mxfp8,
+@@ -1933,13 +2085,13 @@ def run_backend(
+             a_descale=input_scale,
+             b_descale=mat2_scale,
+             out_dtype=res_dtype,
+-            backend=backend,
++            backend=typed_backend,
+             use_8x4_sf_layout=backend == "trtllm" and not args.use_128x4_sf_layout,
+         )
+ 
+     has_reference_output = False
+     if run_refcheck:
+-        reference_output = torch.mm(input, mat2.t())
++        reference_output = torch.mm(input_bf16, mat2.t())
+         has_reference_output = True
+ 
+     cache_path = getattr(args, "autotune_cache", None)
+@@ -2018,13 +2170,20 @@ def run_backend(
+             median_time = np.median(backend_times[backend])
+             std_time = np.std(backend_times[backend])
+             problem_flops = 2 * m * n * k
+-            # MXFP8 uses fp8_e4m3fn for data (1 byte) and uint8 for scales
+-            # Scale tensors are much smaller, so approximate as 1 byte per element for simplicity
+-            problem_bytes = (
+-                m * k * torch.float8_e4m3fn.itemsize
+-                + n * k * torch.float8_e4m3fn.itemsize
+-                + m * n * res_dtype.itemsize
+-            )
++            if dynamic_quant:
++                problem_bytes = _dynamic_mxfp8_problem_bytes(
++                    m,
++                    n,
++                    k,
++                    out_itemsize=res_dtype.itemsize,
++                )
++            else:
++                # MXFP8 values use one byte; scale traffic is omitted for legacy comparability.
++                problem_bytes = (
++                    m * k * torch.float8_e4m3fn.itemsize
++                    + n * k * torch.float8_e4m3fn.itemsize
++                    + m * n * res_dtype.itemsize
++                )
+             tflops = problem_flops / (10**9 * median_time)  # in TFLOPs/sec
+             tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
+             print_perf_metrics(backend_name, median_time, std_time, tflops, tb_per_sec)
+@@ -2041,7 +2200,7 @@ def run_backend(
+                 cur_res["k"] = k
+                 cur_res["out_dtype"] = res_dtype
+                 cur_res["backend"] = backend_name
+-                cur_res["case_tag"] = args.case_tag
++                cur_res["case_tag"] = case_tag
+                 res.append(cur_res)
+     return res
+ 
+diff --git a/docs/api/gemm.rst b/docs/api/gemm.rst
+index db86a4ebfa8..dc3c4de8fbf 100644
+--- a/docs/api/gemm.rst
++++ b/docs/api/gemm.rst
+@@ -50,6 +50,8 @@ MXFP8 GEMM
+     :toctree: ../generated
+ 
+     mm_mxfp8
++    mm_mxfp8_dynamic_quant
++    prepare_mxfp8_trtllm_weights
+     bmm_mxfp8
+ 
+ FP8 GEMM
+diff --git a/flashinfer/__init__.py b/flashinfer/__init__.py
+index 7038abf5094..23df4672241 100644
+--- a/flashinfer/__init__.py
++++ b/flashinfer/__init__.py
+@@ -152,6 +152,8 @@
+ from .gemm import prepare_bf16_fp4_weights as prepare_bf16_fp4_weights
+ from .gemm import mm_fp8 as mm_fp8
+ from .gemm import mm_mxfp8 as mm_mxfp8
++from .gemm import mm_mxfp8_dynamic_quant as mm_mxfp8_dynamic_quant
++from .gemm import prepare_mxfp8_trtllm_weights as prepare_mxfp8_trtllm_weights
+ from .gemm import tgv_gemm_sm100 as tgv_gemm_sm100
+ from .grouped_mm import grouped_mm_bf16 as grouped_mm_bf16
+ from .grouped_mm import grouped_mm_fp8 as grouped_mm_fp8
+diff --git a/flashinfer/gemm/__init__.py b/flashinfer/gemm/__init__.py
+index de751451c01..b54c5dbf42b 100644
+--- a/flashinfer/gemm/__init__.py
++++ b/flashinfer/gemm/__init__.py
+@@ -6,6 +6,10 @@
+ from .gemm_base import mm_fp4 as mm_fp4
+ from .gemm_base import mm_fp8 as mm_fp8
+ from .gemm_base import mm_mxfp8 as mm_mxfp8
++from .gemm_base import mm_mxfp8_dynamic_quant as mm_mxfp8_dynamic_quant
++from .gemm_base import (
++    prepare_mxfp8_trtllm_weights as prepare_mxfp8_trtllm_weights,
++)
+ from .gemm_base import tgv_gemm_sm100 as tgv_gemm_sm100
+ from .gemm_base import group_gemm_mxfp4_nt_groupwise as group_gemm_mxfp4_nt_groupwise
+ from .gemm_base import (
+@@ -118,6 +122,8 @@
+         "mm_fp4",
+         "mm_fp8",
+         "mm_mxfp8",
++        "mm_mxfp8_dynamic_quant",
++        "prepare_mxfp8_trtllm_weights",
+         "tgv_gemm_sm100",
+         "group_gemm_mxfp4_nt_groupwise",
+         "group_gemm_mxfp8_mxfp4_nt_groupwise",
+diff --git a/flashinfer/gemm/gemm_base.py b/flashinfer/gemm/gemm_base.py
+index bcb6be112c5..5041f91c6fc 100644
+--- a/flashinfer/gemm/gemm_base.py
++++ b/flashinfer/gemm/gemm_base.py
+@@ -40,6 +40,7 @@
+     mm_bf16_trace,
+     mm_fp4_trace,
+     mm_fp8_trace,
++    mm_mxfp8_dynamic_quant_trace,
+     mm_mxfp8_trace,
+ )
+ from ..trace.templates.attention import segment_gemm_run_trace
+@@ -102,6 +103,8 @@
+ from ..jit.cpp_ext import get_cuda_version
+ from ..jit.gemm import gen_fp8_blockscale_gemm_sm90_module
+ from ..tllm_enums import DtypeTrtllmGen, SfLayout
++from ..quantization.fp8_quantization import mxfp8_quantize
++from ..quantization.fp4_quantization import shuffle_matrix_a, shuffle_matrix_sf_a
+ from .routergemm import get_tinygemm2_module
+ 
+ 
+@@ -5811,7 +5814,7 @@ def mm_mxfp8(
+         "cutlass": lambda: get_cutlass_mxfp8_gemm_module(
+             major
+         ).cutlass_mxfp8_gemm_runner(),
+-        "trtllm": lambda: get_trtllm_gemm_module().trtllm_mxfp8_gemm_runner(
++        "trtllm": lambda: get_trtllm_gemm_module(a.device).trtllm_mxfp8_gemm_runner(
+             use_8x4_sf_layout
+         ),
+         "cute-dsl": lambda: _cute_dsl_gemm_mxfp8_runner(major, minor, True, out_dtype),
+@@ -5852,6 +5855,282 @@ def mm_mxfp8(
+     return out
+ 
+ 
++@flashinfer_api
++def prepare_mxfp8_trtllm_weights(
++    weight: torch.Tensor,
++    weight_scale: torch.Tensor,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    r"""Prepare linear-layout MXFP8 weights for TRTLLM GEMM kernels.
++
++    ``weight`` and ``weight_scale`` are the outputs of
++    :func:`flashinfer.mxfp8_quantize` with ``sf_swizzle_layout=layout_linear``.
++    This function row-shuffles the weight, pads scale rows to the physical
++    128x4 layout, and returns the column-major weight view consumed by
++    :func:`mm_mxfp8_dynamic_quant`.
++
++    Parameters
++    ----------
++    weight : torch.Tensor
++        Contiguous MXFP8 weight with shape ``(N, K)``.
++    weight_scale : torch.Tensor
++        Linear E8M0 scales with ``N * (K // 32)`` elements.
++
++    Returns
++    -------
++    tuple[torch.Tensor, torch.Tensor]
++        The TRTLLM-shuffled weight view with shape ``(K, N)`` and the flattened
++        128x4 E8M0 scale buffer.
++    """
++    if weight.ndim != 2:
++        raise ValueError(f"weight must have shape (N, K), got {weight.shape}")
++    n, k = weight.shape
++    if weight.dtype != torch.float8_e4m3fn or weight_scale.dtype != torch.uint8:
++        raise ValueError("weight and weight_scale must use MXFP8 storage")
++    if weight.device.type != "cuda":
++        raise ValueError("weight and weight_scale must be CUDA tensors")
++    if weight.device != weight_scale.device:
++        raise ValueError("weight and weight_scale must be on the same CUDA device")
++    if not weight.is_contiguous() or not weight_scale.is_contiguous():
++        raise ValueError("weight and weight_scale must be contiguous")
++    if n < 128 or n % 32 != 0:
++        raise ValueError(f"TRTLLM MXFP8 requires N >= 128 and divisible by 32, got {n}")
++    if k <= 0 or k % 256 != 0:
++        raise ValueError(f"TRTLLM MXFP8 requires K divisible by 256, got {k}")
++    if weight_scale.numel() != n * (k // 32):
++        raise ValueError(
++            "weight_scale must contain one linear scale per 32 weight values; "
++            f"expected {n * (k // 32)}, got {weight_scale.numel()}"
++        )
++
++    with torch.cuda.device(weight.device):
++        linear_scale = weight_scale.reshape(n, k // 32)
++        padded_n = _pad_up(n, 128)
++        if padded_n != n:
++            padding = torch.full(
++                (padded_n - n, k // 32),
++                127,
++                dtype=weight_scale.dtype,
++                device=weight_scale.device,
++            )
++            linear_scale = torch.cat((linear_scale, padding), dim=0)
++
++        prepared_weight = shuffle_matrix_a(weight, 128).reshape(n, k).T
++        prepared_scale = shuffle_matrix_sf_a(
++            linear_scale,
++            128,
++            num_elts_per_sf=32,
++        ).reshape(-1)
++        return prepared_weight, prepared_scale
++
++
++class _TrtllmDynamicQuantMxfp8Runner(TunableRunner):
++    def __init__(self, device: torch.device) -> None:
++        module = get_trtllm_gemm_module(device)
++        self._module = module
++        self._compute_capability = get_compute_capability(device)
++        self._gemm_runner_8x4 = module.trtllm_mxfp8_gemm_runner(True)
++        self._gemm_runner_128x4 = module.trtllm_mxfp8_gemm_runner(False)
++
++    def get_cache_key_extras(
++        self, inputs: List[torch.Tensor]
++    ) -> tuple[tuple[int, int]]:
++        return (self._compute_capability,)
++
++    def get_valid_tactics(
++        self,
++        inputs: List[torch.Tensor],
++        profile: OptimizationProfile,
++    ) -> List[tuple[bool, int]]:
++        a_shape, b_shape = profile.get_opt_shapes()[:2]
++        return [
++            (use_8x4_sf_layout, tactic)
++            for use_8x4_sf_layout in (True, False)
++            for tactic in self._module.trtllm_mxfp8_gemm_tactics(
++                a_shape[0],
++                b_shape[1],
++                a_shape[1],
++                use_8x4_sf_layout,
++            )
++        ]
++
++    def forward(
++        self,
++        inputs: List[torch.Tensor],
++        tactic: int | tuple[bool, int] = -1,
++        do_preparation: bool = False,
++        **kwargs,
++    ) -> torch.Tensor:
++        a, b, b_descale, out_dtype, out, workspace_buffer = inputs
++        if isinstance(tactic, tuple):
++            use_8x4_sf_layout, gemm_tactic = tactic
++        else:
++            use_8x4_sf_layout, gemm_tactic = True, tactic
++        sf_layout = SfLayout.layout_8x4 if use_8x4_sf_layout else SfLayout.layout_128x4
++        a_mxfp8, a_descale = mxfp8_quantize(a, sf_swizzle_layout=sf_layout)
++        gemm_runner = (
++            self._gemm_runner_8x4 if use_8x4_sf_layout else self._gemm_runner_128x4
++        )
++        return gemm_runner(
++            inputs=[
++                a_mxfp8,
++                b,
++                a_descale,
++                b_descale,
++                out_dtype,
++                out,
++                workspace_buffer,
++            ],
++            tactic=gemm_tactic,
++            do_preparation=do_preparation,
++        )
++
++
++def _check_mm_mxfp8_dynamic_quant_problem_size(
++    a: torch.Tensor,
++    b: torch.Tensor,
++    b_descale: torch.Tensor,
++    out: Optional[torch.Tensor] = None,
++    out_dtype: torch.dtype = torch.bfloat16,
++    backend: Literal["trtllm"] = "trtllm",
++) -> bool:
++    if a.dtype != torch.bfloat16:
++        raise ValueError(f"a must be a bfloat16 tensor, got {a.dtype}")
++    if a.ndim != 2 or b.ndim != 2 or a.shape[1] != b.shape[0]:
++        raise ValueError(f"expected a[M, K] and b[K, N], got {a.shape=} and {b.shape=}")
++    if a.shape[0] <= 0:
++        raise ValueError(f"TRTLLM MXFP8 M must be positive, got {a.shape[0]}")
++    if b.shape[1] < 128:
++        raise ValueError(f"TRTLLM MXFP8 requires N >= 128, got {b.shape[1]}")
++    if b.shape[1] % 32 != 0:
++        raise ValueError(f"TRTLLM MXFP8 requires N divisible by 32, got {b.shape[1]}")
++    if a.shape[1] <= 0:
++        raise ValueError(f"TRTLLM MXFP8 K must be positive, got {a.shape[1]}")
++    if b.dtype != torch.float8_e4m3fn or b_descale.dtype != torch.uint8:
++        raise ValueError("b and b_descale must use TRTLLM MXFP8 weight storage")
++    if out_dtype != torch.bfloat16:
++        raise ValueError(
++            "TRTLLM MXFP8 dynamic quantization supports bfloat16 output only"
++        )
++    if a.device != b.device or a.device != b_descale.device:
++        raise ValueError("a, b, and b_descale must be on the same CUDA device")
++    if not a.is_contiguous():
++        raise ValueError("a must be contiguous")
++    if b.stride() != (1, b.shape[0]):
++        raise ValueError("b must be a column-major view of shuffled TRTLLM weights")
++    if not b_descale.is_contiguous():
++        raise ValueError("b_descale must be contiguous")
++    if a.shape[1] % 256 != 0:
++        raise ValueError(f"TRTLLM MXFP8 requires K divisible by 256, got {a.shape[1]}")
++    expected_b_descale_len = _mxfp8_swizzled_scale_len(
++        b.shape[1],
++        b.shape[0],
++        SfLayout.layout_128x4,
++    )
++    if b_descale.ndim != 1 or b_descale.numel() != expected_b_descale_len:
++        raise ValueError(
++            "b_descale must be the shuffled 128x4 weight-scale buffer; "
++            f"expected {expected_b_descale_len} elements, got {b_descale.shape}"
++        )
++    if out is not None and (
++        out.shape != (a.shape[0], b.shape[1])
++        or out.device != a.device
++        or out.dtype != out_dtype
++        or not out.is_contiguous()
++    ):
++        raise ValueError("out must match the expected shape, device, and output dtype")
++    return True
++
++
++@supported_compute_capability([100, 103, 107])
++def _trtllm_dynamic_quant_mxfp8_requirement(
++    a: torch.Tensor,
++    b: torch.Tensor,
++    b_descale: torch.Tensor,
++    out: Optional[torch.Tensor] = None,
++    out_dtype: torch.dtype = torch.bfloat16,
++    backend: Literal["trtllm"] = "trtllm",
++) -> bool:
++    return True
++
++
++@backend_requirement(
++    {"trtllm": _trtllm_dynamic_quant_mxfp8_requirement},
++    common_check=_check_mm_mxfp8_dynamic_quant_problem_size,
++)
++@flashinfer_api(trace=mm_mxfp8_dynamic_quant_trace)
++def mm_mxfp8_dynamic_quant(
++    a: torch.Tensor,
++    b: torch.Tensor,
++    b_descale: torch.Tensor,
++    out: Optional[torch.Tensor] = None,
++    out_dtype: torch.dtype = torch.bfloat16,
++    backend: Literal["trtllm"] = "trtllm",
++) -> torch.Tensor:
++    r"""Quantize BF16 activations and run a TRTLLM MXFP8 GEMM.
++
++    The autotuner profiles activation quantization and GEMM together, jointly
++    selecting the activation scale layout and TRTLLM tactic. Weights must use
++    TRTLLM's shuffled 128x4 MXFP8 storage. Run autotuning during model warmup
++    and load the resulting cache before CUDA Graph capture. Without a cached
++    result, this API uses TRTLLM's existing 8x4 fallback. Blackwell SM100,
++    SM103, and SM107 are supported. ``N`` must be at least 128 and divisible
++    by 32; ``K`` must be divisible by 256. Autotuning evaluates exact
++    ``M=1..32`` profiles, which increases one-time warmup work but avoids
++    sharing decode tactics across distinct low-token shapes.
++
++    Prepare weights once before warmup::
++
++        weight_q, weight_sf = flashinfer.mxfp8_quantize(
++            weight, sf_swizzle_layout=flashinfer.SfLayout.layout_linear
++        )
++        b, b_descale = flashinfer.prepare_mxfp8_trtllm_weights(
++            weight_q, weight_sf
++        )
++
++    Parameters
++    ----------
++    a : torch.Tensor
++        Contiguous BF16 activation matrix with shape ``(M, K)``.
++    b : torch.Tensor
++        Column-major MXFP8 weight view with shape ``(K, N)``. The underlying
++        ``(N, K)`` weight and its scales must use TRTLLM's shuffled layout.
++    b_descale : torch.Tensor
++        Contiguous, flattened E8M0 weight-scale buffer in 128x4 layout.
++    out : Optional[torch.Tensor]
++        Optional contiguous BF16 output buffer with shape ``(M, N)``.
++    out_dtype : torch.dtype
++        Output dtype. Only ``torch.bfloat16`` is supported.
++    backend : Literal["trtllm"]
++        GEMM backend. Only ``"trtllm"`` is supported.
++
++    Returns
++    -------
++    torch.Tensor
++        BF16 output matrix with shape ``(M, N)``.
++    """
++    with torch.cuda.device(a.device):
++        if out is None:
++            out = torch.empty(
++                (a.shape[0], b.shape[1]), device=a.device, dtype=out_dtype
++            )
++
++        workspace_buffer = _get_cache_buf(
++            "mm_mxfp8_dynamic_quant_workspace",
++            DEFAULT_WORKSPACE_SIZE,
++            a.device,
++        )
++        runners: List[TunableRunner] = [_TrtllmDynamicQuantMxfp8Runner(a.device)]
++        inputs = [a, b, b_descale, out_dtype, out, workspace_buffer]
++        runner, tactic = AutoTuner.get().choose_one(
++            custom_op="mxfp8_dynamic_quant_gemm",
++            runners=runners,
++            tuning_config=_MM_MXFP8_DYNAMIC_QUANT_TUNING_CONFIG,
++            inputs=inputs,
++        )
++        runner(inputs=inputs, tactic=tactic)
++        return out
++
++
+ def _cudnn_gemm_fp4(
+     a: torch.Tensor,
+     b: torch.Tensor,
+@@ -7183,6 +7462,49 @@ def _mxfp8_swizzled_scale_len(m: int, k: int, swizzle_layout: SfLayout) -> int:
+ )
+ 
+ 
++_TRTLLM_MXFP8_EXACT_M_MAX = 32
++
++
++def _get_trtllm_mxfp8_tuning_buckets(max_num_tokens: int) -> tuple[int, ...]:
++    exact_end = min(max(max_num_tokens, 1), _TRTLLM_MXFP8_EXACT_M_MAX)
++    exact = range(1, exact_end + 1)
++    hybrid_max = _map_to_trtllm_mxfp8_tuning_bucket(max(max_num_tokens, 1))
++    hybrid = get_hybrid_num_tokens_buckets(hybrid_max)
++    return tuple(sorted(set(exact).union(hybrid)))
++
++
++def _map_to_trtllm_mxfp8_tuning_bucket(num_tokens: int) -> int:
++    if num_tokens <= 0:
++        return 1
++    if num_tokens <= _TRTLLM_MXFP8_EXACT_M_MAX:
++        return num_tokens
++    return map_to_hybrid_bucket_uncapped(num_tokens)
++
++
++_TRTLLM_MXFP8_DYNAMIC_TENSOR_SPECS = (
++    DynamicTensorSpec(
++        (0,),
++        (0,),
++        _get_trtllm_mxfp8_tuning_buckets,
++        _map_to_trtllm_mxfp8_tuning_bucket,
++    ),
++)
++
++
++_MM_MXFP8_DYNAMIC_QUANT_TUNING_CONFIG = TuningConfig(
++    use_cuda_graph=True,
++    use_cold_l2_cache=True,
++    dynamic_tensor_specs=_TRTLLM_MXFP8_DYNAMIC_TENSOR_SPECS,
++    constraint_specs=(
++        ConstraintSpec(
++            4,
++            0,
++            lambda shapes: shapes[0][0],
++        ),
++    ),
++)
++
++
+ @backend_requirement(
+     {
+         "cudnn": _cudnn_gemm_fp4_requirement,
+@@ -7897,8 +8219,9 @@ def gemm_fp8_nt_groupwise(
+     return out
+ 
+ 
+-def get_trtllm_gemm_module():
+-    device = torch.device("cuda", torch.cuda.current_device())
++def get_trtllm_gemm_module(device: Optional[torch.device] = None):
++    if device is None:
++        device = torch.device("cuda", torch.cuda.current_device())
+     enable_rubin = get_compute_capability(device) == (10, 7)
+     return _get_trtllm_gemm_module_impl(enable_rubin)
+ 
+@@ -7909,6 +8232,23 @@ def _get_trtllm_gemm_module_impl(enable_rubin: bool):
+     op = mod.build_and_load()
+     setup_cubin_loader(str(mod.get_library_path()))
+ 
++    def trtllm_mxfp8_gemm_tactics(
++        m: int,
++        n: int,
++        k: int,
++        use_8x4_sf_layout: bool,
++    ) -> List[int]:
++        return list(
++            op.trtllm_gemm_tactics(
++                m,
++                n,
++                k,
++                DtypeTrtllmGen.MxE4m3,
++                DtypeTrtllmGen.Bfloat16,
++                use_8x4_sf_layout,
++            )
++        )
++
+     class TrtllmGemmRunner(TunableRunner):
+         def __init__(
+             self,
+@@ -8006,7 +8346,7 @@ def forward(
+                 a,
+                 b.T,
+                 a_descale,
+-                b_descale.T,
++                b_descale.mT if b_descale.ndim == 2 else b_descale,
+                 alpha,
+                 out,
+                 self._use_8x4_sf_layout,
+@@ -8066,6 +8406,7 @@ def unpack_inputs(
+         trtllm_gemm_runner=trtllm_gemm_runner,
+         trtllm_fp4_gemm_runner=trtllm_fp4_gemm_runner,
+         trtllm_mxfp8_gemm_runner=trtllm_mxfp8_gemm_runner,
++        trtllm_mxfp8_gemm_tactics=trtllm_mxfp8_gemm_tactics,
+         trtllm_gemm=op.trtllm_gemm,
+     )
+ 
+diff --git a/flashinfer/trace/templates/gemm.py b/flashinfer/trace/templates/gemm.py
+index 46a30c4fca8..e29e9766312 100644
+--- a/flashinfer/trace/templates/gemm.py
++++ b/flashinfer/trace/templates/gemm.py
+@@ -187,6 +187,79 @@ def _mm_mxfp8_reference(A, B, a_descale, b_descale):
+ )
+ 
+ 
++def _unshuffle_trtllm_mxfp8_rows(x: torch.Tensor) -> torch.Tensor:
++    """Undo TRT-LLM's 32-row ``shuffleMatrixA`` permutation."""
++    rows = x.shape[0]
++    row_map = torch.tensor(
++        [
++            0,
++            8,
++            16,
++            24,
++            1,
++            9,
++            17,
++            25,
++            2,
++            10,
++            18,
++            26,
++            3,
++            11,
++            19,
++            27,
++            4,
++            12,
++            20,
++            28,
++            5,
++            13,
++            21,
++            29,
++            6,
++            14,
++            22,
++            30,
++            7,
++            15,
++            23,
++            31,
++        ],
++        dtype=torch.long,
++        device=x.device,
++    )
++    old_rows = torch.arange(rows, dtype=torch.long, device=x.device)
++    new_rows = (old_rows // 32) * 32 + row_map[old_rows % 32]
++    row_indices = torch.empty_like(old_rows)
++    row_indices[new_rows] = old_rows
++    unshuffled = torch.empty_like(x)
++    unshuffled[row_indices] = x
++    return unshuffled
++
++
++def _mm_mxfp8_dynamic_quant_reference(A, B, b_descale):
++    """Reference BF16 activation times a TRT-LLM-shuffled MXFP8 weight."""
++    _, K = A.shape
++    N = B.shape[1]
++    block_size = 32
++    weight = _unshuffle_trtllm_mxfp8_rows(B.T)
++    weight_scale = _e8m0_to_float(
++        _unshuffle_trtllm_mxfp8_rows(_unswizzle_sf_128x4(b_descale, N, K // block_size))
++    )
++    weight = weight.to(torch.float32) * weight_scale.repeat_interleave(
++        block_size, dim=1
++    )
++    return torch.matmul(A.to(torch.float32), weight.T).to(torch.bfloat16)
++
++
++cast(Any, _mm_mxfp8_dynamic_quant_reference)._trace_reference_dependencies = (
++    _e8m0_to_float,
++    _unswizzle_batched_sf_128x4,
++    _unswizzle_sf_128x4,
++    _unshuffle_trtllm_mxfp8_rows,
++)
++
++
+ def _mm_fp4_reference(A, B, a_descale, b_descale, block_size=16):
+     """Dequantize FP4 inputs and compute C = A @ B."""
+ 
+@@ -399,6 +472,67 @@ def _mm_mxfp8_init(
+     init=_mm_mxfp8_init,
+ )
+ 
++
++def _mm_mxfp8_dynamic_quant_init(
++    *,
++    M: int,
++    N: int = 4096,
++    K: int = 4096,
++    device: str = "cuda",
++    seed: int = 0,
++):
++    """Build BF16 activations and TRT-LLM-shuffled MXFP8 weights."""
++    from flashinfer import (  # noqa: PLC0415
++        SfLayout,
++        mxfp8_quantize,
++        prepare_mxfp8_trtllm_weights,
++    )
++
++    torch.manual_seed(seed)
++    a = torch.randn(M, K, dtype=torch.bfloat16, device=device)
++    weight = torch.randn(N, K, dtype=torch.bfloat16, device=device)
++    weight_q, weight_scale = mxfp8_quantize(
++        weight,
++        sf_swizzle_layout=SfLayout.layout_linear,
++    )
++    b, b_descale = prepare_mxfp8_trtllm_weights(weight_q, weight_scale)
++    return {"a": a, "b": b, "b_descale": b_descale}
++
++
++mm_mxfp8_dynamic_quant_trace = TraceTemplate(
++    op_type="gemm_mxfp8_dynamic_quant",
++    description=(
++        "BF16 activation quantization followed by MXFP8 GEMM with "
++        "TRT-LLM-shuffled weights."
++    ),
++    axes={
++        "M": Var(),
++        "N": Const(),
++        "K": Const(),
++        "B_scale_size": Const(
++            abbrev="",
++            description="Padded 128x4 weight-scale buffer length.",
++        ),
++    },
++    inputs={
++        "A": Tensor(["M", "K"], param="a", description="BF16 activation."),
++        "B": Tensor(
++            ["K", "N"],
++            param="b",
++            description="TRT-LLM row-shuffled MXFP8 weight, column-major.",
++        ),
++        "b_descale": Tensor(
++            ["B_scale_size"],
++            description="TRT-LLM row-shuffled 128x4 E8M0 weight scales.",
++        ),
++    },
++    outputs={"C": Tensor(["M", "N"], dtype="bfloat16")},
++    tags=["status:verified", "quantization:mxfp8", "dynamic_quantization"],
++    reference=_mm_mxfp8_dynamic_quant_reference,
++    check=_mxfp8_gemm_check,
++    init=_mm_mxfp8_dynamic_quant_init,
++)
++
+ # ── FP4 GEMM ─────────────────────────────────────────────────────────────────
+ 
+ 
+diff --git a/tests/benchmarks/test_gemm_args.py b/tests/benchmarks/test_gemm_args.py
+new file mode 100644
+index 00000000000..f78c145a925
+--- /dev/null
++++ b/tests/benchmarks/test_gemm_args.py
+@@ -0,0 +1,178 @@
++import argparse
++import sys
++from pathlib import Path
++
++import pytest
++
++
++BENCHMARK_ROOT = Path(__file__).resolve().parents[2] / "benchmarks"
++sys.path.insert(0, str(BENCHMARK_ROOT))
++
++from routines.gemm import _dynamic_mxfp8_problem_bytes, parse_gemm_args  # noqa: E402
++
++
++def _parser() -> argparse.ArgumentParser:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--routine")
++    parser.add_argument("--verbose", action="count", default=0)
++    parser.add_argument("--autotune_cache")
++    return parser
++
++
++def test_mm_mxfp8_dynamic_quant_defaults_to_trtllm() -> None:
++    args = parse_gemm_args(
++        [
++            "--routine",
++            "mm_mxfp8",
++            "--m",
++            "4",
++            "--n",
++            "2688",
++            "--k",
++            "4096",
++            "--dynamic_quant",
++        ],
++        _parser(),
++    )
++    assert args.backends == ["trtllm"]
++    assert args.dynamic_quant_layout == "8x4"
++
++
++@pytest.mark.parametrize(
++    ("dynamic_quant_layout", "backend"),
++    [
++        ("auto", "trtllm"),
++        ("8x4", "trtllm"),
++        ("128x4", "trtllm"),
++        ("128x4", "cute-dsl"),
++    ],
++)
++def test_mm_mxfp8_accepts_supported_dynamic_quant_layout_backend_pair(
++    dynamic_quant_layout: str,
++    backend: str,
++) -> None:
++    extra_args = ["--autotune"] if dynamic_quant_layout == "auto" else []
++    args = parse_gemm_args(
++        [
++            "--routine",
++            "mm_mxfp8",
++            "--m",
++            "4",
++            "--n",
++            "2688",
++            "--k",
++            "4096",
++            "--backends",
++            backend,
++            "--dynamic_quant",
++            "--dynamic_quant_layout",
++            dynamic_quant_layout,
++            *extra_args,
++        ],
++        _parser(),
++    )
++    assert args.dynamic_quant is True
++    assert args.dynamic_quant_layout == dynamic_quant_layout
++    assert args.backends == [backend]
++
++
++def test_mm_mxfp8_rejects_adaptive_layout_without_tuning_or_cache() -> None:
++    with pytest.raises(ValueError, match="requires --autotune or --autotune_cache"):
++        parse_gemm_args(
++            [
++                "--routine",
++                "mm_mxfp8",
++                "--m",
++                "4",
++                "--n",
++                "2688",
++                "--k",
++                "4096",
++                "--dynamic_quant",
++                "--dynamic_quant_layout",
++                "auto",
++            ],
++            _parser(),
++        )
++
++
++@pytest.mark.parametrize(
++    ("dynamic_quant_layout", "backend"),
++    [("auto", "cute-dsl"), ("8x4", "cute-dsl"), ("128x4", "cutlass")],
++)
++def test_mm_mxfp8_rejects_dynamic_quant_layout_backend_mismatch(
++    dynamic_quant_layout: str,
++    backend: str,
++) -> None:
++    with pytest.raises(
++        ValueError,
++        match=rf"--dynamic_quant_layout {dynamic_quant_layout} supports only",
++    ):
++        parse_gemm_args(
++            [
++                "--routine",
++                "mm_mxfp8",
++                "--m",
++                "4",
++                "--n",
++                "2688",
++                "--k",
++                "4096",
++                "--backends",
++                backend,
++                "--dynamic_quant",
++                "--dynamic_quant_layout",
++                dynamic_quant_layout,
++            ],
++            _parser(),
++        )
++
++
++def test_dynamic_mxfp8_problem_bytes_reports_logical_quantization_traffic() -> None:
++    assert _dynamic_mxfp8_problem_bytes(4, 128, 256, out_itemsize=2) == 38_976
++
++
++def test_mm_mxfp8_dynamic_quant_rejects_non_bf16_output() -> None:
++    with pytest.raises(ValueError, match="bfloat16 output"):
++        parse_gemm_args(
++            [
++                "--routine",
++                "mm_mxfp8",
++                "--m",
++                "4",
++                "--n",
++                "2688",
++                "--k",
++                "4096",
++                "--backends",
++                "trtllm",
++                "--out_dtype",
++                "float16",
++                "--dynamic_quant",
++            ],
++            _parser(),
++        )
++
++
++def test_mm_mxfp8_dynamic_quant_accepts_fp16_for_fixed_cute_dsl() -> None:
++    args = parse_gemm_args(
++        [
++            "--routine",
++            "mm_mxfp8",
++            "--m",
++            "4",
++            "--n",
++            "2688",
++            "--k",
++            "4096",
++            "--backends",
++            "cute-dsl",
++            "--out_dtype",
++            "float16",
++            "--dynamic_quant",
++            "--dynamic_quant_layout",
++            "128x4",
++        ],
++        _parser(),
++    )
++    assert args.out_dtype == "float16"
+diff --git a/tests/gemm/test_mm_mxfp8_dynamic_quant.py b/tests/gemm/test_mm_mxfp8_dynamic_quant.py
+new file mode 100644
+index 00000000000..7c0e12eeacc
+--- /dev/null
++++ b/tests/gemm/test_mm_mxfp8_dynamic_quant.py
+@@ -0,0 +1,420 @@
++import ast
++import json
++from collections.abc import Generator
++from pathlib import Path
++from typing import Any
++
++import pytest
++import torch
++
++from flashinfer import (
++    SfLayout,
++    autotune,
++    mm_mxfp8_dynamic_quant,
++    mxfp8_quantize,
++    prepare_mxfp8_trtllm_weights,
++    shuffle_matrix_a,
++)
++from flashinfer.autotuner import (
++    AutoTuner,
++    OptimizationProfile,
++    StaticDim,
++    TunableRunner,
++    TuningConfig,
++)
++from flashinfer.gemm import gemm_base
++from flashinfer.trace.templates.gemm import _unshuffle_trtllm_mxfp8_rows
++from flashinfer.utils import BackendSupportedError, get_compute_capability
++
++
++_MIN_COSINE_SIMILARITY = 0.98
++
++
++def _skip_if_trtllm_dynamic_quant_unsupported() -> None:
++    if not torch.cuda.is_available():
++        pytest.skip("TRTLLM MXFP8 dynamic quantization requires CUDA")
++
++    capability = get_compute_capability(torch.device("cuda"))
++    if capability not in {(10, 0), (10, 3), (10, 7)}:
++        pytest.skip("TRTLLM MXFP8 dynamic quantization requires SM100, SM103, or SM107")
++
++
++@pytest.fixture(autouse=True)
++def _isolate_autotuner() -> Generator[None, None, None]:
++    AutoTuner._instance = None
++    try:
++        yield
++    finally:
++        AutoTuner._instance = None
++
++
++@pytest.fixture
++def blackwell_cuda() -> None:
++    _skip_if_trtllm_dynamic_quant_unsupported()
++
++
++def test_trtllm_dynamic_quant_buckets_match_lookup_mapping() -> None:
++    buckets = gemm_base._get_trtllm_mxfp8_tuning_buckets(33)
++    assert 33 not in buckets
++    assert 64 in buckets
++    assert gemm_base._map_to_trtllm_mxfp8_tuning_bucket(3) == 3
++    assert gemm_base._map_to_trtllm_mxfp8_tuning_bucket(32) == 32
++    assert gemm_base._map_to_trtllm_mxfp8_tuning_bucket(33) == 64
++    dynamic_spec = gemm_base._MM_MXFP8_DYNAMIC_QUANT_TUNING_CONFIG.dynamic_tensor_specs[
++        0
++    ]
++    assert dynamic_spec.map_to_tuning_buckets(3) == 3
++
++
++def test_trtllm_dynamic_quant_profiles_like_runtime() -> None:
++    tuning_config = gemm_base._MM_MXFP8_DYNAMIC_QUANT_TUNING_CONFIG
++    assert tuning_config.use_cuda_graph
++    assert tuning_config.use_cold_l2_cache
++
++
++def test_trtllm_dynamic_quant_buckets_keep_low_m_exact() -> None:
++    assert gemm_base._get_trtllm_mxfp8_tuning_buckets(64) == (
++        *range(1, 33),
++        64,
++    )
++
++
++def test_mm_mxfp8_dynamic_quant_exposes_backend_capabilities() -> None:
++    assert mm_mxfp8_dynamic_quant.is_backend_supported("trtllm", 100)
++    assert mm_mxfp8_dynamic_quant.is_backend_supported("trtllm", 107)
++    assert not mm_mxfp8_dynamic_quant.is_backend_supported("trtllm", 90)
++    assert not mm_mxfp8_dynamic_quant.is_backend_supported("cute-dsl", 100)
++    assert mm_mxfp8_dynamic_quant.is_compute_capability_supported(100)
++    assert not mm_mxfp8_dynamic_quant.is_compute_capability_supported(90)
++
++
++def test_mm_mxfp8_dynamic_quant_exposes_trace() -> None:
++    assert callable(mm_mxfp8_dynamic_quant.fi_trace)
++
++
++def test_dynamic_quant_runner_selects_module_for_tensor_device(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    requested_devices: list[torch.device] = []
++
++    class FakeModule:
++        def trtllm_mxfp8_gemm_runner(self, use_8x4_sf_layout: bool) -> object:
++            return object()
++
++    def get_module(device: torch.device) -> FakeModule:
++        requested_devices.append(device)
++        return FakeModule()
++
++    monkeypatch.setattr(gemm_base, "get_trtllm_gemm_module", get_module)
++    monkeypatch.setattr(gemm_base, "get_compute_capability", lambda device: (10, 3))
++
++    runner = gemm_base._TrtllmDynamicQuantMxfp8Runner(torch.device("cuda:1"))
++
++    assert requested_devices == [torch.device("cuda:1")]
++    assert runner.get_cache_key_extras([]) == ((10, 3),)
++
++
++def test_dynamic_quant_trace_unshuffles_trtllm_rows() -> None:
++    original = torch.arange(32 * 4).reshape(32, 4)
++    shuffled = shuffle_matrix_a(original, 128)
++    torch.testing.assert_close(_unshuffle_trtllm_mxfp8_rows(shuffled), original)
++
++
++def _prepare_trtllm_weight(
++    n: int, k: int, device: torch.device | str = "cuda"
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    target_device = torch.device(device)
++    with torch.cuda.device(target_device):
++        weight = torch.randn((n, k), device=target_device, dtype=torch.bfloat16)
++        weight_q, weight_sf = mxfp8_quantize(
++            weight,
++            sf_swizzle_layout=SfLayout.layout_linear,
++        )
++    weight_q, weight_sf = prepare_mxfp8_trtllm_weights(weight_q, weight_sf)
++    return weight, weight_q, weight_sf
++
++
++def test_prepare_mxfp8_trtllm_weights_rejects_cpu_tensors() -> None:
++    weight = torch.empty((128, 256), dtype=torch.float8_e4m3fn)
++    weight_scale = torch.empty((128 * 8,), dtype=torch.uint8)
++
++    with pytest.raises(ValueError, match="must be CUDA tensors"):
++        prepare_mxfp8_trtllm_weights(weight, weight_scale)
++
++
++def test_prepare_mxfp8_trtllm_weights_pads_non_128_aligned_n(
++    blackwell_cuda: None,
++) -> None:
++    n, k = 160, 256
++    weight = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
++    weight_q, weight_sf = mxfp8_quantize(
++        weight,
++        sf_swizzle_layout=SfLayout.layout_linear,
++    )
++
++    b, b_sf = prepare_mxfp8_trtllm_weights(weight_q, weight_sf)
++
++    assert b.shape == (k, n)
++    assert b.stride() == (1, k)
++    assert b_sf.shape == (256 * (k // 32),)
++    a = torch.randn((3, k), device="cuda", dtype=torch.bfloat16)
++    actual = mm_mxfp8_dynamic_quant(a, b, b_sf)
++    assert _cosine_similarity(a @ weight.T, actual) > _MIN_COSINE_SIMILARITY
++
++
++def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
++    return torch.nn.functional.cosine_similarity(
++        a.float().flatten(),
++        b.float().flatten(),
++        dim=0,
++    ).item()
++
++
++def test_mm_mxfp8_dynamic_quant_rejects_non_bf16_activation(
++    blackwell_cuda: None,
++) -> None:
++    a = torch.empty((4, 4096), device="cuda", dtype=torch.float16)
++    _, b, b_sf = _prepare_trtllm_weight(2688, 4096)
++    with pytest.raises(ValueError, match="a must be a bfloat16 tensor"):
++        mm_mxfp8_dynamic_quant(a, b, b_sf)
++
++
++def test_mm_mxfp8_dynamic_quant_rejects_unsupported_backend(
++    blackwell_cuda: None,
++) -> None:
++    a = torch.empty((4, 4096), device="cuda", dtype=torch.bfloat16)
++    _, b, b_sf = _prepare_trtllm_weight(2688, 4096)
++    with pytest.raises(
++        BackendSupportedError,
++        match="does not support backend 'cutlass'",
++    ):
++        mm_mxfp8_dynamic_quant(a, b, b_sf, backend="cutlass")
++
++
++def test_mm_mxfp8_dynamic_quant_rejects_n_below_128(
++    blackwell_cuda: None,
++) -> None:
++    a = torch.empty((4, 256), device="cuda", dtype=torch.bfloat16)
++    b = torch.empty((256, 64), device="cuda", dtype=torch.float8_e4m3fn)
++    b_sf = torch.empty((0,), device="cuda", dtype=torch.uint8)
++
++    with pytest.raises(ValueError, match="N >= 128"):
++        mm_mxfp8_dynamic_quant(a, b, b_sf)
++
++
++def test_mm_mxfp8_dynamic_quant_rejects_unshufflable_n(
++    blackwell_cuda: None,
++) -> None:
++    a = torch.empty((4, 256), device="cuda", dtype=torch.bfloat16)
++    b = torch.empty((256, 129), device="cuda", dtype=torch.float8_e4m3fn)
++    b_sf = torch.empty((0,), device="cuda", dtype=torch.uint8)
++
++    with pytest.raises(ValueError, match="N divisible by 32"):
++        mm_mxfp8_dynamic_quant(a, b, b_sf)
++
++
++def test_mm_mxfp8_dynamic_quant_rejects_zero_k(blackwell_cuda: None) -> None:
++    a = torch.empty((4, 0), device="cuda", dtype=torch.bfloat16)
++    b = torch.empty((0, 128), device="cuda", dtype=torch.float8_e4m3fn)
++    b_sf = torch.empty((0,), device="cuda", dtype=torch.uint8)
++
++    with pytest.raises(ValueError, match="K must be positive"):
++        mm_mxfp8_dynamic_quant(a, b, b_sf)
++
++
++def test_mm_mxfp8_dynamic_quant_rejects_zero_m(blackwell_cuda: None) -> None:
++    a = torch.empty((0, 4096), device="cuda", dtype=torch.bfloat16)
++    _, b, b_sf = _prepare_trtllm_weight(2688, 4096)
++    with pytest.raises(ValueError, match="M must be positive"):
++        mm_mxfp8_dynamic_quant(a, b, b_sf)
++
++
++def test_mm_mxfp8_dynamic_quant_rejects_noncontiguous_activation(
++    blackwell_cuda: None,
++) -> None:
++    a = torch.empty((4096, 4), device="cuda", dtype=torch.bfloat16).T
++    _, b, b_sf = _prepare_trtllm_weight(2688, 4096)
++    with pytest.raises(ValueError, match="a must be contiguous"):
++        mm_mxfp8_dynamic_quant(a, b, b_sf)
++
++
++@pytest.mark.parametrize(
++    ("m", "auto_tuning"),
++    [(3, False), (3, True), (33, True)],
++)
++def test_mm_mxfp8_dynamic_quant_matches_bf16(
++    m: int,
++    auto_tuning: bool,
++    blackwell_cuda: None,
++) -> None:
++    torch.manual_seed(0)
++    a = torch.randn((m, 4096), device="cuda", dtype=torch.bfloat16)
++    weight, b, b_sf = _prepare_trtllm_weight(2688, 4096)
++    reference = a @ weight.T
++
++    with autotune(auto_tuning):
++        actual = mm_mxfp8_dynamic_quant(a, b, b_sf)
++
++    assert _cosine_similarity(reference, actual) > _MIN_COSINE_SIMILARITY
++
++
++class _RecordingTuner:
++    def __init__(self, selected_use_8x4: bool) -> None:
++        self.selected_use_8x4 = selected_use_8x4
++        self.extras: list[tuple[Any, ...]] = []
++        self.tactics: list[list[Any]] = []
++
++    def choose_one(
++        self,
++        custom_op: str,
++        runners: list[TunableRunner],
++        tuning_config: TuningConfig,
++        inputs: list[torch.Tensor],
++    ) -> tuple[TunableRunner, Any]:
++        profile = OptimizationProfile(
++            shapes=[
++                [StaticDim(dim) for dim in value.shape]
++                if isinstance(value, torch.Tensor)
++                else []
++                for value in inputs
++            ],
++            tensor_initializers=[None] * len(inputs),
++        )
++        self.extras = [runner.get_cache_key_extras(inputs) for runner in runners]
++        self.tactics = [runner.get_valid_tactics(inputs, profile) for runner in runners]
++        selected_tactic = next(
++            tactic for tactic in self.tactics[0] if tactic[0] == self.selected_use_8x4
++        )
++        return runners[0], selected_tactic
++
++
++@pytest.mark.parametrize(
++    "m, selected_use_8x4, selected_layout",
++    [
++        (4, True, SfLayout.layout_8x4),
++        (33, False, SfLayout.layout_128x4),
++    ],
++)
++def test_mm_mxfp8_dynamic_quant_offers_both_layouts(
++    m: int,
++    selected_use_8x4: bool,
++    selected_layout: SfLayout,
++    monkeypatch: pytest.MonkeyPatch,
++    blackwell_cuda: None,
++) -> None:
++    recorder = _RecordingTuner(selected_use_8x4)
++    monkeypatch.setattr(AutoTuner, "get", classmethod(lambda cls: recorder))
++
++    a = torch.randn((m, 4096), device="cuda", dtype=torch.bfloat16)
++    _, b, b_sf = _prepare_trtllm_weight(2688, 4096)
++    quantized_layouts: list[SfLayout] = []
++    real_quantize = gemm_base.mxfp8_quantize
++
++    def recording_quantize(
++        tensor: torch.Tensor,
++        **kwargs: Any,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        quantized_layouts.append(kwargs["sf_swizzle_layout"])
++        return real_quantize(tensor, **kwargs)
++
++    monkeypatch.setattr(gemm_base, "mxfp8_quantize", recording_quantize)
++
++    mm_mxfp8_dynamic_quant(a, b, b_sf)
++
++    assert recorder.extras == [(get_compute_capability(a.device),)]
++    assert len(recorder.tactics) == 1
++    assert {use_8x4 for use_8x4, _ in recorder.tactics[0]} == {True, False}
++    assert quantized_layouts == [selected_layout]
++
++
++def test_mm_mxfp8_dynamic_quant_cache_round_trip(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++    blackwell_cuda: None,
++) -> None:
++    cache_path = tmp_path / "dynamic_quant.json"
++    torch.manual_seed(0)
++    a = torch.randn((4, 4096), device="cuda", dtype=torch.bfloat16)
++    _, b, b_sf = _prepare_trtllm_weight(2688, 4096)
++
++    with autotune(True, cache=str(cache_path)):
++        tuned = mm_mxfp8_dynamic_quant(a, b, b_sf)
++
++    AutoTuner._instance = None
++    cache_hits: list[bool] = []
++    real_search_cache = AutoTuner.search_cache
++
++    def recording_search_cache(
++        self: AutoTuner,
++        custom_op: str,
++        runners: list[TunableRunner],
++        input_shapes: tuple[tuple[int, ...], ...],
++        tuning_config: TuningConfig,
++        inputs: list[torch.Tensor] | None = None,
++    ) -> tuple[bool, int, Any, OptimizationProfile | None]:
++        result = real_search_cache(
++            self,
++            custom_op,
++            runners,
++            input_shapes,
++            tuning_config,
++            inputs=inputs,
++        )
++        if custom_op == "mxfp8_dynamic_quant_gemm":
++            cache_hits.append(result[0])
++        return result
++
++    monkeypatch.setattr(AutoTuner, "search_cache", recording_search_cache)
++    with autotune(False, cache=str(cache_path)):
++        cached = mm_mxfp8_dynamic_quant(a, b, b_sf)
++
++    payload = json.loads(cache_path.read_text())
++    dynamic_keys = [key for key in payload if "mxfp8_dynamic_quant_gemm" in key]
++    parsed_keys = [ast.literal_eval(key) for key in dynamic_keys]
++    assert len(parsed_keys) == 4
++    assert {key[2][0][0] for key in parsed_keys} == {1, 2, 3, 4}
++    assert all(key[3] == (get_compute_capability(a.device),) for key in parsed_keys)
++    assert cache_hits == [True]
++    torch.testing.assert_close(cached, tuned, rtol=0, atol=0)
++
++
++def test_mm_mxfp8_dynamic_quant_uses_tensor_device_context(
++    blackwell_cuda: None,
++) -> None:
++    if torch.cuda.device_count() < 2:
++        pytest.skip("requires two CUDA devices")
++
++    original_device = torch.cuda.current_device()
++    target_device = torch.device("cuda:1" if original_device == 0 else "cuda:0")
++    a = torch.randn((3, 4096), device=target_device, dtype=torch.bfloat16)
++    _, b, b_sf = _prepare_trtllm_weight(2688, 4096, target_device)
++
++    actual = mm_mxfp8_dynamic_quant(a, b, b_sf)
++    torch.cuda.synchronize(target_device)
++
++    assert actual.device == target_device
++    assert torch.cuda.current_device() == original_device
++
++
++def test_mm_mxfp8_dynamic_quant_cuda_graph_replay(blackwell_cuda: None) -> None:
++    torch.manual_seed(0)
++    static_a = torch.randn((4, 4096), device="cuda", dtype=torch.bfloat16)
++    _, b, b_sf = _prepare_trtllm_weight(2688, 4096)
++    static_out = torch.empty((4, 2688), device="cuda", dtype=torch.bfloat16)
++
++    with autotune(True):
++        mm_mxfp8_dynamic_quant(static_a, b, b_sf, out=static_out)
++    torch.cuda.synchronize()
++
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        graph_out = mm_mxfp8_dynamic_quant(static_a, b, b_sf, out=static_out)
++
++    for seed in (1, 2):
++        torch.manual_seed(seed)
++        next_a = torch.randn_like(static_a)
++        static_a.copy_(next_a)
++        graph.replay()
++        replayed = graph_out.clone()
++        eager = mm_mxfp8_dynamic_quant(next_a, b, b_sf)
++        assert _cosine_similarity(replayed, eager) > _MIN_COSINE_SIMILARITY
+diff --git a/tests/trace/example.py b/tests/trace/example.py
+index 6820994fa5b..cc10763a1df 100644
+--- a/tests/trace/example.py
++++ b/tests/trace/example.py
+@@ -30,6 +30,7 @@
+ gemm_fp4_N2048_K7168_block_size16.json
+ gemm_fp8_N1536_K7168.json
+ gemm_fp8_nt_groupwise_n1536_k7168.json
++gemm_mxfp8_dynamic_quant_N160_K256.json
+ gemm_mxfp8_N4096_K4096.json
+ gemm_nvfp4_svdquant_N3072_K_packed1536_rank32.json
+ gemma_fused_add_rmsnorm_h4608.json
+@@ -444,6 +445,22 @@
+ except Exception:
+     pass  # Requires Blackwell (SM100+)
+ 
++# ── Dynamic-quant MXFP8 GEMM (Blackwell: BF16 M×256 @ MXFP8 160×256) ─────────
++major, minor = torch.cuda.get_device_capability(torch.device(device))
++if flashinfer.mm_mxfp8_dynamic_quant.is_backend_supported("trtllm", major * 10 + minor):
++    M, K, N = 3, 256, 160
++    a_bf16 = torch.zeros(M, K, dtype=torch.bfloat16, device=device)
++    weight_bf16 = torch.zeros(N, K, dtype=torch.bfloat16, device=device)
++    weight_mxfp8, weight_scale = flashinfer.mxfp8_quantize(
++        weight_bf16,
++        sf_swizzle_layout=flashinfer.SfLayout.layout_linear,
++    )
++    weight_prepared, scale_prepared = flashinfer.prepare_mxfp8_trtllm_weights(
++        weight_mxfp8,
++        weight_scale,
++    )
++    flashinfer.mm_mxfp8_dynamic_quant(a_bf16, weight_prepared, scale_prepared)
++
+ # ── BMM mxfp8 (Blackwell SM100+: 2×128×128, block=32) ────────────────────────
+ try:
+     batch_size, M, K, N = 2, 128, 128, 128
+diff --git a/tests/trace/fi_trace_out/gemm_mxfp8_dynamic_quant_N160_K256.json b/tests/trace/fi_trace_out/gemm_mxfp8_dynamic_quant_N160_K256.json
+new file mode 100644
+index 00000000000..1a934ae8de7
+--- /dev/null
++++ b/tests/trace/fi_trace_out/gemm_mxfp8_dynamic_quant_N160_K256.json
+@@ -0,0 +1,66 @@
++{
++  "name": "gemm_mxfp8_dynamic_quant_N160_K256",
++  "description": "BF16 activation quantization followed by MXFP8 GEMM with TRT-LLM-shuffled weights.",
++  "op_type": "gemm_mxfp8_dynamic_quant",
++  "tags": [
++    "fi_api:flashinfer.gemm.gemm_base.mm_mxfp8_dynamic_quant",
++    "status:verified",
++    "quantization:mxfp8",
++    "dynamic_quantization"
++  ],
++  "axes": {
++    "M": {
++      "type": "var"
++    },
++    "N": {
++      "type": "const",
++      "value": 160
++    },
++    "K": {
++      "type": "const",
++      "value": 256
++    },
++    "B_scale_size": {
++      "type": "const",
++      "value": 2048,
++      "description": "Padded 128x4 weight-scale buffer length."
++    }
++  },
++  "inputs": {
++    "A": {
++      "shape": [
++        "M",
++        "K"
++      ],
++      "dtype": "bfloat16",
++      "description": "BF16 activation."
++    },
++    "B": {
++      "shape": [
++        "K",
++        "N"
++      ],
++      "dtype": "float8_e4m3fn",
++      "description": "TRT-LLM row-shuffled MXFP8 weight, column-major."
++    },
++    "b_descale": {
++      "shape": [
++        "B_scale_size"
++      ],
++      "dtype": "uint8",
++      "description": "TRT-LLM row-shuffled 128x4 E8M0 weight scales."
++    }
++  },
++  "outputs": {
++    "C": {
++      "shape": [
++        "M",
++        "N"
++      ],
++      "dtype": "bfloat16"
++    }
++  },
++  "reference": "from __future__ import annotations\nimport math\nimport torch\nimport torch.nn.functional as F\n\n# ----- reference dependencies -----\ndef _e8m0_to_float(sf: torch.Tensor) -> torch.Tensor:\n    \"\"\"Decode uint8 E8M0 scale bytes to float32 (value = 2**(byte - 127)).\"\"\"\n    return torch.pow(2.0, sf.to(torch.float32) - 127.0)\n\ndef _unswizzle_batched_sf_128x4(\n    sf: torch.Tensor, batch: int, rows: int, cols: int\n) -> torch.Tensor:\n    \"\"\"Recover batched linear scale grids from concatenated 128x4 buffers.\"\"\"\n    padded_rows = (rows + 127) // 128 * 128\n    padded_cols = (cols + 3) // 4 * 4\n    v = sf.reshape(\n        batch,\n        padded_rows // 128,\n        padded_cols // 4,\n        32,\n        4,\n        4,\n    )\n    return v.permute(0, 1, 4, 3, 2, 5).reshape(batch, padded_rows, padded_cols)[\n        :, :rows, :cols\n    ]\n\ndef _unswizzle_sf_128x4(sf: torch.Tensor, rows: int, cols: int) -> torch.Tensor:\n    \"\"\"Recover the linear [rows, cols] grid from a 1D 128x4-swizzled buffer.\"\"\"\n    return _unswizzle_batched_sf_128x4(sf, 1, rows, cols)[0]\n\ndef _unshuffle_trtllm_mxfp8_rows(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Undo TRT-LLM's 32-row ``shuffleMatrixA`` permutation.\"\"\"\n    rows = x.shape[0]\n    row_map = torch.tensor(\n        [\n            0,\n            8,\n            16,\n            24,\n            1,\n            9,\n            17,\n            25,\n            2,\n            10,\n            18,\n            26,\n            3,\n            11,\n            19,\n            27,\n            4,\n            12,\n            20,\n            28,\n            5,\n            13,\n            21,\n            29,\n            6,\n            14,\n            22,\n            30,\n            7,\n            15,\n            23,\n            31,\n        ],\n        dtype=torch.long,\n        device=x.device,\n    )\n    old_rows = torch.arange(rows, dtype=torch.long, device=x.device)\n    new_rows = (old_rows // 32) * 32 + row_map[old_rows % 32]\n    row_indices = torch.empty_like(old_rows)\n    row_indices[new_rows] = old_rows\n    unshuffled = torch.empty_like(x)\n    unshuffled[row_indices] = x\n    return unshuffled\n\n# ----- reference -----\ndef _mm_mxfp8_dynamic_quant_reference(A, B, b_descale):\n    \"\"\"Reference BF16 activation times a TRT-LLM-shuffled MXFP8 weight.\"\"\"\n    _, K = A.shape\n    N = B.shape[1]\n    block_size = 32\n    weight = _unshuffle_trtllm_mxfp8_rows(B.T)\n    weight_scale = _e8m0_to_float(\n        _unshuffle_trtllm_mxfp8_rows(_unswizzle_sf_128x4(b_descale, N, K // block_size))\n    )\n    weight = weight.to(torch.float32) * weight_scale.repeat_interleave(\n        block_size, dim=1\n    )\n    return torch.matmul(A.to(torch.float32), weight.T).to(torch.bfloat16)\n",
++  "check": "def _mxfp8_gemm_check(\n    reference_outputs,\n    actual_outputs,\n    *,\n    rtol=None,\n    atol=None,\n    max_mismatch_pct=100.0,\n    min_cos_sim=0.98,\n):\n    from flashinfer.trace import default_check\n\n    # Matches tests/gemm/test_mm_mxfp8.py (swizzled scales, quantization-limited accuracy).\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n",
++  "init": "from __future__ import annotations\nimport math\nimport torch\n\n# ----- shared init helpers -----\n# Copyright (c) 2025 by FlashInfer team.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#   http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Shared helpers used by ``TraceTemplate.init`` functions.\n\nThis module contains the small set of input-construction patterns that\nrecur across many templates (paged-KV cache index arrays, ragged indptr,\nRoPE pos_ids and cos/sin caches, sampling probs). Each helper is short and\ndocumented; init functions in ``templates/<category>.py`` call into here so\nthe per-template init bodies stay focused on shape/dtype, not boilerplate.\n\nThe full source of this module is **inlined into every dumped JSON's\n``\"init\"`` field** by ``flashinfer/trace/template.py:_render_init_source``,\nso downstream consumers don't need flashinfer installed to re-run the init\nsnippets.\n\"\"\"\n\n\nfrom typing import Optional, Tuple\n\nimport torch\n\n\ndef make_paged_kv_indices(\n    batch_size: int,\n    num_pages_per_seq: int,\n    page_size: int,\n    *,\n    device: str = \"cuda\",\n) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:\n    \"\"\"Return ``(kv_indptr, kv_indices, kv_last_page_len)`` for a uniform batch.\n\n    Every sequence is assigned exactly ``num_pages_per_seq`` pages, fully\n    populated (last-page length == page_size).\n\n    Invariants\n    ----------\n    - ``kv_indptr.shape == (batch_size + 1,)``, dtype int32, monotonic, [0]=0.\n    - ``kv_indices == arange(0, batch_size * num_pages_per_seq)``, int32.\n    - ``kv_last_page_len == full(batch_size, page_size)``, int32.\n    \"\"\"\n    total_pages = batch_size * num_pages_per_seq\n    kv_indptr = (\n        torch.arange(batch_size + 1, dtype=torch.int32, device=device)\n        * num_pages_per_seq\n    )\n    kv_indices = torch.arange(total_pages, dtype=torch.int32, device=device)\n    kv_last_page_len = torch.full(\n        (batch_size,), page_size, dtype=torch.int32, device=device\n    )\n    return kv_indptr, kv_indices, kv_last_page_len\n\n\ndef make_ragged_indptr(\n    seg_lens,\n    *,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.int32,\n) -> torch.Tensor:\n    \"\"\"Return cumulative-sum ``indptr`` of length ``len(seg_lens)+1``.\n\n    ``seg_lens`` may be a list / tuple / 1-D tensor of segment lengths.\n    \"\"\"\n    if isinstance(seg_lens, torch.Tensor):\n        lens = seg_lens.to(device=device, dtype=dtype)\n    else:\n        lens = torch.tensor(list(seg_lens), dtype=dtype, device=device)\n    indptr = torch.zeros(lens.numel() + 1, dtype=dtype, device=device)\n    indptr[1:] = torch.cumsum(lens, dim=0).to(dtype)\n    return indptr\n\n\ndef make_uniform_qo_indptr(\n    batch_size: int,\n    qo_len: int,\n    *,\n    device: str = \"cuda\",\n) -> torch.Tensor:\n    \"\"\"Return ``[0, qo_len, 2*qo_len, ..., batch_size*qo_len]`` int32.\"\"\"\n    return torch.arange(batch_size + 1, dtype=torch.int32, device=device) * qo_len\n\n\ndef make_pos_ids(\n    nnz: int,\n    max_seq_len: Optional[int] = None,\n    *,\n    device: str = \"cuda\",\n) -> torch.Tensor:\n    \"\"\"Return ``[0, 1, ..., nnz-1] (% max_seq_len)`` as int32 on ``device``.\n\n    If ``max_seq_len`` is None, no wrapping is applied.\n    \"\"\"\n    pos = torch.arange(nnz, dtype=torch.int32, device=device)\n    if max_seq_len is not None:\n        pos = pos % max_seq_len\n    return pos\n\n\ndef make_rope_cos_sin_cache(\n    max_seq_len: int,\n    rope_dim: int,\n    *,\n    base: float = 1e4,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.float32,\n) -> torch.Tensor:\n    \"\"\"Return concatenated ``[cos | sin]`` cache of shape ``[max_seq_len, rope_dim]``.\"\"\"\n    t = torch.arange(max_seq_len, dtype=torch.float32, device=device)\n    inv = 1.0 / (\n        base\n        ** (torch.arange(0, rope_dim, 2, dtype=torch.float32, device=device) / rope_dim)\n    )\n    freqs = t.unsqueeze(-1) * inv.unsqueeze(0)\n    cache = torch.cat([torch.cos(freqs), torch.sin(freqs)], dim=-1)\n    return cache.to(dtype)\n\n\ndef make_probs(\n    batch_size: int,\n    vocab_size: int,\n    *,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.float32,\n) -> torch.Tensor:\n    \"\"\"Return a ``[batch_size, vocab_size]`` probability distribution.\n\n    Uses ``softmax(randn(...))`` so each row sums to 1.0. This mirrors the\n    pattern used throughout ``tests/utils/test_sampling.py``.\n    \"\"\"\n    return torch.softmax(\n        torch.randn(batch_size, vocab_size, dtype=torch.float32, device=device),\n        dim=-1,\n    ).to(dtype)\n\n\ndef make_logits(\n    batch_size: int,\n    vocab_size: int,\n    *,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.float32,\n) -> torch.Tensor:\n    \"\"\"Return ``randn(batch_size, vocab_size)`` logits.\"\"\"\n    return torch.randn(batch_size, vocab_size, dtype=dtype, device=device)\n\n\ndef fp8_safe_randn(\n    *shape: int,\n    scale: float = 0.1,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.bfloat16,\n) -> torch.Tensor:\n    \"\"\"``randn(*shape) * scale`` \u2014 keeps values in the FP8/FP4 representable range.\n\n    Tests for fp8/fp4 paths typically multiply ``randn`` by 0.1 to avoid\n    saturation when quantizing. Use this helper to mirror that convention.\n    \"\"\"\n    return (torch.randn(*shape, dtype=dtype, device=device) * scale).to(dtype)\n\n\ndef per_tensor_fp8_quantize(\n    x: torch.Tensor,\n    *,\n    fp8_dtype: torch.dtype = torch.float8_e4m3fn,\n) -> Tuple[torch.Tensor, torch.Tensor]:\n    \"\"\"Per-tensor FP8 quantization, mirroring ``tests/utils_fp8.py:to_float8``.\n\n    Returns ``(x_fp8, inv_scale)`` where ``inv_scale`` is the dequant\n    multiplier (``float \u2248 fp8 * inv_scale``).\n    \"\"\"\n    finfo = torch.finfo(fp8_dtype)\n    amax = x.abs().amax().clamp(min=1e-12)\n    scale = finfo.max / amax\n    x_q = (x.float() * scale).clamp(min=finfo.min, max=finfo.max).to(fp8_dtype)\n    return x_q, scale.float().reciprocal()\n\n\ndef fp8_block_quant_1d(\n    x_bf16: torch.Tensor,\n    block: int = 128,\n) -> Tuple[torch.Tensor, torch.Tensor]:\n    \"\"\"Quantize ``[T, H]`` activations into FP8 with per-``(token, block)``\n    column-block scales. Returns ``(x_fp8, scales)`` where\n    ``scales`` has shape ``[T, H // block]``.\n\n    Mirrors ``_fp8_block_quant_1d`` in\n    ``tests/moe/test_dpsk_fused_moe_fp8.py``.\n    \"\"\"\n    assert x_bf16.dim() == 2\n    T, H = x_bf16.shape\n    assert H % block == 0\n    nb = H // block\n    finfo = torch.finfo(torch.float8_e4m3fn)\n    max_fp8 = finfo.max\n    x_f32 = x_bf16.to(torch.float32)\n    x_fp8 = torch.empty((T, H), dtype=torch.float8_e4m3fn, device=x_bf16.device)\n    scales = torch.empty((T, nb), dtype=torch.float32, device=x_bf16.device)\n    for j in range(nb):\n        sl = slice(j * block, (j + 1) * block)\n        blk = x_f32[:, sl]\n        amax = torch.amax(torch.abs(blk), dim=1)\n        s = torch.where(amax > 0, amax / max_fp8, torch.ones_like(amax))\n        x_fp8[:, sl] = (blk / s.unsqueeze(1)).to(torch.float8_e4m3fn)\n        scales[:, j] = s\n    return x_fp8, scales\n\n\ndef fp8_block_quant_2d(\n    w_bf16: torch.Tensor,\n    block: int = 128,\n) -> Tuple[torch.Tensor, torch.Tensor]:\n    \"\"\"Quantize weights ``[..., R, C]`` with 2-D ``block \u00d7 block`` scales.\n\n    Returns ``(w_fp8, scales)`` where ``scales`` has shape\n    ``[..., R // block, C // block]``. Mirrors ``_fp8_block_quant_2d`` in\n    ``tests/moe/test_dpsk_fused_moe_fp8.py``.\n    \"\"\"\n    assert w_bf16.dim() >= 2\n    *prefix, R, C = w_bf16.shape\n    assert R % block == 0 and C % block == 0\n    nb_r, nb_c = R // block, C // block\n    finfo = torch.finfo(torch.float8_e4m3fn)\n    max_fp8 = finfo.max\n    w_f32 = w_bf16.to(torch.float32).contiguous()\n    prefix_ndim = len(prefix)\n    reshaped = w_f32.reshape(*prefix, nb_r, block, nb_c, block)\n    permute_dims = tuple(range(prefix_ndim)) + (\n        prefix_ndim,\n        prefix_ndim + 2,\n        prefix_ndim + 1,\n        prefix_ndim + 3,\n    )\n    blocks = reshaped.permute(permute_dims).contiguous()\n    amax = torch.amax(torch.abs(blocks), dim=(-1, -2))\n    scales = torch.where(\n        amax > 0, amax / max_fp8, torch.ones_like(amax, dtype=torch.float32)\n    )\n    q_blocks = (blocks / scales.unsqueeze(-1).unsqueeze(-1)).to(torch.float8_e4m3fn)\n    inv_permute = [0] * (prefix_ndim + 4)\n    for i, p in enumerate(permute_dims):\n        inv_permute[p] = i\n    w_fp8 = q_blocks.permute(*inv_permute).reshape(*prefix, R, C).contiguous()\n    return w_fp8, scales\n\n\n__all__ = [\n    \"make_paged_kv_indices\",\n    \"make_ragged_indptr\",\n    \"make_uniform_qo_indptr\",\n    \"make_pos_ids\",\n    \"make_rope_cos_sin_cache\",\n    \"make_probs\",\n    \"make_logits\",\n    \"fp8_safe_randn\",\n    \"per_tensor_fp8_quantize\",\n    \"fp8_block_quant_1d\",\n    \"fp8_block_quant_2d\",\n]\n\n# ----- init -----\ndef _mm_mxfp8_dynamic_quant_init(\n    *,\n    M: int,\n    N: int = 4096,\n    K: int = 4096,\n    device: str = \"cuda\",\n    seed: int = 0,\n):\n    \"\"\"Build BF16 activations and TRT-LLM-shuffled MXFP8 weights.\"\"\"\n    from flashinfer import (  # noqa: PLC0415\n        SfLayout,\n        mxfp8_quantize,\n        prepare_mxfp8_trtllm_weights,\n    )\n\n    torch.manual_seed(seed)\n    a = torch.randn(M, K, dtype=torch.bfloat16, device=device)\n    weight = torch.randn(N, K, dtype=torch.bfloat16, device=device)\n    weight_q, weight_scale = mxfp8_quantize(\n        weight,\n        sf_swizzle_layout=SfLayout.layout_linear,\n    )\n    b, b_descale = prepare_mxfp8_trtllm_weights(weight_q, weight_scale)\n    return {\"a\": a, \"b\": b, \"b_descale\": b_descale}\n"
++}
+diff --git a/tests/trace/test_fi_trace.py b/tests/trace/test_fi_trace.py
+index 02306fdd12b..6b056c50f8e 100644
+--- a/tests/trace/test_fi_trace.py
++++ b/tests/trace/test_fi_trace.py
+@@ -27,7 +27,11 @@
+ import torch
+ 
+ from flashinfer.fi_trace import fi_trace
+-from flashinfer.trace.templates.gemm import bmm_mxfp8_trace, mm_mxfp8_trace
++from flashinfer.trace.templates.gemm import (
++    bmm_mxfp8_trace,
++    mm_mxfp8_dynamic_quant_trace,
++    mm_mxfp8_trace,
++)
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -611,6 +615,25 @@ def test_mxfp8_trace_references_are_self_contained():
+     ).shape == (batch_size, m, n)
+ 
+ 
++def test_mxfp8_dynamic_quant_trace_handles_padded_weight_scales():
++    m, n, k = 3, 160, 256
++    a = torch.zeros((m, k), dtype=torch.bfloat16)
++    weight = torch.zeros((n, k), dtype=torch.float8_e4m3fn)
++    b_descale = torch.full((_mxfp8_scale_buffer_size(n, k),), 127, dtype=torch.uint8)
++    defn = mm_mxfp8_dynamic_quant_trace.build_fi_trace_fn(
++        "flashinfer.gemm.mm_mxfp8_dynamic_quant"
++    )(a=a, b=weight.T, b_descale=b_descale)
++
++    _check_defn(defn, "gemm_mxfp8_dynamic_quant", "mm_mxfp8_dynamic_quant")
++    namespace: dict[str, object] = {}
++    exec(defn["reference"], namespace)
++    reference = cast(
++        Callable[..., torch.Tensor],
++        namespace["_mm_mxfp8_dynamic_quant_reference"],
++    )
++    assert reference(a, weight.T, b_descale).shape == (m, n)
++
++
+ def test_bmm_mxfp8_trace_init_quantizes_each_batch(
+     monkeypatch: pytest.MonkeyPatch,
+ ):

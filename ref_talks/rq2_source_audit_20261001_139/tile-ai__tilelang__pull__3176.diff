@@ -1,0 +1,3615 @@
+diff --git a/.agents/skills/tilelang-layout/SKILL.md b/.agents/skills/tilelang-layout/SKILL.md
+index 07397ca715..3de8df6532 100644
+--- a/.agents/skills/tilelang-layout/SKILL.md
++++ b/.agents/skills/tilelang-layout/SKILL.md
+@@ -97,6 +97,16 @@ annotation contract.
+ 
+ "Cheapest" is a pluggable policy (`layout_cost_model.{h,cc}`):
+ 
++- The default `register-count` policy automatically uses reduction-aware scoring
++  for CUDA reducers:
++  search native, intermediate, and scalar vector widths, then prefer measurable
++  attempts before comparing the sum of spill, execution, and normalized register
++  costs. Execution covers global accesses and reducer work, including collective
++  shared communication, but not ordinary shared accesses or bank conflicts.
++  Physical reducer planning is
++  shared with materialization. Non-reducer components, non-CUDA targets, and
++  unknown serial trip counts fall back to register-count. No new pass-config
++  value is needed.
+ - `tl.layout_cost_model="io-aware"` (opt-in): every
+   fragment<->global copy and global-touching parallel loop is charged
+   `max(bandwidth bytes, issue bytes)` under the attempt's layouts, scored
+@@ -105,8 +115,8 @@ annotation contract.
+   segments counted at warp/step granularity). Registers are the tiebreak.
+   Statements outside the model are charged a conservative worst case — an
+   attempt must never profit from opacity.
+-- `tl.layout_cost_model="register-count"` (default): register-slots-only
+-  ordering.
++- Explicitly naming `tl.layout_cost_model="register-count"` uses the same
++  default strategy; it does not disable reduction awareness.
+ - The scoring formulas are guarded by the Python parity check
+   `maint/layout_inference/run.py --cute` (symbolic scorer vs an
+   independent NumPy enumeration oracle); keep `cute_model.py` in lockstep
+diff --git a/maint/layout_inference/README.md b/maint/layout_inference/README.md
+index c25ad58a64..d39525e0c7 100644
+--- a/maint/layout_inference/README.md
++++ b/maint/layout_inference/README.md
+@@ -1,10 +1,12 @@
+ # Layout inference verification harness
+ 
+ Constructed IR cases with reviewed expected layouts, for validating the
+-free-mode layout search — in particular the selection policy behind
+-`tl.layout_cost_model` ("register-count" = the default ordering,
+-"io-aware" = the opt-in global-memory model in
+-`src/transform/layout_inference/layout_cost_model.cc`).
++free-mode layout search in
++`src/transform/layout_inference/layout_cost_model.cc`. The harness compares
++the existing default `register-count` policy (automatically reduction-aware
++for CUDA reducers) with the experimental `io-aware` policy. The
++`register-count` snapshots exercise the unconfigured default path; there is
++no additional policy or pass-config switch for reduction awareness.
+ 
+ Why this exists:
+ 
+@@ -12,18 +14,31 @@ Why this exists:
+   the model (or a future fast-path/slow-path split inside it) can silently
+   flip the winner. Golden layouts pin the current answers so a flip shows
+   up as a reviewable diff, not a runtime perf mystery.
+-- Cases where the two policies **disagree** are the calibration corpus:
++- Cases where the policies **disagree** are the calibration corpus:
+   each disagreement is a concrete claim ("the io-aware pick is faster on
+   hardware") that can be benchmarked.
+ 
+ ## Usage
+ 
+-The default `register-count` model also tries one scalar plan at each
+-unannotated reducer-update root. Both native and scalar plans use the unchanged
+-spill/register-slot score; native plans win same-root ties. This can remove
+-replicated column accumulators without forcing scalar layouts for full
+-reductions. Explicit widths and layouts remain authoritative. The opt-in
+-`io-aware` model retains its existing candidate search and scoring.
++The default automatically tries native, intermediate, and scalar widths at
++unannotated CUDA reducer-update roots. It scores the actual materialization
++plan, including narrow-to-wide fallback, batched collectives, local arithmetic,
++and collective shared-memory issues. Measurable attempts take precedence over
++unknown ones, then spill bytes, execution cost, and normalized register cost are
++added rather than ranked lexicographically. Execution cost includes ordinary
++global accesses and reducer work, but not ordinary shared accesses or bank
++conflicts. Non-reducer components,
++unsupported targets, and unknown serial trip counts retain register-count scoring.
++The `reduction_aware` cases include a column reduction whose intermediate
++width avoids communication without giving up two-element memory accesses.
++The warp-collective case also guards communication-aware scoring when warp
++shuffles and block barriers have the same register footprint.
++The `reduction_aware_shared` case preserves native FP32 staging when reducer
++costs tie, without ranking ordinary shared-copy vectorization.
++
++The existing `io-aware` policy retains its candidate search and scoring.
++Native plans win same-root ties, and equal-cost roots retain program order.
++Explicit widths and layouts remain authoritative for every policy.
+ 
+ ```bash
+ python run.py                # verify all cases against expected/
+@@ -66,7 +81,8 @@ io-aware scorer on the in-tree CuTe layout algebra
+   exactly. `CUTE_STATEMENTS` in a case supplies real enclosing-buffer
+   shapes where they differ from the fragment shape (offset_region_copy).
+ 
+-Current status: 112/112 statements match with a 100% conversion hit rate.
++The driver reports the parity count and conversion hit rate for the current
++case set.
+ The production scorer in `layout_cost_model.cc` uses this formulation; its
+ mode arithmetic was additionally audited once, in-tree, against a full
+ exact-enumeration oracle across the layout-relevant test corpus (~264
+@@ -119,3 +135,4 @@ nest's `parallel_loop_layout` annotation (see `common.py`).
+ | `offset_region_copy` | Multi-block tiled copies whose region mins carry block indices (the model's "foreign vars"): offset regions must rank exactly like zero-offset ones. |
+ | `shared_staging` | global→shared→fragment→global chain: the shared-side copy is outside the io model, so the fragment is decided by the copy-out alone; goldens would surface any change to that boundary. |
+ | `reducer_scalar_candidates` | Register-count can choose scalar column ownership while preserving native packed layouts for a full reduction; io-aware keeps its existing search. |
++| `reduction_aware_shared` | FP32/int8 staging where equal reducer costs preserve the native layout without scoring ordinary shared accesses. |
+diff --git a/maint/layout_inference/bench_reduction_aware.py b/maint/layout_inference/bench_reduction_aware.py
+new file mode 100644
+index 0000000000..06f672aec9
+--- /dev/null
++++ b/maint/layout_inference/bench_reduction_aware.py
+@@ -0,0 +1,171 @@
++"""SM90 reproducer: equal register scores, different reduction communication.
++
++Each CTA reuses an 8x128 value tile for several weighted sums. Native width 4
++and scalar width 1 both cost 18 fragment slots. The old two-attempt policy keeps
++the native candidate on this tie; the reduction-aware policy avoids its
++cross-warp finalizations. Pinning width 4 reproduces that old winner without
++changing the compiler or adding a pass configuration.
++"""
++
++import argparse
++from functools import partial
++import hashlib
++import json
++import math
++from pathlib import Path
++import random
++import statistics
++
++import torch
++
++import tilelang as tl
++import tilelang.language as T
++from tilelang import tvm
++from tilelang.profiler.bench import do_bench
++
++
++def make_weighted_pooling(groups=256, queries=32, width=None):
++    rows, columns = 8, 128
++    width = None if width is None else T.int32(width)
++
++    @T.prim_func
++    def main(
++        inputs: T.Tensor((groups, rows, columns), "float32"),
++        weights: T.Tensor((groups, queries, rows), "float32"),
++        output: T.Tensor((groups, queries, columns), "float32"),
++    ):
++        with T.Kernel(groups, threads=128) as group:
++            values = T.alloc_fragment((rows, columns), "float32")
++            row_weights = T.alloc_fragment((rows,), "float32")
++            acc = T.alloc_reducer((columns,), "float32")
++            result = T.alloc_fragment((columns,), "float32")
++            T.copy(inputs[group, 0:rows, 0:columns], values)
++            for query in T.serial(queries):
++                T.copy(weights[group, query, 0:rows], row_weights)
++                T.reducer_init(acc)
++                for row, column in T.Parallel(rows, columns, coalesced_width=width):
++                    T.reducer_update(acc[column], values[row, column] * row_weights[row])
++                T.finalize_reducer(acc, result)
++                T.copy(result, output[group, query, 0:columns])
++
++    return main
++
++
++def inspect_plan(function, target):
++    with target, tl.transform.PassContext():
++        module = tvm.IRModule({"main": function})
++        module = tvm.tirx.transform.BindTarget(target)(module)
++        module = tl.transform.MaterializeKernelLaunch()(module)
++        module = tl.transform.LayoutInference()(module)
++    buffer_slots = {}
++
++    def collect(node):
++        if isinstance(node, tvm.tirx.SBlock):
++            for buffer, layout in node.annotations.get("layout_map", {}).items():
++                if isinstance(layout, tl.Fragment):
++                    buffer_slots[buffer.name] = math.prod(int(extent) for extent in layout.get_output_shape())
++
++    tvm.tirx.stmt_functor.post_order_visit(module["main"].body, collect)
++    costs = tvm.get_global_func("tl.analysis.ReducerCost")(module["main"])
++    cost = next(cost for buffer, cost in costs.items() if buffer.name == "acc")
++    assert cost["known"]
++    return {
++        "width": int(cost["vector_widths"][0]),
++        "register_slots": sum(buffer_slots.values()),
++        "buffer_slots": buffer_slots,
++        "local_issues": int(cost["local_issues"]),
++        "barriers": int(cost["barriers"]),
++        "shuffle_issues": int(cost["shuffle_issues"]),
++    }
++
++
++def benchmark(groups, queries, rounds, repeat, target):
++    kernels, plans, sources = {}, {}, {}
++    for name, width in (("native", 4), ("scalar", 1), ("auto", None)):
++        function = make_weighted_pooling(groups, queries, width)
++        plans[name] = inspect_plan(function, target)
++        kernels[name] = tl.compile(function, target=target)
++        sources[name] = kernels[name].get_kernel_source()
++    assert all(plan["register_slots"] == 18 for plan in plans.values())
++    assert plans["native"]["width"] == 4 and plans["native"]["barriers"] == 16 * queries
++    assert plans["auto"]["width"] == 1 and plans["auto"]["barriers"] == 0
++    assert sources["auto"] == sources["scalar"]
++
++    output = torch.empty((groups, queries, 128), device="cuda")
++    for integer_inputs in (True, False):
++        if integer_inputs:
++            inputs = torch.randint(-2, 3, (groups, 8, 128), device="cuda").float()
++            weights = torch.randint(-2, 3, (groups, queries, 8), device="cuda").float()
++        else:
++            inputs = torch.randn((groups, 8, 128), device="cuda")
++            weights = torch.randn((groups, queries, 8), device="cuda")
++        expected = (weights.unsqueeze(-1) * inputs.unsqueeze(1)).sum(dim=2)
++        tolerance = 0 if integer_inputs else 1e-5
++        for kernel in kernels.values():
++            kernel(inputs, weights, output)
++            torch.testing.assert_close(output, expected, atol=tolerance, rtol=tolerance)
++
++    samples = {"native": [], "auto": []}
++    for round_index in range(rounds):
++        order = list(samples)
++        random.Random(round_index).shuffle(order)
++        for name in order:
++            elapsed_ms = do_bench(
++                partial(kernels[name], inputs, weights, output),
++                backend="cudagraph",
++                return_mode="median",
++                _n_repeat=repeat,
++                _n_warmup=32,
++            )
++            samples[name].append(elapsed_ms * 1000)
++    latencies = {name: statistics.median(values) for name, values in samples.items()}
++    return {
++        "groups": groups,
++        "queries": queries,
++        "plans": plans,
++        "source_sha256": {name: hashlib.sha256(source.encode()).hexdigest() for name, source in sources.items()},
++        "latency_us": latencies,
++        "samples_us": samples,
++        "speedup": latencies["native"] / latencies["auto"],
++    }
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--groups", type=int, default=256)
++    parser.add_argument("--queries", type=int, nargs="+", default=[1, 32, 128])
++    parser.add_argument("--rounds", type=int, default=5)
++    parser.add_argument("--repeat", type=int, default=256)
++    parser.add_argument("--json", type=Path, dest="json_path")
++    args = parser.parse_args()
++    if min(args.groups, args.rounds, args.repeat, *args.queries) < 1:
++        parser.error("groups, queries, rounds, and repeat must be positive")
++    if torch.version.hip is not None or not torch.cuda.is_available():
++        parser.error("this benchmark requires a CUDA GPU")
++    if torch.cuda.get_device_capability() != (9, 0):
++        parser.error("this reproducer targets SM90 (H100/H200); its legacy native width is architecture-specific")
++    torch.set_num_threads(1)
++    torch.manual_seed(0)
++    tl.disable_cache()
++    target = tvm.target.Target({"kind": "cuda", "arch": "sm_90"})
++    print(f"GPU: {torch.cuda.get_device_name()}; warm-cache CUDA Graph, interleaved variants, {args.rounds} rounds", flush=True)
++    results = []
++    for queries in args.queries:
++        result = benchmark(args.groups, queries, args.rounds, args.repeat, target)
++        results.append(result)
++        native, automatic = result["latency_us"]["native"], result["latency_us"]["auto"]
++        print(f"queries={queries:3d}: old native={native:8.3f} us; new auto={automatic:8.3f} us; {result['speedup']:.2f}x", flush=True)
++    if args.json_path is not None:
++        report = {
++            "gpu": torch.cuda.get_device_name(),
++            "target": str(target),
++            "rounds": args.rounds,
++            "repeat": args.repeat,
++            "timing": "warm-cache CUDA Graph, interleaved variants",
++            "results": results,
++        }
++        args.json_path.write_text(json.dumps(report, indent=2) + "\n")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/maint/layout_inference/cases/reduction_aware.py b/maint/layout_inference/cases/reduction_aware.py
+new file mode 100644
+index 0000000000..f6410e3cf0
+--- /dev/null
++++ b/maint/layout_inference/cases/reduction_aware.py
+@@ -0,0 +1,72 @@
++"""Communication-aware column ownership and intermediate vector widths."""
++
++import tilelang.language as T
++
++
++def make_reducer(rows=8, columns=128, width=None, dtype="float32", op="sum", updates=1, repeats=1, batch=1, total=False, seed=None):
++    width = None if width is None else T.int32(width)
++    outputs = 1 if total else columns
++
++    @T.prim_func
++    def main(inputs: T.Tensor((rows, columns), dtype), output: T.Tensor((outputs,), dtype)):
++        with T.Kernel(1, threads=128):
++            shared = T.alloc_shared((rows, columns), dtype)
++            values = T.alloc_fragment((rows, columns), dtype)
++            acc = T.alloc_reducer((outputs,), dtype, op=op)
++            result = T.alloc_fragment((outputs,), dtype)
++            T.copy(inputs, shared)
++            T.copy(shared, values)
++            T.reducer_init(acc, init=seed)
++            for _repeat in T.serial(repeats):
++                for row, column in T.Parallel(rows, columns, coalesced_width=width):
++                    T.reducer_update(acc[0 if total else column], values[row, column])
++                if updates > 1:
++                    for row, column in T.Parallel(rows, columns, coalesced_width=width):
++                        T.reducer_update(acc[0 if total else column], values[row, column])
++            T.finalize_reducer(acc, result, batch=batch)
++            T.copy(result, output)
++
++    return main
++
++
++def make_communication_reducer(within_warp=True):
++    @T.prim_func
++    def main(inputs: T.Tensor((8, 128), "float32"), output: T.Tensor((128,), "float32")):
++        with T.Kernel(1, threads=128):
++            values = T.alloc_fragment((8, 128), "float32")
++            acc = T.alloc_reducer((128,), "float32")
++            result = T.alloc_fragment((128,), "float32")
++            T.annotate_layout(
++                {
++                    values: T.Fragment(
++                        (8, 128),
++                        forward_thread_fn=lambda row, column: (column // 4 * 4 + row % 4) if within_warp else (row % 4 * 32 + column // 4),
++                        forward_index_fn=lambda row, column: row // 4 * 4 + column % 4,
++                    )
++                }
++            )
++            T.copy(inputs, values)
++            T.reducer_init(acc)
++            for row, column in T.Parallel(8, 128):
++                T.reducer_update(acc[column], values[row, column])
++            T.finalize_reducer(acc, result)
++            T.copy(result, output)
++
++    return main
++
++
++VARIANTS = {
++    "columns": lambda: make_reducer(),
++    "intermediate": lambda: make_reducer(rows=4, columns=256),
++    "full": lambda: make_reducer(rows=4, columns=256, total=True),
++    "warp_collective": make_communication_reducer,
++}
++
++
++def check(variant, model, result):
++    if variant == "full":
++        assert result["buffers"]["acc"]["replicate"] == 128
++    elif variant == "warp_collective":
++        assert result["buffers"]["acc"]["replicate"] == 4
++    elif model == "register-count":
++        assert result["buffers"]["acc"]["replicate"] == 1
+diff --git a/maint/layout_inference/cases/reduction_aware_shared.py b/maint/layout_inference/cases/reduction_aware_shared.py
+new file mode 100644
+index 0000000000..ec7a2282cd
+--- /dev/null
++++ b/maint/layout_inference/cases/reduction_aware_shared.py
+@@ -0,0 +1,55 @@
++"""Native FP32 staging is retained when reducer costs tie."""
++
++import tilelang.language as T
++
++
++def make_reducer(streams=8, width=None, swizzle=False):
++    elements, threads = 2048, 128
++
++    @T.prim_func
++    def main(
++        inputs: T.Tensor((elements,), "float32"),
++        masks: T.Tensor((streams, elements), "int8"),
++        output: T.Tensor((1,), "float32"),
++    ):
++        with T.Kernel(1, threads=threads):
++            shared = T.alloc_shared((elements,), "float32")
++            mask_shared = T.alloc_shared((streams, elements), "int8")
++            values = T.alloc_fragment((elements,), "float32")
++            weights = T.alloc_fragment((streams, elements), "int32")
++            acc = T.alloc_reducer((1,), "float32")
++            result = T.alloc_fragment((1,), "float32")
++            if width is not None:
++                T.annotate_layout(
++                    {
++                        values: T.Fragment(
++                            (elements,),
++                            forward_thread_fn=lambda element: element // width % threads,
++                            forward_index_fn=lambda element: element // (threads * width) * width + element % width,
++                        )
++                    }
++                )
++            if swizzle:
++                T.annotate_layout({shared: T.Layout((elements,), lambda element: element ^ 16)})
++            T.copy(inputs, shared, disable_tma=True)
++            T.copy(masks, mask_shared, disable_tma=True)
++            T.copy(shared, values)
++            T.copy(mask_shared, weights)
++            T.reducer_init(acc)
++            for element in T.Parallel(elements):
++                for stream in T.serial(streams):
++                    T.reducer_update(acc[0], values[element] * T.cast(weights[stream, element], "float32"))
++            T.finalize_reducer(acc, result)
++            T.copy(result, output)
++
++    return main
++
++
++VARIANTS = {"mixed_dtype": make_reducer}
++
++
++def check(variant, model, result):
++    values = result["buffers"]["values"]
++    assert values["replicate"] == 1
++    if model == "register-count":
++        assert values["forward_thread"] == "_i % 512 // 4"
+diff --git a/maint/layout_inference/common.py b/maint/layout_inference/common.py
+index 343d52ae4b..e2fffa9b86 100644
+--- a/maint/layout_inference/common.py
++++ b/maint/layout_inference/common.py
+@@ -23,7 +23,7 @@
+ from tilelang.layout import Fragment
+ from tvm.tirx.stmt_functor import post_order_visit
+ 
+-# The two selection policies behind `tl.layout_cost_model`, by name.
++# The existing policies; register-count snapshots exercise the default path.
+ COST_MODELS = ("register-count", "io-aware")
+ 
+ 
+@@ -35,7 +35,8 @@ def _run_passes(prim_func, cost_model: str, target=None):
+     with tvm.target.Target(target):
+         mod = tvm.tirx.transform.BindTarget(target)(mod)
+         mod = tl.transform.MaterializeKernelLaunch()(mod)
+-        with tvm.transform.PassContext(config={"tl.layout_cost_model": cost_model}):
++        configs = {} if cost_model == "register-count" else {"tl.layout_cost_model": cost_model}
++        with tvm.transform.PassContext(config=configs):
+             mod = tl.transform.LayoutInference()(mod)
+     return mod["main"]
+ 
+diff --git a/maint/layout_inference/expected/reduction_aware.json b/maint/layout_inference/expected/reduction_aware.json
+new file mode 100644
+index 0000000000..1a4465b9d0
+--- /dev/null
++++ b/maint/layout_inference/expected/reduction_aware.json
+@@ -0,0 +1,658 @@
++{
++  "columns": {
++    "io-aware": {
++      "buffers": {
++        "acc": {
++          "forward_index": [
++            "_i % 4"
++          ],
++          "forward_thread": "_rep * 32 + _i // 4",
++          "input_shape": [
++            128
++          ],
++          "kind": "PartialFragment",
++          "output_shape": [
++            4
++          ],
++          "replicate": 4,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        },
++        "result": {
++          "forward_index": [
++            "_i % 4"
++          ],
++          "forward_thread": "_rep * 32 + _i // 4",
++          "input_shape": [
++            128
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            4
++          ],
++          "replicate": 4,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        },
++        "values": {
++          "forward_index": [
++            "_i // 4 * 4 + _j % 4"
++          ],
++          "forward_thread": "_i % 4 * 32 + _j // 4",
++          "input_shape": [
++            8,
++            128
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            8
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      },
++      "loops": {
++        "row,column[8x128]": {
++          "forward_index": [
++            "_i // 4 * 4 + _j % 4"
++          ],
++          "forward_thread": "_i % 4 * 32 + _j // 4",
++          "input_shape": [
++            8,
++            128
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            8
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      }
++    },
++    "register-count": {
++      "buffers": {
++        "acc": {
++          "forward_index": [
++            "0"
++          ],
++          "forward_thread": "_i",
++          "input_shape": [
++            128
++          ],
++          "kind": "PartialFragment",
++          "output_shape": [
++            1
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        },
++        "result": {
++          "forward_index": [
++            "0"
++          ],
++          "forward_thread": "_i",
++          "input_shape": [
++            128
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            1
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        },
++        "values": {
++          "forward_index": [
++            "_i"
++          ],
++          "forward_thread": "_j",
++          "input_shape": [
++            8,
++            128
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            8
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      },
++      "loops": {
++        "row,column[8x128]": {
++          "forward_index": [
++            "_i"
++          ],
++          "forward_thread": "_j",
++          "input_shape": [
++            8,
++            128
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            8
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      }
++    }
++  },
++  "full": {
++    "io-aware": {
++      "buffers": {
++        "acc": {
++          "forward_index": [
++            "0"
++          ],
++          "forward_thread": "_rep % 2 * 64 + _rep // 2",
++          "input_shape": [
++            1
++          ],
++          "kind": "PartialFragment",
++          "output_shape": [
++            1
++          ],
++          "replicate": 128,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        },
++        "result": {
++          "forward_index": [
++            "0"
++          ],
++          "forward_thread": "_rep",
++          "input_shape": [
++            1
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            1
++          ],
++          "replicate": 128,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        },
++        "values": {
++          "forward_index": [
++            "_i // 2 * 4 + _j % 4"
++          ],
++          "forward_thread": "_i % 2 * 64 + _j // 4",
++          "input_shape": [
++            4,
++            256
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            8
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      },
++      "loops": {
++        "row,column[4x256]": {
++          "forward_index": [
++            "_i // 2 * 4 + _j % 4"
++          ],
++          "forward_thread": "_i % 2 * 64 + _j // 4",
++          "input_shape": [
++            4,
++            256
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            8
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      }
++    },
++    "register-count": {
++      "buffers": {
++        "acc": {
++          "forward_index": [
++            "0"
++          ],
++          "forward_thread": "_rep % 2 * 64 + _rep // 2",
++          "input_shape": [
++            1
++          ],
++          "kind": "PartialFragment",
++          "output_shape": [
++            1
++          ],
++          "replicate": 128,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        },
++        "result": {
++          "forward_index": [
++            "0"
++          ],
++          "forward_thread": "_rep",
++          "input_shape": [
++            1
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            1
++          ],
++          "replicate": 128,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        },
++        "values": {
++          "forward_index": [
++            "_i // 2 * 4 + _j % 4"
++          ],
++          "forward_thread": "_i % 2 * 64 + _j // 4",
++          "input_shape": [
++            4,
++            256
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            8
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      },
++      "loops": {
++        "row,column[4x256]": {
++          "forward_index": [
++            "_i // 2 * 4 + _j % 4"
++          ],
++          "forward_thread": "_i % 2 * 64 + _j // 4",
++          "input_shape": [
++            4,
++            256
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            8
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      }
++    }
++  },
++  "intermediate": {
++    "io-aware": {
++      "buffers": {
++        "acc": {
++          "forward_index": [
++            "_i % 4"
++          ],
++          "forward_thread": "_rep * 64 + _i // 4",
++          "input_shape": [
++            256
++          ],
++          "kind": "PartialFragment",
++          "output_shape": [
++            4
++          ],
++          "replicate": 2,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        },
++        "result": {
++          "forward_index": [
++            "_i % 4"
++          ],
++          "forward_thread": "_rep * 64 + _i // 4",
++          "input_shape": [
++            256
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            4
++          ],
++          "replicate": 2,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        },
++        "values": {
++          "forward_index": [
++            "_i // 2 * 4 + _j % 4"
++          ],
++          "forward_thread": "_i % 2 * 64 + _j // 4",
++          "input_shape": [
++            4,
++            256
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            8
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      },
++      "loops": {
++        "row,column[4x256]": {
++          "forward_index": [
++            "_i // 2 * 4 + _j % 4"
++          ],
++          "forward_thread": "_i % 2 * 64 + _j // 4",
++          "input_shape": [
++            4,
++            256
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            8
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      }
++    },
++    "register-count": {
++      "buffers": {
++        "acc": {
++          "forward_index": [
++            "_i % 2"
++          ],
++          "forward_thread": "_i // 2",
++          "input_shape": [
++            256
++          ],
++          "kind": "PartialFragment",
++          "output_shape": [
++            2
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        },
++        "result": {
++          "forward_index": [
++            "_i % 2"
++          ],
++          "forward_thread": "_i // 2",
++          "input_shape": [
++            256
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            2
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        },
++        "values": {
++          "forward_index": [
++            "_i * 2 + _j % 2"
++          ],
++          "forward_thread": "_j // 2",
++          "input_shape": [
++            4,
++            256
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            8
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      },
++      "loops": {
++        "row,column[4x256]": {
++          "forward_index": [
++            "_i * 2 + _j % 2"
++          ],
++          "forward_thread": "_j // 2",
++          "input_shape": [
++            4,
++            256
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            8
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      }
++    }
++  },
++  "warp_collective": {
++    "io-aware": {
++      "buffers": {
++        "acc": {
++          "forward_index": [
++            "_i % 4"
++          ],
++          "forward_thread": "_i // 4 * 4 + _rep",
++          "input_shape": [
++            128
++          ],
++          "kind": "PartialFragment",
++          "output_shape": [
++            4
++          ],
++          "replicate": 4,
++          "threads": 128
++        },
++        "result": {
++          "forward_index": [
++            "_i % 4"
++          ],
++          "forward_thread": "_i // 4 * 4 + _rep",
++          "input_shape": [
++            128
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            4
++          ],
++          "replicate": 4,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        },
++        "values": {
++          "forward_index": [
++            "_i // 4 * 4 + _j % 4"
++          ],
++          "forward_thread": "_j // 4 * 4 + _i % 4",
++          "input_shape": [
++            8,
++            128
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            8
++          ],
++          "replicate": 1,
++          "threads": 128
++        }
++      },
++      "loops": {
++        "row,column[8x128]": {
++          "forward_index": [
++            "_i // 4 * 4 + _j % 4"
++          ],
++          "forward_thread": "_j // 4 * 4 + _i % 4",
++          "input_shape": [
++            8,
++            128
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            8
++          ],
++          "replicate": 1,
++          "threads": 128
++        }
++      }
++    },
++    "register-count": {
++      "buffers": {
++        "acc": {
++          "forward_index": [
++            "_i % 4"
++          ],
++          "forward_thread": "_i // 4 * 4 + _rep",
++          "input_shape": [
++            128
++          ],
++          "kind": "PartialFragment",
++          "output_shape": [
++            4
++          ],
++          "replicate": 4,
++          "threads": 128
++        },
++        "result": {
++          "forward_index": [
++            "_i % 4"
++          ],
++          "forward_thread": "_i // 4 * 4 + _rep",
++          "input_shape": [
++            128
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            4
++          ],
++          "replicate": 4,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        },
++        "values": {
++          "forward_index": [
++            "_i // 4 * 4 + _j % 4"
++          ],
++          "forward_thread": "_j // 4 * 4 + _i % 4",
++          "input_shape": [
++            8,
++            128
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            8
++          ],
++          "replicate": 1,
++          "threads": 128
++        }
++      },
++      "loops": {
++        "row,column[8x128]": {
++          "forward_index": [
++            "_i // 4 * 4 + _j % 4"
++          ],
++          "forward_thread": "_j // 4 * 4 + _i % 4",
++          "input_shape": [
++            8,
++            128
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            8
++          ],
++          "replicate": 1,
++          "threads": 128
++        }
++      }
++    }
++  }
++}
+diff --git a/maint/layout_inference/expected/reduction_aware_shared.json b/maint/layout_inference/expected/reduction_aware_shared.json
+new file mode 100644
+index 0000000000..b58d336cb5
+--- /dev/null
++++ b/maint/layout_inference/expected/reduction_aware_shared.json
+@@ -0,0 +1,208 @@
++{
++  "mixed_dtype": {
++    "io-aware": {
++      "buffers": {
++        "acc": {
++          "forward_index": [
++            "0"
++          ],
++          "forward_thread": "_rep",
++          "input_shape": [
++            1
++          ],
++          "kind": "PartialFragment",
++          "output_shape": [
++            1
++          ],
++          "replicate": 128,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        },
++        "result": {
++          "forward_index": [
++            "0"
++          ],
++          "forward_thread": "_rep",
++          "input_shape": [
++            1
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            1
++          ],
++          "replicate": 128,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        },
++        "values": {
++          "forward_index": [
++            "_i // 512 * 4 + _i % 4"
++          ],
++          "forward_thread": "_i % 512 // 4",
++          "input_shape": [
++            2048
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            16
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        },
++        "weights": {
++          "forward_index": [
++            "_i * 16 + _j // 512 * 4 + _j % 4"
++          ],
++          "forward_thread": "_j % 512 // 4",
++          "input_shape": [
++            8,
++            2048
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            128
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      },
++      "loops": {
++        "element[2048]": {
++          "forward_index": [
++            "_i // 512 * 4 + _i % 4"
++          ],
++          "forward_thread": "_i % 512 // 4",
++          "input_shape": [
++            2048
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            16
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      }
++    },
++    "register-count": {
++      "buffers": {
++        "acc": {
++          "forward_index": [
++            "0"
++          ],
++          "forward_thread": "_rep",
++          "input_shape": [
++            1
++          ],
++          "kind": "PartialFragment",
++          "output_shape": [
++            1
++          ],
++          "replicate": 128,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        },
++        "result": {
++          "forward_index": [
++            "0"
++          ],
++          "forward_thread": "_rep",
++          "input_shape": [
++            1
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            1
++          ],
++          "replicate": 128,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        },
++        "values": {
++          "forward_index": [
++            "_i // 512 * 4 + _i % 4"
++          ],
++          "forward_thread": "_i % 512 // 4",
++          "input_shape": [
++            2048
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            16
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        },
++        "weights": {
++          "forward_index": [
++            "_i * 16 + _j // 512 * 4 + _j % 4"
++          ],
++          "forward_thread": "_j % 512 // 4",
++          "input_shape": [
++            8,
++            2048
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            128
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      },
++      "loops": {
++        "element[2048]": {
++          "forward_index": [
++            "_i // 512 * 4 + _i % 4"
++          ],
++          "forward_thread": "_i % 512 // 4",
++          "input_shape": [
++            2048
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            16
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      }
++    }
++  }
++}
+diff --git a/maint/layout_inference/run.py b/maint/layout_inference/run.py
+index 470820a95a..c8a5ebc02a 100755
+--- a/maint/layout_inference/run.py
++++ b/maint/layout_inference/run.py
+@@ -3,8 +3,8 @@
+ 
+ Each module under ``cases/`` constructs PrimFuncs whose free-mode layout
+ search has a known-good answer.  This driver runs LayoutInference under
+-both selection policies (``tl.layout_cost_model`` = "register-count" or
+-"io-aware"), snapshots the inferred layouts, and compares them against
++the configured selection policies (``tl.layout_cost_model``), snapshots
++the inferred layouts, and compares them against
+ the reviewed golden files under ``expected/``.
+ 
+ Usage:
+diff --git a/src/config.h b/src/config.h
+index 644fa208cb..c79f120a9a 100644
+--- a/src/config.h
++++ b/src/config.h
+@@ -28,10 +28,9 @@ inline bool ReducerPlanVerboseEnabled() {
+ }
+ 
+ /*!
+- * \brief The cost model that ranks free-mode layout attempts. Valid
+- *  values: "register-count" (default — total fragment register slots) and
+- *  "io-aware" (bytes x vector-width/coalescing over fragment<->global
+- *  traffic, registers as tiebreak).
++ * \brief The cost model ranking free-mode layout attempts:
++ *  "register-count" (default, automatically reduction-aware for CUDA
++ *  reducers) or the existing "io-aware" global-memory policy.
+  */
+ inline std::string LayoutCostModelName() {
+   auto ctxt = tvm::transform::PassContext::Current();
+diff --git a/src/op/builtin.h b/src/op/builtin.h
+index 04d6e77737..ac75090efa 100644
+--- a/src/op/builtin.h
++++ b/src/op/builtin.h
+@@ -80,11 +80,11 @@ static constexpr const char *kReducerForceBaseline =
+     "tl.reducer_force_baseline";
+ static constexpr const char *kEnableReducerPlanVerbose =
+     "tl.enable_reducer_plan_verbose";
+-// The cost model that ranks free-mode layout attempts, by name:
+-// "register-count" (default) uses total fragment register slots;
+-// "io-aware" scores estimated global-memory access cost — vector width /
+-// coalescing of every fragment<->global copy, weighted by bytes moved —
+-// with register count as the tiebreak.
++// The cost model ranking free-mode layout attempts: "register-count"
++// (default) automatically uses reduction-aware scoring for CUDA reducers
++// and spill/register scoring elsewhere. "io-aware" scores global-memory
++// vector width / coalescing weighted by bytes moved, with registers as
++// the tiebreak.
+ static constexpr const char *kLayoutCostModel = "tl.layout_cost_model";
+ static constexpr const char *kEnableVectorizePlannerVerbose =
+     "tl.enable_vectorize_planner_verbose";
+diff --git a/src/op/parallel.cc b/src/op/parallel.cc
+index 6ca485b14e..3750a46bfc 100644
+--- a/src/op/parallel.cc
++++ b/src/op/parallel.cc
+@@ -996,8 +996,8 @@ Fragment ParallelOpNode::ComputeLoopLayoutFromBuffer(
+   return result;
+ }
+ 
+-Fragment
+-ParallelOpNode::ComputePlanCandidate(const LayoutInferArgs &layout_args) const {
++int ParallelOpNode::GetPlanVectorSize(
++    const LayoutInferArgs &layout_args) const {
+   // Vectorize Size must be aware of the buffer_remap
+   // As the pass will do post processing to the layout
+   auto maybe_remapped_root_ = IfBufferRemapLoopGenerator::run(
+@@ -1048,6 +1048,12 @@ ParallelOpNode::ComputePlanCandidate(const LayoutInferArgs &layout_args) const {
+   DLOG(INFO) << "[PlanLoopPartition] root_ = " << root_
+              << " ############# vector_size = " << vector_size
+              << ", thread_bounds = " << layout_args.thread_bounds << '\n';
++  return vector_size;
++}
++
++Fragment
++ParallelOpNode::ComputePlanCandidate(const LayoutInferArgs &layout_args) const {
++  int vector_size = GetPlanVectorSize(layout_args);
+   auto plan = PlanLoopPartition(root_, vector_size, layout_args.thread_bounds);
+   DLOG(INFO) << "[PlanLoopPartition] candidate = " << plan->DebugOutput()
+              << '\n';
+diff --git a/src/op/parallel.h b/src/op/parallel.h
+index 1b77d821d3..66bab8b822 100644
+--- a/src/op/parallel.h
++++ b/src/op/parallel.h
+@@ -172,6 +172,7 @@ class ParallelOpNode : public TileOperatorNode {
+   // input dims of GetLoopLayout().
+   const Array<IterVar> &GetLoopVars() const { return loop_vars_; }
+   bool HasReducerUpdates() const { return !reducer_updates_.empty(); }
++  int GetPlanVectorSize(const LayoutInferArgs &layout_args) const;
+   // Get the mapping from buffer to access indices + access type.
+   const BufferIndiceMap &GetIndiceMap() const { return indice_map_; }
+   // Get buffers in the order they first appear in the loop body.
+diff --git a/src/transform/layout_inference/layout_cost_model.cc b/src/transform/layout_inference/layout_cost_model.cc
+index 9bdd23c165..93498bcb4e 100644
+--- a/src/transform/layout_inference/layout_cost_model.cc
++++ b/src/transform/layout_inference/layout_cost_model.cc
+@@ -6,12 +6,14 @@
+ 
+ #include "layout_cost_model.h"
+ 
++#include <tvm/ffi/reflection/registry.h>
+ #include <tvm/runtime/logging.h>
+ #include <tvm/tirx/expr.h>
+ #include <tvm/tirx/op.h>
+ #include <tvm/tirx/stmt_functor.h>
+ 
+ #include <algorithm>
++#include <functional>
+ #include <limits>
+ #include <optional>
+ #include <sstream>
+@@ -21,14 +23,19 @@
+ #include <utility>
+ #include <vector>
+ 
++#include "../../config.h"
++#include "../../cuda/target_utils.h"
+ #include "../../layout/cute_layout.h"
+ #include "../../layout/layout.h"
+ #include "../../layout/utils.h"
+ #include "../../op/copy.h"
+ #include "../../op/parallel.h"
++#include "../../op/reducer.h"
+ #include "../../op/utils.h"
+ #include "../../span_utils.h"
++#include "../loop_partition.h"
+ #include "../loop_vectorize.h"
++#include "../reducer_plan.h"
+ 
+ namespace tvm {
+ namespace tl {
+@@ -696,7 +703,7 @@ StatementProbe BuildCopyProbe(const Copy &copy, const Fragment &frag_layout,
+ /*! \brief Collect the direct global-memory accesses of a parallel loop
+  *  body, with the trip count of any enclosing serial loops (the access
+  *  pattern replays, shifted, once per serial iteration). */
+-class LoopGlobalAccessCollector : public StmtExprVisitor {
++class LoopMemoryAccessCollector : public StmtExprVisitor {
+ public:
+   struct RawAccess {
+     Buffer buffer;
+@@ -706,9 +713,7 @@ class LoopGlobalAccessCollector : public StmtExprVisitor {
+     bool symbolic_repeat;
+   };
+   std::vector<RawAccess> accesses;
+-  // Whether the loop body also touches shared memory: feeds the shared
+-  // width-cap policy (256-bit loads are global-only).
+-  bool touches_shared{false};
++  bool has_shared_access{false};
+ 
+   void Collect(const Stmt &stmt) { VisitStmt(stmt); }
+ 
+@@ -734,7 +739,8 @@ class LoopGlobalAccessCollector : public StmtExprVisitor {
+   void Record(const Buffer &buffer, const Array<PrimExpr> &indices,
+               bool is_store) {
+     if (IsSharedBuffer(buffer)) {
+-      touches_shared = true;
++      has_shared_access = true;
++      return;
+     }
+     if (!IsGlobalBuffer(buffer)) {
+       return;
+@@ -763,7 +769,7 @@ class LoopGlobalAccessCollector : public StmtExprVisitor {
+  *  even be sized (skip — nothing sensible to charge). */
+ std::optional<StatementProbe> BuildLoopProbe(const ParallelOp &loop,
+                                              const Target &target) {
+-  LoopGlobalAccessCollector collector;
++  LoopMemoryAccessCollector collector;
+   collector.Collect(loop->GetRoot());
+   StatementProbe probe;
+   if (collector.accesses.empty()) {
+@@ -828,7 +834,7 @@ std::optional<StatementProbe> BuildLoopProbe(const ParallelOp &loop,
+     return worst_only("loop forward maps have unsupported geometry");
+   }
+   probe.vector_bits = MaxVectorLoadBits(
+-      target, /*global_only_access=*/!collector.touches_shared);
++      target, /*global_only_access=*/!collector.has_shared_access);
+   BindMemoryGeometry(&probe, target);
+ 
+   for (const auto &raw : collector.accesses) {
+@@ -990,7 +996,9 @@ class RegisterCountCostModel final : public LayoutCostModel {
+     return cost;
+   }
+   const char *Name() const final { return "register-count"; }
+-  bool ExploreReducerScalarLayouts() const final { return true; }
++  ReducerVectorSearch GetReducerVectorSearch() const final {
++    return ReducerVectorSearch::kScalar;
++  }
+ };
+ 
+ /*! \brief IO-aware policy (layout RFC, design B2): every global-touching
+@@ -1015,104 +1023,103 @@ class IOAwareCostModel final : public LayoutCostModel {
+     cost.regs = CountRegisterSlots(tmp_layout_map);
+ 
+     for (int idx : members) {
+-      const TileOperator &op = infer_list[idx];
+-      DLOG(INFO) << "[LayoutCost] member " << idx
+-                 << " begin: type=" << op->GetTypeKey();
+-      if (const auto *copy = infer_list[idx].as<CopyNode>()) {
+-        Copy copy_op = GetRef<Copy>(copy);
++      cost.mem += GlobalMemoryCost(idx, infer_list[idx], tmp_layout_map);
++    }
++    DLOG(INFO) << "[LayoutCost] io-aware score end: mem=" << cost.mem
++               << " regs=" << cost.regs;
++    return cost;
++  }
++
++  int64_t GlobalMemoryCost(int idx, const TileOperator &op,
++                           const LayoutMap &tmp_layout_map) const {
++    DLOG(INFO) << "[LayoutCost] member " << idx
++               << " begin: type=" << op->GetTypeKey();
++    if (const auto *copy = op.as<CopyNode>()) {
++      Copy copy_op = GetRef<Copy>(copy);
++      DLOG(INFO) << "[LayoutCost] member " << idx << " copy: src=" << copy->src
++                 << " (scope=" << copy->src.scope() << ") dst=" << copy->dst
++                 << " (scope=" << copy->dst.scope() << ')';
++      bool src_frag = IsFragmentBuffer(copy->src);
++      bool dst_frag = IsFragmentBuffer(copy->dst);
++      Buffer frag;
++      bool frag_is_src = false;
++      if (src_frag && IsGlobalBuffer(copy->dst)) {
++        frag = copy->src;
++        frag_is_src = true;
++      } else if (dst_frag && IsGlobalBuffer(copy->src)) {
++        frag = copy->dst;
++      } else {
+         DLOG(INFO) << "[LayoutCost] member " << idx
+-                   << " copy: src=" << copy->src
+-                   << " (scope=" << copy->src.scope() << ") dst=" << copy->dst
+-                   << " (scope=" << copy->dst.scope() << ')';
+-        bool src_frag = IsFragmentBuffer(copy->src);
+-        bool dst_frag = IsFragmentBuffer(copy->dst);
+-        Buffer frag;
+-        bool frag_is_src = false;
+-        if (src_frag && IsGlobalBuffer(copy->dst)) {
+-          frag = copy->src;
+-          frag_is_src = true;
+-        } else if (dst_frag && IsGlobalBuffer(copy->src)) {
+-          frag = copy->dst;
+-        } else {
+-          DLOG(INFO) << "[LayoutCost] member " << idx
+-                     << " copy ignored: not a fragment<->global transfer";
+-          continue; // register moves / shared staging: out of the model
+-        }
++                   << " copy ignored: not a fragment<->global transfer";
++        return 0;
++      }
++      DLOG(INFO) << "[LayoutCost] member " << idx << " copy modeled as global "
++                 << (frag_is_src ? "store" : "load")
++                 << " through fragment=" << frag;
++      auto layout = tmp_layout_map.Get(frag);
++      if (!layout.has_value()) {
+         DLOG(INFO) << "[LayoutCost] member " << idx
+-                   << " copy modeled as global "
+-                   << (frag_is_src ? "store" : "load")
+-                   << " through fragment=" << frag;
+-        auto layout = tmp_layout_map.Get(frag);
+-        if (!layout.has_value()) {
+-          DLOG(INFO) << "[LayoutCost] member " << idx
+-                     << " copy ignored: fragment has no tentative layout";
+-          continue;
+-        }
+-        auto frag_layout = layout.value().as<Fragment>();
+-        if (!frag_layout.has_value()) {
+-          DLOG(INFO) << "[LayoutCost] member " << idx
+-                     << " copy ignored: tentative layout is not a Fragment";
+-          continue;
+-        }
+-        DLOG(INFO) << "[LayoutCost] member " << idx << " copy fragment layout: "
+-                   << frag_layout.value()->DebugOutput();
+-        int64_t statement_mem =
+-            CachedStatementMem(idx, frag_layout.value(), [&]() {
+-              std::optional<StatementProbe> probe;
+-              try {
+-                probe = BuildCopyProbe(copy_op, frag_layout.value(),
+-                                       frag_is_src, target_);
+-              } catch (const std::exception &e) {
+-                DLOG(INFO) << "[LayoutCost] member " << idx
+-                           << " copy probe construction threw: " << e.what();
+-                probe = std::nullopt; // skipped below; builder-side fallbacks
+-                                      // cover every non-throwing failure
+-              }
+-              return ChargeStatement(probe, idx, "copy");
+-            });
+-        cost.mem += statement_mem;
++                   << " copy ignored: fragment has no tentative layout";
++        return 0;
++      }
++      auto frag_layout = layout.value().as<Fragment>();
++      if (!frag_layout.has_value()) {
+         DLOG(INFO) << "[LayoutCost] member " << idx
+-                   << " copy contribution=" << statement_mem
+-                   << " running_mem=" << cost.mem;
+-      } else if (const auto *loop = infer_list[idx].as<ParallelOpNode>()) {
+-        ParallelOp loop_op = GetRef<ParallelOp>(loop);
+-        Fragment loop_layout = loop_op->GetLoopLayout();
+-        if (loop_layout.defined()) {
+-          DLOG(INFO) << "[LayoutCost] member " << idx
+-                     << " parallel-loop layout: " << loop_layout->DebugOutput();
+-        } else {
+-          DLOG(INFO) << "[LayoutCost] member " << idx
+-                     << " parallel-loop layout is undefined";
+-        }
+-        auto compute = [&]() {
+-          std::optional<StatementProbe> probe;
+-          try {
+-            probe = BuildLoopProbe(loop_op, target_);
+-          } catch (const std::exception &e) {
+-            DLOG(INFO) << "[LayoutCost] member " << idx
+-                       << " parallel-loop probe construction threw: "
+-                       << e.what();
+-            probe = std::nullopt;
+-          }
+-          return ChargeStatement(probe, idx, "parallel-loop");
+-        };
+-        int64_t statement_mem =
+-            loop_layout.defined()
+-                ? CachedStatementMem(idx, loop_layout, compute)
+-                : compute();
+-        cost.mem += statement_mem;
++                   << " copy ignored: tentative layout is not a Fragment";
++        return 0;
++      }
++      DLOG(INFO) << "[LayoutCost] member " << idx << " copy fragment layout: "
++                 << frag_layout.value()->DebugOutput();
++      int64_t statement_mem =
++          CachedStatementMem(idx, frag_layout.value(), [&]() {
++            std::optional<StatementProbe> probe;
++            try {
++              probe = BuildCopyProbe(copy_op, frag_layout.value(), frag_is_src,
++                                     target_);
++            } catch (const std::exception &e) {
++              DLOG(INFO) << "[LayoutCost] member " << idx
++                         << " copy probe construction threw: " << e.what();
++              probe = std::nullopt; // skipped below; builder-side fallbacks
++                                    // cover every non-throwing failure
++            }
++            return ChargeStatement(probe, idx, "copy");
++          });
++      DLOG(INFO) << "[LayoutCost] member " << idx
++                 << " copy contribution=" << statement_mem;
++      return statement_mem;
++    } else if (const auto *loop = op.as<ParallelOpNode>()) {
++      ParallelOp loop_op = GetRef<ParallelOp>(loop);
++      Fragment loop_layout = loop_op->GetLoopLayout();
++      if (loop_layout.defined()) {
+         DLOG(INFO) << "[LayoutCost] member " << idx
+-                   << " parallel-loop contribution=" << statement_mem
+-                   << " running_mem=" << cost.mem;
++                   << " parallel-loop layout: " << loop_layout->DebugOutput();
+       } else {
+         DLOG(INFO) << "[LayoutCost] member " << idx
+-                   << " ignored: type=" << op->GetTypeKey()
+-                   << " is outside the IO-aware statement model";
++                   << " parallel-loop layout is undefined";
+       }
++      auto compute = [&]() {
++        std::optional<StatementProbe> probe;
++        try {
++          probe = BuildLoopProbe(loop_op, target_);
++        } catch (const std::exception &e) {
++          DLOG(INFO) << "[LayoutCost] member " << idx
++                     << " parallel-loop probe construction threw: " << e.what();
++          probe = std::nullopt;
++        }
++        return ChargeStatement(probe, idx, "parallel-loop");
++      };
++      int64_t statement_mem =
++          loop_layout.defined() ? CachedStatementMem(idx, loop_layout, compute)
++                                : compute();
++      DLOG(INFO) << "[LayoutCost] member " << idx
++                 << " parallel-loop contribution=" << statement_mem;
++      return statement_mem;
++    } else {
++      DLOG(INFO) << "[LayoutCost] member " << idx
++                 << " ignored: type=" << op->GetTypeKey()
++                 << " is outside the IO-aware statement model";
+     }
+-    DLOG(INFO) << "[LayoutCost] io-aware score end: mem=" << cost.mem
+-               << " regs=" << cost.regs;
+-    return cost;
++    return 0;
+   }
+ 
+   const char *Name() const final { return "io-aware"; }
+@@ -1181,20 +1188,565 @@ class IOAwareCostModel final : public LayoutCostModel {
+       stmt_cache_;
+ };
+ 
++constexpr int64_t kUnknownReductionCost =
++    std::numeric_limits<int64_t>::max() / 16;
++
++int64_t CeilDiv(int64_t numerator, int64_t denominator) {
++  return numerator / denominator + (numerator % denominator != 0);
++}
++
++int64_t AddCost(int64_t left, int64_t right) {
++  return left >= kUnknownReductionCost - right ? kUnknownReductionCost
++                                               : left + right;
++}
++
++int64_t MultiplyCost(int64_t left, int64_t right) {
++  if (left == 0 || right == 0) {
++    return 0;
++  }
++  return left > kUnknownReductionCost / right ? kUnknownReductionCost
++                                              : left * right;
++}
++
++std::optional<int64_t> ConstantCount(const PrimExpr &expression) {
++  arith::Analyzer analyzer;
++  PrimExpr simplified = analyzer.Simplify(expression);
++  const int64_t *value = as_const_int(simplified);
++  if (value == nullptr || *value < 0 || *value >= kUnknownReductionCost) {
++    return std::nullopt;
++  }
++  return *value;
++}
++
++std::optional<int64_t> ConstantProduct(const Array<PrimExpr> &extents) {
++  int64_t result = 1;
++  for (const PrimExpr &extent : extents) {
++    auto value = ConstantCount(extent);
++    if (!value.has_value()) {
++      return std::nullopt;
++    }
++    result = MultiplyCost(result, value.value());
++  }
++  return result < kUnknownReductionCost ? std::optional<int64_t>(result)
++                                        : std::nullopt;
++}
++
++class ExecutionCountCollector : public StmtExprVisitor {
++public:
++  std::unordered_map<ObjectRef, int64_t, ObjectPtrHash, ObjectPtrEqual> counts;
++  bool known{true};
++
++  void Collect(const PrimFunc &function) { VisitStmt(function->body); }
++
++private:
++  void VisitStmt_(const ForNode *loop) final {
++    counts[GetRef<For>(loop)] = count_;
++    int64_t previous = count_;
++    if (loop->kind != ForKind::kParallel) {
++      auto extent = ConstantCount(loop->extent);
++      count_ = count_ < 0 || !extent.has_value()
++                   ? -1
++                   : MultiplyCost(count_, extent.value());
++      known = known && count_ >= 0 && count_ < kUnknownReductionCost;
++    }
++    StmtExprVisitor::VisitStmt_(loop);
++    count_ = previous;
++  }
++
++  void VisitExpr_(const CallNode *call) final {
++    counts[GetRef<Call>(call)] = count_;
++    StmtExprVisitor::VisitExpr_(call);
++  }
++
++  int64_t count_{1};
++};
++
++struct ReducerCostFeatures {
++  int64_t local_issues{0};
++  int64_t shared_issues{0};
++  int64_t shuffle_issues{0};
++  int64_t shared_rounds{0};
++  int64_t barriers{0};
++  int64_t combine_issues{0};
++  int64_t slots{0};
++  std::vector<int> vector_widths;
++};
++
++int PartitionedVectorWidth(const For &loop, const Fragment &layout,
++                           const LayoutMap &layouts) {
++  arith::Analyzer analyzer;
++  Var thread("reduction_cost_thread", DataType::Int(32));
++  Range bounds = layout->ThreadRange();
++  if (!bounds.defined()) {
++    bounds = Range::FromMinExtent(0, layout->ThreadExtent());
++  }
++  analyzer.Bind(thread, bounds);
++  For partitioned = PartitionLoop(loop, thread, &analyzer, layout);
++  return GetVectorizeSize(partitioned, &analyzer, layouts);
++}
++
++class ReducerCostRewriter : public StmtExprMutator {
++public:
++  ReducerCostRewriter(const std::vector<ReducerPlanInfo> &plans,
++                      const LayoutMap &layouts)
++      : layouts(layouts) {
++    for (const ReducerPlanInfo &plan : plans) {
++      Array<PrimExpr> shape = plan.reducer->shape;
++      Fragment storage = plan.storage_layout;
++      if (plan.packed_layout.defined()) {
++        shape.push_back(Integer(2));
++        storage = plan.packed_layout.value();
++      }
++      Var data("reduction_cost_acc",
++               PointerType(PrimType(plan.reducer->dtype), "local.fragment"));
++      Buffer buffer(data, plan.reducer->dtype, shape, {}, Integer(0),
++                    "reduction_cost_acc", plan.reducer->data_alignment,
++                    plan.reducer->offset_factor, plan.reducer->buffer_type);
++      this->layouts.Set(buffer, storage);
++      updates_.emplace(
++          plan.reducer->data,
++          Update{buffer, plan.op, plan.pack_lane_var, plan.narrow});
++    }
++  }
++
++  LayoutMap layouts;
++
++private:
++  struct Update {
++    Buffer buffer;
++    ReducerV2OpType op;
++    Optional<Var> pack_lane;
++    bool narrow;
++  };
++
++  Stmt VisitStmt_(const EvaluateNode *statement) final {
++    const auto *call = statement->value.as<CallNode>();
++    if (call == nullptr || !call->op.same_as(reducer_update())) {
++      return StmtExprMutator::VisitStmt_(statement);
++    }
++    ReducerUpdateArgs args = ParseReducerUpdate(call);
++    const Update &update = updates_.at(args.reducer->data);
++    Array<PrimExpr> indices = args.indices;
++    if (update.pack_lane.defined()) {
++      indices.push_back(
++          FloorMod(update.pack_lane.value(), IntImm(DataType::Int(32), 2)));
++    }
++    Stmt store = BufferStore(
++        update.buffer,
++        ReducerV2Combine(update.op, BufferLoad(update.buffer, indices),
++                         args.value),
++        indices);
++    if (!update.narrow) {
++      store = AttrStmt(update.buffer->data, attr::kParallelMultiplicity,
++                       IntImm(DataType::Int(32), 1), store);
++    }
++    return store;
++  }
++
++  std::unordered_map<Var, Update, ObjectPtrHash, ObjectPtrEqual> updates_;
++};
++
++Map<For, Integer> ReducerVectorWidths(const std::vector<ReducerPlanInfo> &plans,
++                                      const LayoutMap &layouts) {
++  ReducerCostRewriter rewriter(plans, layouts);
++  Map<For, Integer> widths;
++  for (const ReducerPlanInfo &plan : plans) {
++    for (const ReducerUpdatePlanSite &site : plan.updates) {
++      if (!widths.count(site.loop)) {
++        For loop = Downcast<For>(rewriter(site.loop));
++        widths.Set(site.loop, Integer(PartitionedVectorWidth(
++                                  loop, site.loop_layout, rewriter.layouts)));
++      }
++    }
++  }
++  return widths;
++}
++
++std::optional<ReducerCostFeatures>
++ExtractReducerCost(const ReducerPlanInfo &plan, const Map<For, Integer> &widths,
++                   const Target &target) {
++  ReducerCostFeatures features;
++  auto slots = ConstantProduct(plan.storage_layout->OutputShape());
++  auto finalizations = ConstantCount(plan.finalize_count);
++  bool materializes_finalize =
++      !plan.narrow || !plan.steps.empty() || plan.has_seed;
++  if (!slots.has_value() || !finalizations.has_value() || plan.batch < 1 ||
++      (materializes_finalize && plan.batch > 1 &&
++       (plan.batch > slots.value() || slots.value() % plan.batch != 0))) {
++    return std::nullopt;
++  }
++  features.slots = slots.value();
++  bool packed_arithmetic = plan.reducer->dtype.is_float16() ||
++                           plan.reducer->dtype.is_bfloat16() ||
++                           (plan.reducer->dtype == DataType::Float(32) &&
++                            TargetHasSMVersionGE(target, 100));
++  for (const ReducerUpdatePlanSite &site : plan.updates) {
++    auto points = ConstantProduct(site.loop_layout->OutputShape());
++    auto repeats = ConstantCount(site.execution_count);
++    if (!points.has_value() || !repeats.has_value()) {
++      return std::nullopt;
++    }
++    int width = static_cast<int>(widths.at(site.loop)->value);
++    features.vector_widths.push_back(width);
++    int arithmetic_width = packed_arithmetic ? std::min(width, 2) : 1;
++    int64_t work = MultiplyCost(points.value(), repeats.value());
++    features.local_issues =
++        AddCost(features.local_issues, CeilDiv(work, arithmetic_width));
++  }
++  if (plan.packed_layout.defined()) {
++    features.local_issues =
++        AddCost(features.local_issues,
++                MultiplyCost(features.slots, finalizations.value()));
++  }
++  int warp_size =
++      target->GetAttr<Integer>("thread_warp_size").value_or(32)->value;
++  for (const auto &[threads, scale] : plan.steps) {
++    if (scale <= 0 || threads < scale || threads % scale != 0 ||
++        ((threads / scale) & (threads / scale - 1)) != 0) {
++      return std::nullopt;
++    }
++    int64_t batch = threads > warp_size ? plan.batch : 1;
++    int64_t groups =
++        MultiplyCost(features.slots / batch, finalizations.value());
++    int64_t values = MultiplyCost(features.slots, finalizations.value());
++    for (int offset = threads / 2; offset >= scale; offset /= 2) {
++      if (offset >= warp_size) {
++        features.shared_rounds = AddCost(features.shared_rounds, groups);
++        features.barriers = AddCost(features.barriers, MultiplyCost(2, groups));
++        features.shared_issues =
++            AddCost(features.shared_issues, MultiplyCost(2, values));
++      } else {
++        features.shuffle_issues = AddCost(features.shuffle_issues, values);
++      }
++      features.combine_issues = AddCost(features.combine_issues, values);
++    }
++  }
++  return features;
++}
++
++int64_t CudaReducerIssueCost(const ReducerCostFeatures &features) {
++  constexpr int64_t kShuffleWeight = 4;
++  constexpr int64_t kBarrierWeight = 32;
++  int64_t cost = AddCost(features.local_issues, features.shared_issues);
++  cost = AddCost(cost, features.combine_issues);
++  cost = AddCost(cost, MultiplyCost(kShuffleWeight, features.shuffle_issues));
++  return AddCost(cost, MultiplyCost(kBarrierWeight, features.barriers));
++}
++
++/*! \brief Reduction-aware heuristic, not a calibrated latency model.
++ *
++ * Known attempts precede unknown ones. Within that ordering, minimize:
++ *
++ * \code
++ * reducer_issues = local_issues + shared_issues + combine_issues
++ *                  + 4 * shuffle_issues + 32 * barriers
++ * execution = global_memory_cost
++ *             + sum_reducers(threads * max_vector_bytes * reducer_issues)
++ * register_penalty = 4 * max_threads * register_slots
++ * total = spill_bytes + execution + register_penalty
++ * \endcode
++ *
++ * threads is each reducer's participant count; max_threads is their maximum.
++ * max_vector_bytes = MaxVectorLoadBits(target, false) / 8. global_memory_cost
++ * covers ordinary global accesses; shared_issues above covers collective
++ * communication, not ordinary shared accesses or bank conflicts. Arithmetic
++ * issues cover reducer work, not all kernel arithmetic. Spill, memory, and
++ * issue estimates include execution counts.
++ *
++ * register_slots sums physical fragment slots per thread, including packing
++ * temporaries, without liveness analysis. This is a static resource penalty;
++ * unlike traffic/issues, it is not multiplied by execution counts.
++ *
++ * Byte-like scaling aligns thread scope, not performance cost: register
++ * capacity, memory traffic, and issue-equivalent bytes are not interchangeable.
++ * The top-level 1:1:1 and issue weights are uncalibrated heuristics. With
++ * max_vector_bytes=16 and equal thread counts, one local issue scores like
++ * four extra per-thread register slots; one barrier scores like 128 slots.
++ */
++class ReductionAwareCostModel final : public LayoutCostModel {
++public:
++  ReductionAwareCostModel(Target target, const PrimFunc &function,
++                          std::vector<int64_t> execution_counts)
++      : target_(std::move(target)), plans_(function), io_model_(target_),
++        execution_counts_(std::move(execution_counts)) {}
++
++  AttemptCost Score(const std::vector<int> &members,
++                    const std::vector<TileOperator> &infer_list,
++                    const LayoutMap &layouts) const final {
++    Array<Buffer> reducers;
++    std::unordered_set<Buffer, ObjectPtrHash, ObjectPtrEqual> seen;
++    Map<For, Fragment> loop_layouts;
++    for (int member : members) {
++      if (auto finalize = infer_list[member].as<FinalizeReducerV2Op>()) {
++        if (seen.insert(finalize.value()->reducer).second) {
++          reducers.push_back(finalize.value()->reducer);
++        }
++      }
++      if (auto loop = infer_list[member].as<ParallelOp>()) {
++        loop_layouts.Set(loop.value()->GetRoot(),
++                         loop.value()->GetLoopLayout());
++      }
++    }
++    if (reducers.empty()) {
++      return RegisterCountCostModel().Score(members, infer_list, layouts);
++    }
++    AttemptCost cost;
++    cost.mem = CountSpilledBytes(members, infer_list, layouts);
++    cost.regs = CountRegisterSlots(layouts);
++    cost.execution = kUnknownReductionCost;
++    cost.known = false;
++    try {
++      auto plans = plans_.Analyze(layouts, loop_layouts, reducers);
++      if (!plans.has_value()) {
++        return cost;
++      }
++      LayoutMap physical_layouts = layouts;
++      for (const ReducerPlanInfo &plan : plans.value()) {
++        physical_layouts.Set(plan.reducer, plan.storage_layout);
++        for (const auto &[buffer, layout] : plan.layout_overrides) {
++          physical_layouts.Set(buffer, layout);
++        }
++      }
++      cost.regs = CountRegisterSlots(physical_layouts);
++      Map<For, Integer> widths =
++          ReducerVectorWidths(plans.value(), physical_layouts);
++      int64_t execution = 0;
++      int64_t register_threads = 1;
++      for (const ReducerPlanInfo &plan : plans.value()) {
++        auto features = ExtractReducerCost(plan, widths, target_);
++        if (!features.has_value()) {
++          return cost;
++        }
++        int64_t participants = *as_const_int(plan.thread_bounds->extent);
++        register_threads = std::max(register_threads, participants);
++        int64_t issue_bytes =
++            MultiplyCost(participants, MaxVectorLoadBits(target_, false) / 8);
++        execution = AddCost(
++            execution,
++            MultiplyCost(CudaReducerIssueCost(features.value()), issue_bytes));
++        if (plan.packed_layout.defined()) {
++          auto packed_slots =
++              ConstantProduct(plan.packed_layout.value()->OutputShape());
++          if (!packed_slots.has_value()) {
++            return cost;
++          }
++          cost.regs = AddCost(cost.regs, packed_slots.value());
++        }
++        if (tl_config::ReducerPlanVerboseEnabled()) {
++          LOG(INFO) << "[ReducerCost] reducer=" << plan.reducer->name
++                    << " narrow=" << plan.narrow << " reason=" << plan.reason
++                    << " local_issues=" << features->local_issues
++                    << " shared_rounds=" << features->shared_rounds
++                    << " barriers=" << features->barriers
++                    << " shuffle_issues=" << features->shuffle_issues
++                    << " vector_widths="
++                    << FormatVector(features->vector_widths);
++        }
++      }
++      int64_t spilled = 0;
++      for (int member : members) {
++        int64_t repeats = execution_counts_.at(member);
++        int64_t spill =
++            CountSpilledBytes({member}, infer_list, physical_layouts);
++        spilled = AddCost(spilled, MultiplyCost(spill, repeats));
++        int64_t memory = io_model_.GlobalMemoryCost(member, infer_list[member],
++                                                    physical_layouts);
++        Optional<ParallelOp> loop = infer_list[member].as<ParallelOp>();
++        if (auto copy = infer_list[member].as<Copy>()) {
++          if (copy.value()->par_op_.defined()) {
++            loop = copy.value()->par_op_;
++          }
++        }
++        if (loop.defined()) {
++          auto loop_memory =
++              GlobalLoopMemoryCost_(loop.value(), widths, memory);
++          if (!loop_memory.has_value()) {
++            return cost;
++          }
++          memory = loop_memory.value();
++        }
++        execution = AddCost(execution, MultiplyCost(memory, repeats));
++      }
++      cost.mem = spilled;
++      cost.execution = execution;
++      constexpr int64_t kRegisterSlotBytes = 4;
++      int64_t register_cost = MultiplyCost(
++          cost.regs, MultiplyCost(register_threads, kRegisterSlotBytes));
++      int64_t total_cost = AddCost(AddCost(spilled, execution), register_cost);
++      cost.known = total_cost < kUnknownReductionCost;
++      if (cost.known) {
++        cost.total_cost = total_cost;
++      }
++    } catch (const std::exception &error) {
++      DLOG(INFO) << "[ReducerCost] unmeasurable attempt: " << error.what();
++      cost.execution = kUnknownReductionCost;
++    }
++    return cost;
++  }
++
++  const char *Name() const final { return "reduction-aware"; }
++
++  ReducerVectorSearch GetReducerVectorSearch() const final {
++    return ReducerVectorSearch::kAll;
++  }
++
++private:
++  std::optional<int64_t> GlobalLoopMemoryCost_(const ParallelOp &loop,
++                                               const Map<For, Integer> &widths,
++                                               int64_t global) const {
++    auto solved_width = widths.Get(loop->GetRoot());
++    if (!solved_width.has_value()) {
++      return global;
++    }
++    LoopMemoryAccessCollector collector;
++    collector.Collect(loop->GetRoot());
++    if (collector.accesses.empty()) {
++      return global;
++    }
++    Fragment layout = loop->GetLoopLayout();
++    if (!layout.defined()) {
++      return std::nullopt;
++    }
++    auto slots = ConstantProduct(layout->OutputShape());
++    auto threads = ConstantCount(layout->ThreadExtent());
++    if (!slots.has_value() || !threads.has_value()) {
++      return std::nullopt;
++    }
++    int64_t global_accesses = 0;
++    for (const auto &access : collector.accesses) {
++      if (access.symbolic_repeat || access.repeat < 0) {
++        return std::nullopt;
++      }
++      global_accesses = AddCost(global_accesses, access.repeat);
++    }
++    int64_t issues = MultiplyCost(
++        CeilDiv(slots.value(), solved_width.value()->value), global_accesses);
++    int64_t issue_bytes =
++        MultiplyCost(threads.value(), MaxVectorLoadBits(target_, true) / 8);
++    return std::max(global, MultiplyCost(issues, issue_bytes));
++  }
++
++  Target target_;
++  ReducerPlanAnalyzer plans_;
++  IOAwareCostModel io_model_;
++  std::vector<int64_t> execution_counts_;
++};
++
++Map<Buffer, Map<String, Any>> ReducerCostSummary(const PrimFunc &function) {
++  Target target = function->GetAttr<Target>(tvm::attr::kTarget).value();
++  ICHECK(TargetIsCuda(target)) << "ReducerCost currently supports CUDA targets";
++  With<Target> target_scope(target);
++  LayoutMap layouts;
++  Map<For, Fragment> loops;
++  Array<Buffer> reducers;
++  PostOrderVisit(function->body, [&](const ObjectRef &object) {
++    if (auto block = object.as<SBlock>()) {
++      if (auto annotation = block.value()->annotations.Get(attr::kLayoutMap)) {
++        for (const auto &[buffer, layout] :
++             Downcast<LayoutMap>(annotation.value())) {
++          layouts.Set(buffer, layout);
++        }
++      }
++      for (const Buffer &buffer : block.value()->alloc_buffers) {
++        if (IsReducerV2Buffer(buffer)) {
++          reducers.push_back(buffer);
++        }
++      }
++    } else if (auto loop = object.as<For>()) {
++      if (auto layout =
++              loop.value()->annotations.Get(attr::kParallelLoopLayout)) {
++        loops.Set(loop.value(), Downcast<Fragment>(layout.value()));
++      }
++    }
++  });
++  auto plans = ReducerPlanAnalyzer(function).Analyze(layouts, loops, reducers);
++  ICHECK(plans.has_value())
++      << "ReducerCost requires completed layout inference";
++  for (const ReducerPlanInfo &plan : plans.value()) {
++    for (const auto &[buffer, layout] : plan.layout_overrides) {
++      layouts.Set(buffer, layout);
++    }
++  }
++  Map<For, Integer> widths = ReducerVectorWidths(plans.value(), layouts);
++  Map<Buffer, Map<String, Any>> result;
++  for (const ReducerPlanInfo &plan : plans.value()) {
++    Map<String, Any> summary;
++    summary.Set("narrow", plan.narrow);
++    summary.Set("reason", String(plan.reason));
++    summary.Set("batch", plan.batch);
++    Array<Array<Integer>> steps;
++    for (const auto &[threads, scale] : plan.steps) {
++      steps.push_back({Integer(threads), Integer(scale)});
++    }
++    summary.Set("steps", steps);
++    auto features = ExtractReducerCost(plan, widths, target);
++    summary.Set("known", features.has_value());
++    if (features.has_value()) {
++      Array<Integer> widths;
++      for (int width : features->vector_widths) {
++        widths.push_back(Integer(width));
++      }
++      summary.Set("vector_widths", widths);
++      summary.Set("local_issues", features->local_issues);
++      summary.Set("shared_issues", features->shared_issues);
++      summary.Set("shuffle_issues", features->shuffle_issues);
++      summary.Set("shared_rounds", features->shared_rounds);
++      summary.Set("barriers", features->barriers);
++      summary.Set("combine_issues", features->combine_issues);
++      summary.Set("slots", features->slots);
++      summary.Set("issue_cost", CudaReducerIssueCost(features.value()));
++    }
++    result.Set(plan.reducer, summary);
++  }
++  return result;
++}
++
+ } // namespace
+ 
++TVM_FFI_STATIC_INIT_BLOCK() {
++  ffi::reflection::GlobalDef().def("tl.analysis.ReducerCost",
++                                   ReducerCostSummary);
++}
++
+ std::unique_ptr<LayoutCostModel>
+-LayoutCostModel::Create(const std::string &name, Target target) {
++LayoutCostModel::Create(const std::string &name, Target target,
++                        const PrimFunc &function,
++                        const std::vector<ObjectRef> &statements) {
+   if (name == "io-aware") {
+     return std::make_unique<IOAwareCostModel>(std::move(target));
+   }
+-  if (name == "register-count") {
++  if (name != "register-count") {
++    LOG(FATAL) << "Unknown layout cost model \"" << name
++               << "\" for pass config `tl.layout_cost_model`; valid values "
++                  "are \"register-count\" (default) and \"io-aware\".";
++  }
++  bool has_reducer = std::any_of(
++      statements.begin(), statements.end(), [](const ObjectRef &statement) {
++        const auto *call = statement.as<CallNode>();
++        return call != nullptr && call->op.same_as(FinalizeReducerV2Op::Get());
++      });
++  if (!TargetIsCuda(target) || !has_reducer) {
++    return std::make_unique<RegisterCountCostModel>();
++  }
++  ICHECK(function.defined()) << "reduction-aware scoring requires a PrimFunc";
++  ExecutionCountCollector collector;
++  collector.Collect(function);
++  if (!collector.known) {
+     return std::make_unique<RegisterCountCostModel>();
+   }
+-  LOG(FATAL) << "Unknown layout cost model \"" << name
+-             << "\" for pass config `tl.layout_cost_model`; valid values "
+-                "are \"register-count\" (default) and \"io-aware\".";
+-  return nullptr; // unreachable
++  std::vector<int64_t> counts;
++  for (const ObjectRef &statement : statements) {
++    auto found = collector.counts.find(statement);
++    if (found == collector.counts.end() || found->second < 0 ||
++        found->second >= kUnknownReductionCost) {
++      DLOG(INFO)
++          << "[ReducerCost] unknown execution count; using register-count";
++      return std::make_unique<RegisterCountCostModel>();
++    }
++    counts.push_back(found->second);
++  }
++  return std::make_unique<ReductionAwareCostModel>(std::move(target), function,
++                                                   std::move(counts));
+ }
+ 
+ } // namespace tl
+diff --git a/src/transform/layout_inference/layout_cost_model.h b/src/transform/layout_inference/layout_cost_model.h
+index e95173085b..2a0bcb97ab 100644
+--- a/src/transform/layout_inference/layout_cost_model.h
++++ b/src/transform/layout_inference/layout_cost_model.h
+@@ -6,7 +6,7 @@
+  * connected component and keeps the cheapest complete layout assignment.
+  * What "cheapest" means is a pluggable policy behind LayoutCostModel:
+  *
+- *  - RegisterCountCostModel (default): total fragment register slots.
++ *  - RegisterCountCostModel (fallback): total fragment register slots.
+  *    Also considers scalar plans at unannotated reducer-update roots,
+  *    scored with the same spill/register ordering as native plans.
+  *  - IOAwareCostModel (layout RFC, design B2): walks the component's
+@@ -16,6 +16,11 @@
+  *    tentative layouts; registers remain the lexicographic tiebreak.
+  *    Available through `tl.layout_cost_model="io-aware"` for opt-in use
+  *    and A/B comparisons.
++ *  - ReductionAwareCostModel (default for CUDA reducers): enumerates vector
++ *    widths and prefers known attempts before comparing spill, global-memory
++ *    and reducer-execution estimates plus a register-slot penalty.
++ *    This is a heuristic score, not a calibrated latency estimate. Physical
++ *    reducer plans use the materializer's narrow/wide and packed decisions.
+  *
+  * Concrete models live in the .cc; callers go through Create().
+  */
+@@ -25,36 +30,59 @@
+ 
+ #include <cstdint>
+ #include <memory>
++#include <optional>
+ #include <string>
+ #include <vector>
+ 
+ #include <tvm/target/target.h>
++#include <tvm/tirx/function.h>
+ 
+ #include "../../op/operator.h"
+ 
+ namespace tvm {
+ namespace tl {
+ 
+-/*! \brief Score of one complete free-mode layout assignment. Compared
+- *  lexicographically: estimated memory cost first, total register count as
+- *  the tiebreak. `mem` includes the estimated local-memory traffic of
+- *  register-array spills (a thread-dependent register-array index demotes
+- *  the whole array to local memory), priced in bytes so it competes
+- *  honestly with the io-aware model's global traffic instead of vetoing
+- *  it. Models that do not estimate global memory leave the global part at
+- *  0, so their ordering is spill bytes, then register count — attempts
+- *  without spills keep the historical register-count ordering untouched. */
++/*! \brief Score of one complete free-mode layout assignment. Known scores
++ *  precede unmeasurable attempts, then compare their combined total_cost.
++ *  Legacy policies and unmeasurable attempts
++ *  leave total_cost unset and retain the mem/execution/regs ordering. Legacy
++ *  policies also leave execution at zero.
++ *  `mem` includes the estimated
++ * local-memory traffic of register-array spills (a thread-dependent
++ * register-array index demotes the whole array to local memory), priced in
++ * bytes so it competes honestly with the io-aware model's global traffic
++ * instead of vetoing it. Models that do not estimate global memory leave the
++ * global part at 0, so their ordering is spill bytes, then register count —
++ * attempts without spills keep the historical register-count ordering
++ * untouched. */
+ struct AttemptCost {
+   int64_t mem{0};
++  int64_t execution{0};
+   int64_t regs{0};
++  bool known{true};
++  std::optional<int64_t> total_cost;
+   bool BetterThan(const AttemptCost &other) const {
++    if (known != other.known) {
++      return known;
++    }
++    if (total_cost.has_value() != other.total_cost.has_value()) {
++      return total_cost.has_value();
++    }
++    if (total_cost.has_value()) {
++      return total_cost.value() < other.total_cost.value();
++    }
+     if (mem != other.mem) {
+       return mem < other.mem;
+     }
++    if (execution != other.execution) {
++      return execution < other.execution;
++    }
+     return regs < other.regs;
+   }
+ };
+ 
++enum class ReducerVectorSearch { kNative, kScalar, kAll };
++
+ /*! \brief Policy interface: rank one attempt of a component.
+  *
+  *  `members` indexes the component's operators inside `infer_list` (which
+@@ -71,17 +99,21 @@ class LayoutCostModel {
+   /*! \brief Model name for diagnostics. */
+   virtual const char *Name() const = 0;
+ 
+-  /*! \brief Whether to also try a scalar plan at unannotated reducer roots.
+-   *  Adds one attempt per eligible root, not a Cartesian width search. */
+-  virtual bool ExploreReducerScalarLayouts() const { return false; }
++  /*! \brief Width search at unannotated reducer roots. Alternatives cap
++   *  only the root's first inference, never a Cartesian width search. */
++  virtual ReducerVectorSearch GetReducerVectorSearch() const {
++    return ReducerVectorSearch::kNative;
++  }
+ 
+-  /*! \brief Instantiate the model selected by `tl.layout_cost_model`
+-   *  by name ("io-aware" or "register-count" — each model's Name());
+-   *  unknown names are a hard error listing the valid values. `target`
+-   *  feeds the vectorizer's shared width-cap policy (MaxVectorLoadBits);
+-   *  the legacy model ignores it. */
+-  static std::unique_ptr<LayoutCostModel> Create(const std::string &name,
+-                                                 Target target);
++  /*! \brief Instantiate the existing "register-count" or "io-aware" policy.
++   *  The default register-count policy automatically uses reduction-aware
++   *  scoring for CUDA reducers; there is no separate configuration switch.
++   *  Unknown names are a hard error. `target` feeds the vectorizer's shared
++   *  width-cap policy (MaxVectorLoadBits); the fallback model ignores it. */
++  static std::unique_ptr<LayoutCostModel>
++  Create(const std::string &name, Target target,
++         const tirx::PrimFunc &function = tirx::PrimFunc(),
++         const std::vector<ffi::ObjectRef> &statements = {});
+ };
+ 
+ } // namespace tl
+diff --git a/src/transform/layout_inference/layout_inference.cc b/src/transform/layout_inference/layout_inference.cc
+index 07466c6579..06b4a0a85d 100644
+--- a/src/transform/layout_inference/layout_inference.cc
++++ b/src/transform/layout_inference/layout_inference.cc
+@@ -713,6 +713,7 @@ class BufferUseDefCollector : public IRVisitorWithAnalyzer {
+   }
+ 
+   void Collect(const PrimFunc &f) {
++    function_ = f;
+     for (const auto &[_, buffer] : f->buffer_map) {
+       if (buffer_data_to_buffers_.count(buffer->data)) {
+         auto buffers = buffer_data_to_buffers_[buffer->data];
+@@ -1312,6 +1313,7 @@ class BufferUseDefCollector : public IRVisitorWithAnalyzer {
+   std::vector<Range> thread_bounds_vec_;
+   std::vector<std::unique_ptr<arith::Analyzer>> analyzer_vec_;
+   Target target_;
++  PrimFunc function_;
+   LayoutMap annotated_layout_map_;
+ 
+   std::vector<TileOperator> BackupInferList() {
+@@ -1341,7 +1343,8 @@ class BufferUseDefCollector : public IRVisitorWithAnalyzer {
+       int attempt_root, const std::vector<int> &members,
+       const LayoutMap &base_layout_map, const LayoutMap &strict_layout_map,
+       const std::vector<std::pair<Buffer, Fragment>> &seed_layouts,
+-      const LayoutCostModel &cost_model, int candidate_vector_size_limit = 0) {
++      const LayoutCostModel &cost_model, int candidate_vector_size_limit = 0,
++      std::vector<Fragment> *seen_root_layouts = nullptr) {
+     auto back_infer_list = BackupInferList();
+     LayoutMap tmp_layout_map = base_layout_map;
+     // A failed attempt can leave pending propagation work. Keep both the
+@@ -1360,6 +1363,20 @@ class BufferUseDefCollector : public IRVisitorWithAnalyzer {
+       // solved layout is frozen; propagation and later visits use normal args.
+       RunInferStep(attempt_root, InferLevel::kFree, true, tmp_layout_map,
+                    strict_layout_map, q, in_queue, candidate_vector_size_limit);
++      if (seen_root_layouts != nullptr) {
++        Fragment root_layout =
++            Downcast<ParallelOp>(infer_list_[attempt_root])->GetLoopLayout();
++        for (const Fragment &seen : *seen_root_layouts) {
++          if (root_layout->IsEqual(seen.get())) {
++            infer_list_ = std::move(back_infer_list);
++            DLOG(INFO) << "[ReducerVectorPlan] duplicate root layout: root="
++                       << attempt_root
++                       << " limit=" << candidate_vector_size_limit;
++            return std::nullopt;
++          }
++        }
++        seen_root_layouts->push_back(root_layout);
++      }
+       FinishInferQueue(InferLevel::kFree, tmp_layout_map, strict_layout_map, q,
+                        in_queue);
+       for (int other : members) {
+@@ -1457,8 +1474,8 @@ class BufferUseDefCollector : public IRVisitorWithAnalyzer {
+ 
+     // For each component, try each op as root, and determine the least
+     // replicated one
+-    std::unique_ptr<LayoutCostModel> cost_model =
+-        LayoutCostModel::Create(tl_config::LayoutCostModelName(), target_);
++    std::unique_ptr<LayoutCostModel> cost_model = LayoutCostModel::Create(
++        tl_config::LayoutCostModelName(), target_, function_, infer_list_stmt_);
+     DLOG(INFO) << "[InferInFreeMode] cost model: " << cost_model->Name();
+     for (auto &&[root, members] : components) {
+       DLOG(INFO) << "======================= processing component " << root
+@@ -1482,29 +1499,59 @@ class BufferUseDefCollector : public IRVisitorWithAnalyzer {
+       // slots; the existing cost model decides whether that is worthwhile.
+       for (int attempt_infer_root : members) {
+         const auto *loop = infer_list_[attempt_infer_root].as<ParallelOpNode>();
+-        bool try_scalar =
+-            cost_model->ExploreReducerScalarLayouts() && loop &&
++        ReducerVectorSearch search = cost_model->GetReducerVectorSearch();
++        bool try_alternatives =
++            search != ReducerVectorSearch::kNative && loop &&
+             loop->HasReducerUpdates() && !loop->GetLoopLayout().defined() &&
+             !loop->annotated_layout_unbound_.defined() &&
+             !loop->GetRoot()->annotations.count(attr::kCoalescedWidth);
+-        for (int candidate_vector_size_limit : {0, 1}) {
+-          if (candidate_vector_size_limit != 0 && !try_scalar) {
+-            continue;
++        std::vector<int> limits{0};
++        if (try_alternatives) {
++          if (search == ReducerVectorSearch::kScalar) {
++            limits.push_back(1);
++          } else {
++            LayoutInferArgs args{
++                target_,    thread_bounds_vec_[attempt_infer_root],
++                layout_map, analyzer_vec_[attempt_infer_root].get(),
++                {},         bind_var_to_expr_,
++                false,      strict_layout_map};
++            for (int width = loop->GetPlanVectorSize(args) / 2; width >= 1;
++                 width /= 2) {
++              limits.push_back(width);
++            }
+           }
++        }
++        std::vector<Fragment> seen_root_layouts;
++        for (int candidate_vector_size_limit : limits) {
+           DLOG(INFO) << "----------------------- try root "
+                      << attempt_infer_root << " members " << members.size()
+                      << " candidate_vector_size_limit="
+                      << candidate_vector_size_limit << '\n';
+           auto outcome = RunOneAttempt(
+               attempt_infer_root, members, layout_map, strict_layout_map,
+-              /*seed_layouts=*/{}, *cost_model, candidate_vector_size_limit);
++              /*seed_layouts=*/{}, *cost_model, candidate_vector_size_limit,
++              try_alternatives && search == ReducerVectorSearch::kAll
++                  ? &seen_root_layouts
++                  : nullptr);
+           if (!outcome) {
+             continue;
+           }
+           DLOG(INFO) << "[InferInFreeMode] attempt root " << attempt_infer_root
+                      << " cost model " << cost_model->Name()
+                      << " output: mem=" << outcome->cost.mem
++                     << " total=" << outcome->cost.total_cost.value_or(-1)
++                     << " execution=" << outcome->cost.execution
+                      << " regs=" << outcome->cost.regs;
++          if (search == ReducerVectorSearch::kAll &&
++              tl_config::ReducerPlanVerboseEnabled()) {
++            LOG(INFO) << "[ReducerVectorPlan] root=" << attempt_infer_root
++                      << " limit=" << candidate_vector_size_limit
++                      << " known=" << outcome->cost.known
++                      << " total=" << outcome->cost.total_cost.value_or(-1)
++                      << " spill=" << outcome->cost.mem
++                      << " execution=" << outcome->cost.execution
++                      << " regs=" << outcome->cost.regs;
++          }
+           // Ties keep the earliest root and its native plan. The scalar
+           // alternative must improve the score to replace the same root.
+           if (!has_best || outcome->cost.BetterThan(best_cost) ||
+@@ -1543,6 +1590,8 @@ class BufferUseDefCollector : public IRVisitorWithAnalyzer {
+       DLOG(INFO) << "[InferInFreeMode] final selection: attempt root "
+                  << best_infer_root << " cost model " << cost_model->Name()
+                  << " output: mem=" << best_cost.mem
++                 << " total=" << best_cost.total_cost.value_or(-1)
++                 << " execution=" << best_cost.execution
+                  << " regs=" << best_cost.regs;
+     }
+   }
+diff --git a/src/transform/reducer_plan.h b/src/transform/reducer_plan.h
+new file mode 100644
+index 0000000000..3b52060e18
+--- /dev/null
++++ b/src/transform/reducer_plan.h
+@@ -0,0 +1,57 @@
++#ifndef TVM_TL_TRANSFORM_REDUCER_PLAN_H_
++#define TVM_TL_TRANSFORM_REDUCER_PLAN_H_
++
++#include <memory>
++#include <optional>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include <tvm/tirx/function.h>
++
++#include "../op/reducer.h"
++
++namespace tvm {
++namespace tl {
++
++struct ReducerUpdatePlanSite {
++  Fragment loop_layout;
++  tirx::For loop;
++  PrimExpr execution_count{1};
++};
++
++struct ReducerPlanInfo {
++  tirx::Buffer reducer;
++  ReducerV2OpType op;
++  Range thread_bounds;
++  Fragment storage_layout;
++  ffi::Optional<Fragment> packed_layout;
++  ffi::Optional<tirx::Var> pack_lane_var;
++  std::vector<ReducerUpdatePlanSite> updates;
++  std::vector<std::pair<int, int>> steps;
++  LayoutMap layout_overrides;
++  PrimExpr finalize_count{0};
++  int64_t batch{1};
++  bool narrow{false};
++  bool has_seed{false};
++  std::string reason;
++};
++
++class ReducerPlanAnalyzer {
++public:
++  explicit ReducerPlanAnalyzer(const tirx::PrimFunc &function);
++
++  std::optional<std::vector<ReducerPlanInfo>>
++  Analyze(const LayoutMap &layouts,
++          const ffi::Map<tirx::For, Fragment> &loop_layouts,
++          const ffi::Array<tirx::Buffer> &reducers) const;
++
++private:
++  struct Impl;
++  std::shared_ptr<const Impl> impl_;
++};
++
++} // namespace tl
++} // namespace tvm
++
++#endif // TVM_TL_TRANSFORM_REDUCER_PLAN_H_
+diff --git a/src/transform/reducer_plan_materialize.cc b/src/transform/reducer_plan_materialize.cc
+index 8cd494e4a7..5ad1283320 100644
+--- a/src/transform/reducer_plan_materialize.cc
++++ b/src/transform/reducer_plan_materialize.cc
+@@ -80,6 +80,7 @@
+ #include "arith/ir_mutator_with_analyzer.h"
+ #include "arith/ir_visitor_with_analyzer.h"
+ #include "backend/common/op/reduce.h"
++#include "reducer_plan.h"
+ 
+ namespace tvm {
+ namespace tl {
+@@ -121,6 +122,8 @@ struct UpdateSite {
+   // optimization uses the innermost one as its lane source.
+   Array<Var> serial_vars;
+   Array<PrimExpr> serial_extents;
++  For loop;
++  PrimExpr execution_count{1};
+ };
+ 
+ struct EpochInfo {
+@@ -132,6 +135,7 @@ struct EpochInfo {
+   std::vector<UpdateSite> updates;
+   Buffer dst;
+   int64_t batch{1};
++  PrimExpr finalize_count{0};
+   // False when some structural prerequisite for plan analysis is missing
+   // (e.g. an update site without a solved loop layout).
+   bool analyzable{true};
+@@ -139,6 +143,9 @@ struct EpochInfo {
+ 
+ class ReducerEpochCollector : public IRVisitorWithAnalyzer {
+ public:
++  explicit ReducerEpochCollector(bool collect_unresolved_loops = false)
++      : collect_unresolved_loops_(collect_unresolved_loops) {}
++
+   std::unordered_map<const VarNode *, EpochInfo> epochs_;
+ 
+   void Collect(const PrimFunc &f) { VisitStmt(f->body); }
+@@ -175,11 +182,17 @@ class ReducerEpochCollector : public IRVisitorWithAnalyzer {
+ 
+   void VisitStmt_(const ForNode *op) final {
+     if (op->kind == ForKind::kParallel &&
+-        op->annotations.count(tl::attr::kParallelLoopLayout)) {
++        (op->annotations.count(tl::attr::kParallelLoopLayout) ||
++         (collect_unresolved_loops_ && !cur_loop_.defined()))) {
+       auto prev_layout = cur_loop_layout_;
+       auto prev_vars = cur_loop_vars_;
+-      cur_loop_layout_ = Downcast<Fragment>(
+-          op->annotations.Get(tl::attr::kParallelLoopLayout).value());
++      auto prev_loop = cur_loop_;
++      cur_loop_ = GetRef<For>(op);
++      if (auto layout = op->annotations.Get(tl::attr::kParallelLoopLayout)) {
++        cur_loop_layout_ = Downcast<Fragment>(layout.value());
++      } else {
++        cur_loop_layout_ = std::nullopt;
++      }
+       // Gather the consecutive parallel nest the annotation covers.
+       Array<Var> vars;
+       const ForNode *cur = op;
+@@ -200,16 +213,28 @@ class ReducerEpochCollector : public IRVisitorWithAnalyzer {
+       IRVisitorWithAnalyzer::VisitStmt_(op);
+       cur_loop_layout_ = prev_layout;
+       cur_loop_vars_ = prev_vars;
++      cur_loop_ = prev_loop;
+       cur_serial_vars_ = prev_serial_vars;
+       cur_serial_extents_ = prev_serial_extents;
+       return;
+     }
+-    if (op->kind == ForKind::kSerial && cur_loop_layout_.defined()) {
++    if (op->kind != ForKind::kParallel) {
++      PrimExpr previous_count = execution_count_;
++      if (collect_unresolved_loops_) {
++        execution_count_ = analyzer_.Simplify(
++            execution_count_ * cast(DataType::Int(64), op->extent));
++      }
++      if (op->kind != ForKind::kSerial || !cur_loop_.defined()) {
++        IRVisitorWithAnalyzer::VisitStmt_(op);
++        execution_count_ = previous_count;
++        return;
++      }
+       cur_serial_vars_.push_back(op->loop_var);
+       cur_serial_extents_.push_back(op->extent);
+       IRVisitorWithAnalyzer::VisitStmt_(op);
+       cur_serial_vars_.pop_back();
+       cur_serial_extents_.pop_back();
++      execution_count_ = previous_count;
+       return;
+     }
+     IRVisitorWithAnalyzer::VisitStmt_(op);
+@@ -238,11 +263,13 @@ class ReducerEpochCollector : public IRVisitorWithAnalyzer {
+                                 : epochs_.end();
+       if (it != epochs_.end()) {
+         EpochInfo *epoch = &it->second;
+-        if (cur_loop_layout_.defined()) {
++        if (cur_loop_layout_.defined() ||
++            (collect_unresolved_loops_ && cur_loop_.defined())) {
+           ReducerUpdateArgs update = ParseReducerUpdate(op);
+-          epoch->updates.push_back(UpdateSite{
+-              cur_loop_layout_.value(), cur_loop_vars_, update.indices,
+-              update.value, cur_serial_vars_, cur_serial_extents_});
++          epoch->updates.push_back(
++              UpdateSite{cur_loop_layout_.value_or(Fragment()), cur_loop_vars_,
++                         update.indices, update.value, cur_serial_vars_,
++                         cur_serial_extents_, cur_loop_, execution_count_});
+         } else {
+           epoch->analyzable = false;
+         }
+@@ -251,6 +278,10 @@ class ReducerEpochCollector : public IRVisitorWithAnalyzer {
+     }
+     if (op->op.same_as(FinalizeReducerV2Op::Get())) {
+       if (EpochInfo *epoch = FindEpoch(op->args[0])) {
++        if (collect_unresolved_loops_) {
++          epoch->finalize_count =
++              analyzer_.Simplify(epoch->finalize_count + execution_count_);
++        }
+         if (auto call2 = op->args[1].as<CallNode>()) {
+           if (call2->op.same_as(region())) {
+             if (auto load = call2->args[0].as<BufferLoadNode>()) {
+@@ -284,6 +315,9 @@ class ReducerEpochCollector : public IRVisitorWithAnalyzer {
+   }
+ 
+   IterVar thread_var_;
++  bool collect_unresolved_loops_{false};
++  For cur_loop_;
++  PrimExpr execution_count_{IntImm(DataType::Int(64), 1)};
+   Optional<Fragment> cur_loop_layout_;
+   Array<Var> cur_loop_vars_;
+   Array<Var> cur_serial_vars_;
+@@ -347,6 +381,45 @@ struct UseGraph {
+   std::vector<CopyEdge> copies;
+ };
+ 
++UseGraph CollectReducerUseGraph(const Stmt &stmt) {
++  UseGraph graph;
++  PostOrderVisit(stmt, [&](const ObjectRef &object) {
++    if (const auto *load = object.as<BufferLoadNode>()) {
++      graph.census[load->buffer->data.get()].loads++;
++    } else if (const auto *store = object.as<BufferStoreNode>()) {
++      graph.census[store->buffer->data.get()].stores++;
++    } else if (const auto *call = object.as<CallNode>()) {
++      auto region_buffer = [](const PrimExpr &arg) -> Buffer {
++        if (auto region_call = arg.as<CallNode>()) {
++          if (region_call->op.same_as(region())) {
++            if (auto load = region_call->args[0].as<BufferLoadNode>()) {
++              return load->buffer;
++            }
++          }
++        }
++        return Buffer();
++      };
++      if (call->op.same_as(Copy::Get()) && call->args.size() >= 2) {
++        Buffer src = region_buffer(call->args[0]);
++        Buffer dst = region_buffer(call->args[1]);
++        if (src.defined() && dst.defined()) {
++          graph.census[src->data.get()].copy_src++;
++          graph.census[dst->data.get()].copy_dst++;
++          graph.copies.push_back(CopyEdge{src->data.get(), dst->data.get(),
++                                          IsGlobalBuffer(dst),
++                                          IsFragmentBuffer(dst), dst});
++        }
++      } else if (call->op.same_as(FinalizeReducerV2Op::Get())) {
++        Buffer dst = region_buffer(call->args[1]);
++        if (dst.defined()) {
++          graph.census[dst->data.get()].finalize_dst++;
++        }
++      }
++    }
++  });
++  return graph;
++}
++
+ /*! \brief Check the destination override chain rooted at `root` and collect
+  *  the downstream fragments (excluding the root) that must be overridden
+  *  with it. Returns false when any buffer on the chain has uses beyond
+@@ -593,6 +666,31 @@ DeriveNarrowLowering(const EpochInfo &epoch, const PartialFragment &partial,
+   return decision;
+ }
+ 
++std::optional<NarrowDecision>
++SelectNarrowReducerPlan(const EpochInfo &epoch, const LayoutMap &known_layouts,
++                        const UseGraph &use_graph, arith::Analyzer *analyzer,
++                        std::string *reason) {
++  auto entry = known_layouts.Get(epoch.buffer);
++  if (!entry.has_value()) {
++    *reason = "no solved partial layout for this epoch";
++    return std::nullopt;
++  }
++  PartialFragment partial = Downcast<PartialFragment>(entry.value());
++  const int64_t *combine = as_const_int(partial->CombineSize());
++  const int64_t *replicate = as_const_int(partial->ReplicateExtent());
++  ICHECK(combine != nullptr && replicate != nullptr)
++      << "reducer `" << epoch.buffer->name
++      << "` carries a non-constant partial decomposition: "
++      << partial->DebugOutput();
++  if (*combine == *replicate && *replicate == epoch.thread_extent &&
++      partial->IsCompletedReplicated()) {
++    *reason = "FullParticipant partial (wide fallback)";
++    return std::nullopt;
++  }
++  return DeriveNarrowLowering(epoch, partial, known_layouts, use_graph,
++                              analyzer, reason);
++}
++
+ // ---------------------------------------------------------------------------
+ // Phase C: materialization
+ // ---------------------------------------------------------------------------
+@@ -611,7 +709,7 @@ class ReducerPlanAndMaterializeRewriter : public IRMutatorWithAnalyzer {
+     // partial layout; the per-buffer use census decides whether an inferred
+     // destination layout may be replaced.
+     Map<Buffer, Layout> known_layouts;
+-    UseGraph use_graph;
++    UseGraph use_graph = CollectReducerUseGraph(f->body);
+     PostOrderVisit(f->body, [&](const ObjectRef &obj) {
+       if (const auto *block = obj.as<SBlockNode>()) {
+         if (auto anno = block->annotations.Get(tl::attr::kLayoutMap)) {
+@@ -621,37 +719,6 @@ class ReducerPlanAndMaterializeRewriter : public IRMutatorWithAnalyzer {
+             }
+           }
+         }
+-      } else if (const auto *load = obj.as<BufferLoadNode>()) {
+-        use_graph.census[load->buffer->data.get()].loads++;
+-      } else if (const auto *store = obj.as<BufferStoreNode>()) {
+-        use_graph.census[store->buffer->data.get()].stores++;
+-      } else if (const auto *call = obj.as<CallNode>()) {
+-        auto region_buffer = [](const PrimExpr &arg) -> Buffer {
+-          if (auto region_call = arg.as<CallNode>()) {
+-            if (region_call->op.same_as(region())) {
+-              if (auto ld = region_call->args[0].as<BufferLoadNode>()) {
+-                return ld->buffer;
+-              }
+-            }
+-          }
+-          return Buffer();
+-        };
+-        if (call->op.same_as(Copy::Get()) && call->args.size() >= 2) {
+-          Buffer src = region_buffer(call->args[0]);
+-          Buffer dst = region_buffer(call->args[1]);
+-          if (src.defined() && dst.defined()) {
+-            use_graph.census[src->data.get()].copy_src++;
+-            use_graph.census[dst->data.get()].copy_dst++;
+-            use_graph.copies.push_back(
+-                CopyEdge{src->data.get(), dst->data.get(), IsGlobalBuffer(dst),
+-                         IsFragmentBuffer(dst), dst});
+-          }
+-        } else if (call->op.same_as(FinalizeReducerV2Op::Get())) {
+-          Buffer dst = region_buffer(call->args[1]);
+-          if (dst.defined()) {
+-            use_graph.census[dst->data.get()].finalize_dst++;
+-          }
+-        }
+       }
+     });
+ 
+@@ -675,47 +742,8 @@ class ReducerPlanAndMaterializeRewriter : public IRMutatorWithAnalyzer {
+       // unguarded updates. Only the destination-containment lowerability
+       // gate can still demote a narrow node at materialize.
+       std::string reason;
+-      std::optional<NarrowDecision> decision;
+-      const PartialFragmentNode *partial = nullptr;
+-      Optional<PartialFragment> partial_ref;
+-      if (auto partial_entry = known_layouts.Get(epoch.buffer)) {
+-        partial_ref = Downcast<PartialFragment>(partial_entry.value());
+-        partial = partial_ref.value().get();
+-        ICHECK(partial != nullptr) << "reducer `" << epoch.buffer->name
+-                                   << "` carries a non-partial layout: "
+-                                   << partial_entry.value()->DebugOutput();
+-      }
+-      bool node_narrow = false;
+-      if (partial == nullptr) {
+-        reason = "no solved partial layout for this epoch";
+-      } else {
+-        const int64_t *combine = as_const_int(partial->CombineSize());
+-        const int64_t *rep = as_const_int(partial->ReplicateExtent());
+-        ICHECK(combine != nullptr && rep != nullptr)
+-            << "reducer `" << epoch.buffer->name
+-            << "` carries a non-constant partial decomposition: "
+-            << partial->DebugOutput();
+-        bool full_participant = (*combine == *rep) &&
+-                                (*rep == epoch.thread_extent) &&
+-                                partial->IsCompletedReplicated();
+-        node_narrow = !full_participant;
+-        if (!node_narrow) {
+-          reason = "FullParticipant partial (wide fallback)";
+-        }
+-      }
+-      if (node_narrow) {
+-        decision =
+-            DeriveNarrowLowering(epoch, partial_ref.value(), known_layouts,
+-                                 use_graph, &analyzer, &reason);
+-        if (!decision.has_value()) {
+-          // Destination containment demoted the epoch: the node keeps its
+-          // narrow decomposition for cost accounting; the physical plan
+-          // falls back to FullParticipant.
+-          DLOG(INFO) << "[ReducerPlan] narrow partial of `"
+-                     << epoch.buffer->name
+-                     << "` demoted to the wide plan: " << reason;
+-        }
+-      }
++      std::optional<NarrowDecision> decision = SelectNarrowReducerPlan(
++          epoch, known_layouts, use_graph, &analyzer, &reason);
+       bool verbose = tl_config::ReducerPlanVerboseEnabled();
+       if (decision.has_value()) {
+         std::string msg = "[ReducerPlan] `" + std::string(epoch.buffer->name) +
+@@ -1261,6 +1289,93 @@ class ReducerPlanAndMaterializeRewriter : public IRMutatorWithAnalyzer {
+ 
+ } // namespace
+ 
++struct ReducerPlanAnalyzer::Impl {
++  std::unordered_map<Var, EpochInfo, ObjectPtrHash, ObjectPtrEqual> epochs;
++  UseGraph use_graph;
++};
++
++ReducerPlanAnalyzer::ReducerPlanAnalyzer(const PrimFunc &function) {
++  auto impl = std::make_shared<Impl>();
++  ReducerEpochCollector collector(true);
++  collector.Collect(function);
++  for (auto &[variable, epoch] : collector.epochs_) {
++    impl->epochs.emplace(GetRef<Var>(variable), std::move(epoch));
++  }
++  impl->use_graph = CollectReducerUseGraph(function->body);
++  impl_ = std::move(impl);
++}
++
++std::optional<std::vector<ReducerPlanInfo>>
++ReducerPlanAnalyzer::Analyze(const LayoutMap &layouts,
++                             const Map<For, Fragment> &loop_layouts,
++                             const Array<Buffer> &reducers) const {
++  std::vector<ReducerPlanInfo> result;
++  for (const Buffer &buffer : reducers) {
++    auto found = impl_->epochs.find(buffer->data);
++    if (found == impl_->epochs.end() || !layouts.count(buffer)) {
++      return std::nullopt;
++    }
++    EpochInfo epoch = found->second;
++    if (!epoch.analyzable || epoch.thread_extent <= 0 || !epoch.dst.defined()) {
++      return std::nullopt;
++    }
++    for (UpdateSite &site : epoch.updates) {
++      if (auto layout = loop_layouts.Get(site.loop)) {
++        site.loop_layout = layout.value();
++      }
++      if (!site.loop_layout.defined()) {
++        return std::nullopt;
++      }
++    }
++    ReducerPlanInfo info;
++    info.reducer = buffer;
++    info.op = epoch.op;
++    info.thread_bounds = Range::FromMinExtent(Integer(epoch.thread_min),
++                                              Integer(epoch.thread_extent));
++    info.batch = epoch.batch;
++    info.finalize_count = epoch.finalize_count;
++    info.has_seed = epoch.seed.defined();
++    arith::Analyzer analyzer;
++    auto decision = SelectNarrowReducerPlan(epoch, layouts, impl_->use_graph,
++                                            &analyzer, &info.reason);
++    if (decision.has_value()) {
++      info.narrow = true;
++      info.storage_layout = decision->storage_layout;
++      info.steps = decision->steps;
++      if (decision->packed) {
++        info.packed_layout = decision->packed_layout;
++        info.pack_lane_var = decision->pack_lane_var;
++      }
++      if (decision->override_dst_layout) {
++        info.layout_overrides.Set(epoch.dst, decision->storage_layout);
++        for (const Buffer &staged : decision->override_chain) {
++          info.layout_overrides.Set(staged, decision->storage_layout);
++        }
++      }
++    } else {
++      info.storage_layout =
++          Fragment::FullyReplicated(buffer->shape, Integer(epoch.thread_extent))
++              ->BindThreadRange(info.thread_bounds);
++      if (epoch.thread_extent > 1) {
++        info.steps.emplace_back(static_cast<int>(epoch.thread_extent), 1);
++      }
++      auto overrides =
++          TryWideFinalizeDstOverride(epoch, layouts, impl_->use_graph);
++      if (overrides.has_value()) {
++        for (const auto &[destination, layout] : overrides.value()) {
++          info.layout_overrides.Set(destination, layout);
++        }
++      }
++    }
++    for (const UpdateSite &site : epoch.updates) {
++      info.updates.push_back(
++          {site.loop_layout, site.loop, site.execution_count});
++    }
++    result.push_back(std::move(info));
++  }
++  return result;
++}
++
+ using namespace tirx::transform;
+ 
+ tvm::transform::Pass ReducerPlanAndMaterialize() {
+diff --git a/testing/python/transform/test_tilelang_transform_layout_inference.py b/testing/python/transform/test_tilelang_transform_layout_inference.py
+index 76a8dc25a7..4262aa2893 100644
+--- a/testing/python/transform/test_tilelang_transform_layout_inference.py
++++ b/testing/python/transform/test_tilelang_transform_layout_inference.py
+@@ -110,7 +110,7 @@ def main(
+         # tvm.ir.assert_structural_equal(mod, ref_mod)
+ 
+ 
+-def test_register_count_is_default_layout_cost_model():
++def test_non_reducer_defaults_to_register_count():
+     @T.prim_func
+     def main(
+         S: T.Tensor((2,), T.float32),
+@@ -272,6 +272,7 @@ def test_column_broadcast_fragment_values(block_n):
+     assert torch.equal(out, expected)
+ 
+ 
++@tilelang.testing.requires_cuda
+ def test_spill_pricing_no_false_positive_on_strided_fragment_layouts():
+     """Distilled from hai-llm's kl_div_with_mask large-d kernel (a 1.23-1.29x
+     production regression): a pipelined scan staging fp32/int8 chunks through
+@@ -340,6 +341,7 @@ def kernel(
+     kern = tl.compile(
+         kernel,
+         out_idx=-1,
++        target="cuda",
+         pass_configs={
+             # Pin 128-bit vectorization so the asserted distribution (float4,
+             # thread stride 4) is architecture-independent.
+diff --git a/testing/python/transform/test_tilelang_transform_reduction_aware_layout.py b/testing/python/transform/test_tilelang_transform_reduction_aware_layout.py
+new file mode 100644
+index 0000000000..7c7648c520
+--- /dev/null
++++ b/testing/python/transform/test_tilelang_transform_reduction_aware_layout.py
+@@ -0,0 +1,543 @@
++import importlib.util
++import re
++from pathlib import Path
++
++import pytest
++import torch
++
++import tilelang as tl
++import tilelang.language as T
++import tilelang.testing
++from tilelang import tvm
++
++
++def load_factory(relative_path, name="make_reducer"):
++    path = Path(__file__).resolve().parents[3] / relative_path
++    spec = importlib.util.spec_from_file_location("reduction_aware", path)
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return getattr(module, name)
++
++
++def make_reducer(**kwargs):
++    return load_factory("maint/layout_inference/cases/reduction_aware.py")(**kwargs)
++
++
++def make_communication_reducer(**kwargs):
++    return load_factory("maint/layout_inference/cases/reduction_aware.py", "make_communication_reducer")(**kwargs)
++
++
++def make_shared_reducer(**kwargs):
++    return load_factory("maint/layout_inference/cases/reduction_aware_shared.py")(**kwargs)
++
++
++def make_weighted_pooling(**kwargs):
++    return load_factory("maint/layout_inference/bench_reduction_aware.py", "make_weighted_pooling")(**kwargs)
++
++
++def reducer_candidate_costs(diagnostics):
++    """Exclude unrelated register-count components with zero execution cost."""
++    costs = [
++        {name: int(value) for name, value in re.findall(r"(\w+)=(-?\d+)", line)}
++        for line in diagnostics.splitlines()
++        if "[ReducerVectorPlan]" in line
++    ]
++    return [cost for cost in costs if cost["execution"] > 0]
++
++
++def infer(factory=make_reducer, model=None, target=None, pass_configs=None, **kwargs):
++    target = tvm.target.Target({"kind": "cuda", "arch": "sm_90"} if target is None else target)
++    configs = dict(pass_configs or {})
++    if model is not None:
++        configs["tl.layout_cost_model"] = model
++    with target, tl.transform.PassContext(config=configs):
++        module = tvm.IRModule({"main": factory(**kwargs)})
++        module = tvm.tirx.transform.BindTarget(target)(module)
++        module = tl.transform.MaterializeKernelLaunch()(module)
++        module = tl.transform.LayoutInference()(module)
++    layouts = {}
++
++    def collect(node):
++        if isinstance(node, tvm.tirx.SBlock):
++            for buffer, layout in node.annotations.get("layout_map", {}).items():
++                layouts[buffer.name] = layout
++
++    tvm.tirx.stmt_functor.post_order_visit(module["main"].body, collect)
++    return module["main"], layouts
++
++
++def reducer_cost(function):
++    return {buffer.name: dict(cost) for buffer, cost in tvm.get_global_func("tl.analysis.ReducerCost")(function).items()}
++
++
++@tilelang.testing.requires_cuda(support_required="compile-only")
++def test_column_reduction_avoids_communication():
++    function, layouts = infer()
++    assert int(layouts["acc"].combine_size) == 1
++    cost = reducer_cost(function)["acc"]
++    assert cost["known"]
++    assert list(cost["steps"]) == []
++    assert cost["barriers"] == cost["shuffle_issues"] == 0
++
++
++@tilelang.testing.requires_cuda(support_required="compile-only")
++def test_default_intermediate_width_beats_both_endpoints():
++    _, automatic = infer(rows=4, columns=256)
++    _, intermediate = infer(rows=4, columns=256, width=2)
++    _, scalar = infer(rows=4, columns=256, width=1)
++    _, native = infer(rows=4, columns=256, width=4)
++    assert automatic["values"].is_equal(intermediate["values"])
++    assert not automatic["values"].is_equal(scalar["values"])
++    assert not automatic["values"].is_equal(native["values"])
++    assert int(automatic["acc"].combine_size) == 1
++
++
++@tilelang.testing.requires_cuda(support_required="compile-only")
++def test_scalar_fp32_arithmetic_is_not_discounted_by_layout_width():
++    native, _ = infer(width=4)
++    scalar, _ = infer(width=1)
++    native_cost = reducer_cost(native)["acc"]
++    scalar_cost = reducer_cost(scalar)["acc"]
++    assert native_cost["local_issues"] == scalar_cost["local_issues"] == 8
++    assert [tuple(map(int, step)) for step in native_cost["steps"]] == [(128, 32)]
++    assert native_cost["barriers"] == 16
++    assert native_cost["issue_cost"] == 544
++    assert scalar_cost["issue_cost"] == 8
++
++
++@tilelang.testing.requires_cuda(support_required="compile-only")
++def test_equal_register_scores_account_for_communication(capfd):
++    scores, features = {}, {}
++    for within_warp in (False, True):
++        function, _ = infer(
++            factory=make_communication_reducer,
++            within_warp=within_warp,
++            pass_configs={"tl.enable_reducer_plan_verbose": True},
++        )
++        candidates = reducer_candidate_costs(capfd.readouterr().err)
++        assert candidates and all(cost["known"] for cost in candidates)
++        scores[within_warp] = min(candidates, key=lambda cost: cost["total"])
++        features[within_warp] = reducer_cost(function)["acc"]
++    for score in scores.values():
++        assert score["regs"] == 16 and score["spill"] == 0
++    block, warp = features[False], features[True]
++    assert block["barriers"] == 16 and block["shuffle_issues"] == 0
++    assert warp["barriers"] == 0 and warp["shuffle_issues"] == 8
++    assert block["local_issues"] == warp["local_issues"]
++    communication_delta = (block["issue_cost"] - warp["issue_cost"]) * 128 * 16
++    assert communication_delta > 0
++    assert scores[False]["execution"] - scores[True]["execution"] == communication_delta
++    assert scores[False]["total"] - scores[True]["total"] == communication_delta
++
++
++@tilelang.testing.requires_cuda
++@pytest.mark.parametrize("within_warp", [False, True])
++def test_equal_register_communication_kernel_correctness(within_warp):
++    kernel = tl.compile(make_communication_reducer(within_warp=within_warp), out_idx=-1, target="cuda")
++    inputs = torch.randn((8, 128), device="cuda")
++    torch.testing.assert_close(kernel(inputs), inputs.sum(dim=0), atol=1e-5, rtol=1e-5)
++
++
++@tilelang.testing.requires_cuda(support_required="compile-only")
++@pytest.mark.parametrize("queries", [1, 32])
++def test_weighted_pooling_selects_less_communication_at_equal_register_cost(queries, capfd):
++    features, scores, layouts = {}, {}, {}
++    for width in (4, 1, None):
++        function, layouts[width] = infer(
++            factory=make_weighted_pooling,
++            groups=1,
++            queries=queries,
++            width=width,
++            pass_configs={"tl.enable_reducer_plan_verbose": True},
++        )
++        candidates = reducer_candidate_costs(capfd.readouterr().err)
++        assert candidates and all(cost["known"] for cost in candidates)
++        scores[width] = min(candidates, key=lambda cost: cost["total"])
++        features[width] = reducer_cost(function)["acc"]
++    assert scores[4]["regs"] == scores[1]["regs"] == scores[None]["regs"] == 18
++    assert all(score["spill"] == 0 for score in scores.values())
++    assert features[4]["local_issues"] == features[1]["local_issues"] == features[None]["local_issues"]
++    assert features[4]["barriers"] == 16 * queries
++    assert features[1]["barriers"] == features[None]["barriers"] == 0
++    assert layouts[None]["values"].is_equal(layouts[1]["values"])
++    assert scores[None]["total"] == scores[1]["total"] < scores[4]["total"]
++
++
++@tilelang.testing.requires_cuda
++@pytest.mark.parametrize("width", [4, 1, None])
++def test_weighted_pooling_kernel_correctness(width):
++    kernel = tl.compile(make_weighted_pooling(groups=4, queries=3, width=width), out_idx=-1, target="cuda")
++    inputs = torch.randn((4, 8, 128), device="cuda")
++    weights = torch.randn((4, 3, 8), device="cuda")
++    expected = (weights.unsqueeze(-1) * inputs.unsqueeze(1)).sum(dim=2)
++    torch.testing.assert_close(kernel(inputs, weights), expected, atol=1e-5, rtol=1e-5)
++
++
++@tilelang.testing.requires_cuda(support_required="compile-only")
++def test_batch_shares_barriers_but_not_value_work():
++    scalar, _ = infer(width=4)
++    batched, _ = infer(width=4, batch=4)
++    scalar_cost = reducer_cost(scalar)["acc"]
++    batched_cost = reducer_cost(batched)["acc"]
++    assert scalar_cost["barriers"] == 4 * batched_cost["barriers"]
++    assert scalar_cost["combine_issues"] == batched_cost["combine_issues"]
++    assert scalar_cost["shared_issues"] == batched_cost["shared_issues"]
++    assert batched_cost["issue_cost"] == 160
++
++
++@tilelang.testing.requires_cuda(support_required="compile-only")
++@pytest.mark.parametrize("width", [None, 1])
++def test_local_complete_ignores_unused_batch(width):
++    function, layouts = infer(width=width, batch=4)
++    cost = reducer_cost(function)["acc"]
++    assert cost["known"]
++    assert int(layouts["acc"].combine_size) == 1
++    assert list(cost["steps"]) == []
++
++
++@tilelang.testing.requires_cuda(support_required="compile-only")
++def test_multiple_updates_and_serial_repeats_do_not_duplicate_finalize():
++    baseline, _ = infer(width=4)
++    repeated, _ = infer(width=4, updates=2, repeats=3)
++    baseline_cost = reducer_cost(baseline)["acc"]
++    repeated_cost = reducer_cost(repeated)["acc"]
++    assert repeated_cost["local_issues"] == 6 * baseline_cost["local_issues"]
++    assert repeated_cost["barriers"] == baseline_cost["barriers"]
++
++
++@tilelang.testing.requires_cuda(support_required="compile-only")
++def test_reduction_axis_updates_remain_scalar():
++    function, layouts = infer(rows=4, columns=256, total=True, width=4)
++    cost = reducer_cost(function)["acc"]
++    assert int(layouts["acc"].combine_size) == 128
++    assert list(map(int, cost["vector_widths"])) == [1]
++    assert cost["shuffle_issues"] > 0
++
++
++@tilelang.testing.requires_cuda(support_required="compile-only")
++@pytest.mark.parametrize(
++    "kwargs, expected",
++    [
++        ({"width": 1}, 1),
++        ({"width": 4}, 4),
++        ({"rows": 4, "columns": 256}, 2),
++        ({"rows": 4, "columns": 256, "total": True, "width": 4}, 1),
++    ],
++)
++def test_predicted_update_width_matches_lowering(kwargs, expected):
++    function, _ = infer(**kwargs)
++    assert list(map(int, reducer_cost(function)["acc"]["vector_widths"])) == [expected]
++    target = tvm.target.Target({"kind": "cuda", "arch": "sm_90"})
++    with target, tl.transform.PassContext():
++        artifact = tl.lower(make_reducer(**kwargs), target=target, enable_device_compile=False)
++    widths = []
++
++    def visit(node):
++        if not isinstance(node, tvm.tirx.BufferStore) or node.buffer.name != "acc":
++            return
++
++        def visit_load(value):
++            if isinstance(value, tvm.tirx.BufferLoad) and value.buffer.same_as(node.buffer):
++                widths.append(node.value.dtype.lanes)
++
++        tvm.tirx.stmt_functor.post_order_visit(node.value, visit_load)
++
++    for device_function in artifact.device_mod.functions.values():
++        tvm.tirx.stmt_functor.post_order_visit(device_function.body, visit)
++    assert max(widths) == expected
++
++
++@tilelang.testing.requires_cuda(support_required="compile-only")
++def test_default_policy_is_reduction_aware_with_or_without_its_existing_name():
++    _, register_count = infer(model="register-count", rows=4, columns=256)
++    _, io_aware = infer(model="io-aware", rows=4, columns=256)
++    _, automatic = infer(rows=4, columns=256)
++    _, native = infer(rows=4, columns=256, width=4)
++    assert register_count["values"].is_equal(automatic["values"])
++    assert io_aware["values"].is_equal(native["values"])
++
++
++@tilelang.testing.requires_cuda(support_required="compile-only")
++def test_unknown_serial_extent_retains_register_count_search():
++    @T.prim_func
++    def kernel(inputs: T.Tensor((4, 256), "float32"), output: T.Tensor((256,), "float32"), count: T.int32):
++        with T.Kernel(1, threads=128):
++            values = T.alloc_fragment((4, 256), "float32")
++            acc = T.alloc_reducer((256,), "float32")
++            result = T.alloc_fragment((256,), "float32")
++            T.copy(inputs, values)
++            T.reducer_init(acc)
++            for _repeat in T.serial(count):
++                for row, column in T.Parallel(4, 256):
++                    T.reducer_update(acc[column], values[row, column])
++            T.finalize_reducer(acc, result)
++            T.copy(result, output)
++
++    _, automatic = infer(factory=lambda: kernel)
++    _, fallback = infer(rows=4, columns=256, width=1)
++    assert automatic["values"].is_equal(fallback["values"])
++    assert automatic["acc"].is_equal(fallback["acc"])
++
++
++@tilelang.testing.requires_cuda(support_required="compile-only")
++@pytest.mark.parametrize("constraints", [{"width": 4}, {"pinned": True}, {"pin_loop": True}])
++def test_explicit_constraints_are_preserved(constraints):
++    factory = load_factory("maint/layout_inference/cases/reducer_scalar_candidates.py")
++    _, automatic = infer(factory=factory, **constraints)
++    _, pinned = infer(factory=factory, width=4)
++    assert int(automatic["acc"].combine_size) == 4
++    assert automatic["values"].is_equal(pinned["values"])
++
++
++@tilelang.testing.requires_cuda(support_required="compile-only")
++def test_annotated_partial_is_authoritative():
++    @T.prim_func
++    def kernel(inputs: T.Tensor((32, 32), "float32"), output: T.Tensor((32,), "float32")):
++        with T.Kernel(1, threads=128):
++            values = T.alloc_fragment((32, 32), "float32")
++            acc = T.alloc_reducer((32,), "float32")
++            result = T.alloc_fragment((32,), "float32")
++            T.annotate_layout({acc: T.PartialFragment((32,), forward_thread_fn=lambda row, replica: row * 4 + replica, replicate=4)})
++            T.copy(inputs, values)
++            T.reducer_init(acc)
++            for row, column in T.Parallel(32, 32):
++                T.reducer_update(acc[row], values[row, column])
++            T.finalize_reducer(acc, result)
++            T.copy(result, output)
++
++    function, layouts = infer(factory=lambda: kernel)
++    assert int(layouts["acc"].combine_size) == 4
++    cost = reducer_cost(function)["acc"]
++    assert cost["shared_rounds"] == 0
++    assert cost["shuffle_issues"] == 2
++    assert cost["issue_cost"] == 18
++
++
++@tilelang.testing.requires_cuda(support_required="compile-only")
++@pytest.mark.parametrize("width", [None, 4])
++def test_cost_tracks_materialization_wide_fallback(width):
++    factory = load_factory(
++        "testing/python/transform/test_tilelang_transform_reducer_scalar_candidates.py", "make_reducer_with_pinned_consumer"
++    )
++    function, _ = infer(factory=factory, width=width)
++    cost = reducer_cost(function)["acc"]
++    if width is None:
++        assert cost["narrow"]
++        assert list(cost["steps"]) == []
++    else:
++        assert not cost["narrow"]
++        assert [tuple(map(int, step)) for step in cost["steps"]] == [(128, 1)]
++        assert cost["barriers"] > 0
++
++
++@tilelang.testing.requires_cuda(support_required="compile-only")
++def test_full_reduction_keeps_native_input_vectorization():
++    factory = load_factory("maint/layout_inference/cases/reducer_scalar_candidates.py")
++    _, automatic = infer(factory=factory, total=True)
++    _, native = infer(factory=factory, total=True, pinned=True)
++    assert int(automatic["acc"].combine_size) == 128
++    assert automatic["values"].is_equal(native["values"])
++
++
++@tilelang.testing.requires_cuda(support_required="compile-only")
++def test_shared_accesses_preserve_native_reducer_cost_ties(capfd):
++    scores, layouts = {}, {}
++    for width in (4, 16):
++        _, layouts[width] = infer(factory=make_shared_reducer, width=width, pass_configs={"tl.enable_reducer_plan_verbose": True})
++        costs = reducer_candidate_costs(capfd.readouterr().err)
++        assert costs and all(cost["known"] and cost["spill"] == 0 for cost in costs)
++        scores[width] = min(cost["total"] for cost in costs)
++    assert scores[4] == scores[16]
++    _, automatic = infer(factory=make_shared_reducer)
++    assert automatic["values"].is_equal(layouts[4]["values"])
++    assert not automatic["values"].is_equal(layouts[16]["values"])
++
++
++@tilelang.testing.requires_cuda(support_required="compile-only")
++@pytest.mark.parametrize("kwargs", [{}, {"repeats": 3}, {"width": 4, "batch": 4}])
++def test_spill_execution_registers_share_total_cost(capfd, kwargs):
++    infer(pass_configs={"tl.enable_reducer_plan_verbose": True}, **kwargs)
++    costs = reducer_candidate_costs(capfd.readouterr().err)
++    assert costs and all(cost["known"] for cost in costs)
++    for cost in costs:
++        assert cost["total"] == cost["spill"] + cost["execution"] + cost["regs"] * 128 * 4
++
++
++@tilelang.testing.requires_cuda(support_required="compile-only")
++@pytest.mark.parametrize("width", [4, 16])
++def test_shared_layout_constraints_are_preserved(capfd, width):
++    _, layouts = infer(factory=make_shared_reducer, width=width, pass_configs={"tl.enable_reducer_plan_verbose": True})
++    costs = reducer_candidate_costs(capfd.readouterr().err)
++    expected = T.Fragment(
++        (2048,),
++        forward_thread_fn=lambda element: element // width % 128,
++        forward_index_fn=lambda element: element // (128 * width) * width + element % width,
++    )
++    assert layouts["values"].is_equal(expected)
++    assert costs and all(cost["known"] for cost in costs)
++
++
++@tilelang.testing.requires_cuda(support_required="compile-only")
++def test_shared_swizzle_does_not_change_reducer_cost(capfd):
++    scores = {}
++    for swizzle in (False, True):
++        infer(factory=make_shared_reducer, swizzle=swizzle, pass_configs={"tl.enable_reducer_plan_verbose": True})
++        costs = reducer_candidate_costs(capfd.readouterr().err)
++        assert costs and all(cost["known"] and cost["total"] >= 0 for cost in costs)
++        scores[swizzle] = min(cost["total"] for cost in costs)
++    assert scores[False] == scores[True]
++
++
++@tilelang.testing.requires_cuda
++@pytest.mark.parametrize("width", [None, 4, 16])
++@pytest.mark.parametrize("swizzle", [False, True])
++def test_mixed_dtype_shared_reduction(width, swizzle):
++    kernel = tl.compile(
++        make_shared_reducer(width=width, swizzle=swizzle),
++        out_idx=-1,
++        target="cuda",
++        pass_configs={"tl.disable_vectorize_256": True},
++    )
++    inputs = torch.randn((2048,), device="cuda")
++    masks = torch.randint(0, 2, (8, 2048), dtype=torch.int8, device="cuda")
++    expected = (inputs * masks.to(torch.float32)).sum().reshape(1)
++    torch.testing.assert_close(kernel(inputs, masks), expected, atol=1e-4, rtol=1e-4)
++
++
++@tilelang.testing.requires_cuda(support_required="compile-only")
++def test_arithmetic_packing_is_target_specific():
++    function, _ = infer(width=4, target={"kind": "cuda", "arch": "sm_100a"})
++    assert reducer_cost(function)["acc"]["local_issues"] == 4
++
++
++@tilelang.testing.requires_cuda(support_required="compile-only")
++def test_forced_baseline_is_not_priced_as_local_complete():
++    function, _ = infer(pass_configs={"tl.reducer_force_baseline": True})
++    cost = reducer_cost(function)["acc"]
++    assert not cost["narrow"]
++    assert [tuple(map(int, step)) for step in cost["steps"]] == [(128, 1)]
++
++
++@tilelang.testing.requires_cuda(support_required="compile-only")
++def test_vector_width_respects_other_updates_in_the_same_loop():
++    @T.prim_func
++    def kernel(inputs: T.Tensor((8, 128), "float32"), columns: T.Tensor((128,), "float32"), total: T.Tensor((1,), "float32")):
++        with T.Kernel(1, threads=128):
++            values = T.alloc_fragment((8, 128), "float32")
++            column_acc = T.alloc_reducer((128,), "float32")
++            total_acc = T.alloc_reducer((1,), "float32")
++            column_result = T.alloc_fragment((128,), "float32")
++            total_result = T.alloc_fragment((1,), "float32")
++            T.copy(inputs, values)
++            T.reducer_init(column_acc)
++            T.reducer_init(total_acc)
++            for row, column in T.Parallel(8, 128, coalesced_width=T.int32(4)):
++                T.reducer_update(column_acc[column], values[row, column])
++                T.reducer_update(total_acc[0], values[row, column])
++            T.finalize_reducer(column_acc, column_result)
++            T.finalize_reducer(total_acc, total_result)
++            T.copy(column_result, columns)
++            T.copy(total_result, total)
++
++    function, _ = infer(factory=lambda: kernel)
++    for cost in reducer_cost(function).values():
++        assert list(map(int, cost["vector_widths"])) == [1]
++
++
++@tilelang.testing.requires_cuda
++@pytest.mark.parametrize("staged", [False, True])
++@pytest.mark.parametrize("total", [False, True])
++def test_direct_memory_reducer_updates(staged, total):
++    outputs = 1 if total else 256
++
++    @T.prim_func
++    def program(inputs: T.Tensor((4, 256), "float32"), output: T.Tensor((outputs,), "float32")):
++        with T.Kernel(1, threads=128):
++            shared = T.alloc_shared((4, 256), "float32")
++            acc = T.alloc_reducer((outputs,), "float32")
++            result = T.alloc_fragment((outputs,), "float32")
++            if staged:
++                T.copy(inputs, shared)
++            T.reducer_init(acc)
++            for row, column in T.Parallel(4, 256):
++                T.reducer_update(acc[0 if total else column], shared[row, column] if staged else inputs[row, column])
++            T.finalize_reducer(acc, result)
++            T.copy(result, output)
++
++    function, _ = infer(factory=lambda: program)
++    cost = reducer_cost(function)["acc"]
++    assert cost["known"]
++    assert cost["local_issues"] == 8
++    if total:
++        assert list(map(int, cost["vector_widths"])) == [1]
++    kernel = tl.compile(program, out_idx=-1, target="cuda")
++    inputs = torch.randn((4, 256), device="cuda")
++    expected = inputs.sum().reshape(1) if total else inputs.sum(dim=0)
++    torch.testing.assert_close(kernel(inputs), expected, atol=1e-4, rtol=1e-4)
++
++
++@tilelang.testing.requires_rocm(support_required="compile-only")
++def test_non_cuda_target_retains_register_count():
++    target = {"kind": "hip", "mcpu": "gfx90a"}
++    _, automatic = infer(target=target, rows=4, columns=256)
++    _, baseline = infer(target=target, rows=4, columns=256, width=1)
++    assert automatic["values"].is_equal(baseline["values"])
++
++
++@tilelang.testing.requires_cuda
++@pytest.mark.parametrize(
++    "kwargs",
++    [
++        {"rows": 7, "seed": 2.5},
++        {"updates": 2, "repeats": 3, "seed": 2.5},
++        {"width": 4, "batch": 4},
++        {"batch": 4},
++        {"batch": 4, "seed": 2.5},
++    ],
++)
++def test_seeded_repeated_and_batched_reductions(kwargs):
++    kernel = tl.compile(make_reducer(**kwargs), out_idx=-1, target="cuda")
++    inputs = torch.randn((kwargs.get("rows", 8), 128), device="cuda")
++    expected = inputs.sum(dim=0) * kwargs.get("updates", 1) * kwargs.get("repeats", 1) + kwargs.get("seed", 0)
++    torch.testing.assert_close(kernel(inputs), expected, atol=1e-4, rtol=1e-4)
++
++
++def check_reduction_aware_kernel(columns, dtype, op):
++    kernel = tl.compile(
++        make_reducer(columns=columns, dtype=dtype, op=op),
++        out_idx=-1,
++        target="cuda",
++    )
++    inputs = torch.randn((8, columns), dtype=getattr(torch, dtype), device="cuda")
++    expected = {"sum": torch.sum, "max": torch.amax, "min": torch.amin}[op](inputs, dim=0)
++    tolerance = 1e-5 if dtype == "float32" else 2e-2
++    torch.testing.assert_close(kernel(inputs), expected, atol=tolerance, rtol=tolerance)
++    assert "tl::AllReduce<" not in kernel.get_kernel_source()
++
++
++@tilelang.testing.requires_cuda
++@pytest.mark.parametrize("columns", [128, 256])
++@pytest.mark.parametrize("dtype", ["float32", "float16"])
++@pytest.mark.parametrize("op", ["sum", "max", "min"])
++def test_reduction_aware_kernel_correctness(columns, dtype, op):
++    check_reduction_aware_kernel(columns, dtype, op)
++
++
++@tilelang.testing.requires_cuda_compute_version_ge(8)
++@pytest.mark.parametrize("columns", [128, 256])
++@pytest.mark.parametrize("op", ["sum", "max", "min"])
++def test_reduction_aware_bfloat16_kernel_correctness(columns, op):
++    check_reduction_aware_kernel(columns, "bfloat16", op)
++
++
++@tilelang.testing.requires_cuda_compute_version_ge(8)
++def test_full_reduction_kernel_correctness():
++    factory = load_factory("maint/layout_inference/cases/reducer_scalar_candidates.py")
++    kernel = tl.compile(factory(total=True), out_idx=-1, target="cuda")
++    inputs = torch.randn((4, 256), device="cuda", dtype=torch.bfloat16)
++    torch.testing.assert_close(kernel(inputs), inputs.float().sum().reshape(1), atol=1e-4, rtol=1e-4)
++    assert "tl::AllReduce<" in kernel.get_kernel_source()
++
++
++if __name__ == "__main__":
++    tilelang.testing.main()
+diff --git a/tilelang/transform/pass_config.py b/tilelang/transform/pass_config.py
+index 83c3fa2159..9f17b3c937 100644
+--- a/tilelang/transform/pass_config.py
++++ b/tilelang/transform/pass_config.py
+@@ -114,16 +114,21 @@ class PassConfigKey(str, Enum):
+     TL_ENABLE_REDUCER_PLAN_VERBOSE = "tl.enable_reducer_plan_verbose"
+     """Log each reducer epoch's chosen physical plan (and narrow-plan
+     rejection reason) at INFO level during ReducerPlanAndMaterialize.
++    The reduction-aware layout policy also logs candidate costs and widths.
+     Default: False"""
+ 
+     TL_LAYOUT_COST_MODEL = "tl.layout_cost_model"
+-    """The cost model that ranks free-mode layout attempts, by name:
++    """The cost model ranking free-mode layout attempts, by name:
+     "io-aware" scores estimated global-memory access cost (vector width /
+     warp coalescing of every fragment<->global copy, weighted by bytes
+-    moved) with register count as the tiebreak; "register-count" is the
+-    total-register-slots-only ordering. When unset, the
+-    ``TILELANG_LAYOUT_COST_MODEL`` environment variable supplies the
+-    default. Default: 'register-count'"""
++    moved) with register count as the tiebreak. The default "register-count"
++    policy automatically searches intermediate vector widths for CUDA
++    reducers and scores spills, local work, memory issues, actual finalize
++    communication, and registers. Other targets, non-reducer components, and
++    unknown serial trip counts retain spill/register ordering. There is no
++    separate reduction-aware switch. When unset, the
++    ``TILELANG_LAYOUT_COST_MODEL`` environment variable supplies the policy.
++    Default: 'register-count'"""
+ 
+     TL_REDUCER_FORCE_BASELINE = "tl.reducer_force_baseline"
+     """Force the canonical FullParticipant baseline for every reducer epoch,

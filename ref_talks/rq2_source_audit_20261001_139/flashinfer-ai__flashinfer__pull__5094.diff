@@ -1,0 +1,1088 @@
+diff --git a/csrc/blackwell_msa/route_manifest.json b/csrc/blackwell_msa/route_manifest.json
+index 71557326963..af8dc9ae8ff 100644
+--- a/csrc/blackwell_msa/route_manifest.json
++++ b/csrc/blackwell_msa/route_manifest.json
+@@ -625,8 +625,8 @@
+         "source_unit": "decode_uniform_fp8_qkv_paged",
+         "normalization_schema": "blackwell-msa-identifiers-v1",
+         "generated_input_sha256": "17923e99f86181a47096b602f5ce008f6c0bb49e22f598bf30190b1daffa7ecd",
+-        "vendored_sha256": "6e180a15405eb3beaf08512066eccf615381780519c02f4664a456844e79b0a3",
+-        "binding_sha256": "353410b94ea95ac1921938327b7a1ac4b39d86a7f312d7fde4c8e3cd41ce8afe",
++        "vendored_sha256": "7210f586ee8ded8e8bd5662654346d36552b02d20041f0f3bc20ed49438cbbc2",
++        "binding_sha256": "01f354d8b97269e7d4c626f829c5ce7c518782d519b8715a39369794529f2834",
+         "arg_plan_sha256": "706df10fe82c59904254a8c183386490f441067f2987881fd2cffdadc730560a",
+         "kernel_entry": "kernel_blackwell_batch_attention_msa_decode_uniform_fp8_natural_sm100_v1",
+         "replacement_counts": {
+@@ -1195,8 +1195,8 @@
+         "source_unit": "decode_uniform_fp8_qkv_paged",
+         "normalization_schema": "blackwell-msa-identifiers-v1",
+         "generated_input_sha256": "17923e99f86181a47096b602f5ce008f6c0bb49e22f598bf30190b1daffa7ecd",
+-        "vendored_sha256": "6e180a15405eb3beaf08512066eccf615381780519c02f4664a456844e79b0a3",
+-        "binding_sha256": "353410b94ea95ac1921938327b7a1ac4b39d86a7f312d7fde4c8e3cd41ce8afe",
++        "vendored_sha256": "7210f586ee8ded8e8bd5662654346d36552b02d20041f0f3bc20ed49438cbbc2",
++        "binding_sha256": "01f354d8b97269e7d4c626f829c5ce7c518782d519b8715a39369794529f2834",
+         "arg_plan_sha256": "706df10fe82c59904254a8c183386490f441067f2987881fd2cffdadc730560a",
+         "kernel_entry": "kernel_blackwell_batch_attention_msa_decode_uniform_fp8_natural_sm100_v1",
+         "replacement_counts": {
+diff --git a/csrc/blackwell_msa/sm100a/blackwell_msa_decode_uniform_fp8_qkv_paged.cu b/csrc/blackwell_msa/sm100a/blackwell_msa_decode_uniform_fp8_qkv_paged.cu
+index 96eedfd697e..2acb16552d1 100644
+--- a/csrc/blackwell_msa/sm100a/blackwell_msa_decode_uniform_fp8_qkv_paged.cu
++++ b/csrc/blackwell_msa/sm100a/blackwell_msa_decode_uniform_fp8_qkv_paged.cu
+@@ -536,8 +536,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
+     return result;
+ }
+ 
+-extern "C" {
+-
++template <bool kTaskKindTokenMajor>
+ __global__ __launch_bounds__(384) void
+ kernel_blackwell_batch_attention_msa_decode_uniform_fp8_natural_sm100_v1(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* __restrict__ O, float* __restrict__ msa_lse, int* __restrict__ kv_indices, int* __restrict__ kv_indptr, int* __restrict__ task_kind, int* __restrict__ task_request, int* __restrict__ task_kv_head, int total_q, int seqlen_q, int num_q_heads, int num_kv_heads, float softmax_scale_log2, float output_scale, int msa_max_pages)
+ {
+@@ -1272,6 +1271,15 @@ kernel_blackwell_batch_attention_msa_decode_uniform_fp8_natural_sm100_v1(const _
+                 int query = work_idx_l / (unsigned int)num_kv_heads;
+                 int kv_head = work_idx_l % (unsigned int)num_kv_heads;
+                 int group_size = num_q_heads / num_kv_heads;
++                constexpr int kAttentionTopK = 16;
++                int task_kind_base;
++                if constexpr (kTaskKindTokenMajor) {
++                    // Token-major storage is [query, kv_head, topk]. Since work_idx_l is
++                    // query * num_kv_heads + kv_head, it already linearizes the first two axes.
++                    task_kind_base = work_idx_l * kAttentionTopK;
++                } else {
++                    task_kind_base = (kv_head * total_q + query) * kAttentionTopK;
++                }
+                 mbarrier_wait(q_empty_addr, _phase_q_empty_0);
+                 _phase_q_empty_0 ^= 1;
+                 if (elect_sync()) {
+@@ -1290,7 +1298,7 @@ kernel_blackwell_batch_attention_msa_decode_uniform_fp8_natural_sm100_v1(const _
+                         int valid_cols_1 = 128;
+                         int batch = query / seqlen_q;
+                         int query_in_batch = query - batch * seqlen_q;
+-                        int selected_block = task_kind[(kv_head * total_q + query) * 16 + selected_position];
++                        int selected_block = task_kind[task_kind_base + selected_position];
+                         int kv_len = task_kv_head[batch];
+                         int valid_cols_0 = 0;
+                         if (selected_block >= 0) {
+@@ -1353,7 +1361,7 @@ kernel_blackwell_batch_attention_msa_decode_uniform_fp8_natural_sm100_v1(const _
+                         int next_valid_cols = 128;
+                         int batch_1 = query / seqlen_q;
+                         int query_in_batch_1 = query - batch_1 * seqlen_q;
+-                        int selected_block_1 = task_kind[(kv_head * total_q + query) * 16 + selected_position_1];
++                        int selected_block_1 = task_kind[task_kind_base + selected_position_1];
+                         int kv_len_1 = task_kv_head[batch_1];
+                         int valid_cols_2 = 0;
+                         if (selected_block_1 >= 0) {
+@@ -1882,5 +1890,3 @@ kernel_blackwell_batch_attention_msa_decode_uniform_fp8_natural_sm100_v1(const _
+         asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(tmem_addr_storage[0]), "r"(512));
+     }
+ }
+-
+-} // extern "C"
+diff --git a/csrc/blackwell_msa/sm100a/blackwell_msa_decode_uniform_fp8_qkv_paged_binding.cu b/csrc/blackwell_msa/sm100a/blackwell_msa_decode_uniform_fp8_qkv_paged_binding.cu
+index 544e765f7c8..063fe9d2e02 100644
+--- a/csrc/blackwell_msa/sm100a/blackwell_msa_decode_uniform_fp8_qkv_paged_binding.cu
++++ b/csrc/blackwell_msa/sm100a/blackwell_msa_decode_uniform_fp8_qkv_paged_binding.cu
+@@ -64,6 +64,49 @@ inline void CheckContiguous(const TensorView& t, const char* name) {
+   TVM_FFI_CHECK(t.IsContiguous(), ValueError) << name << " must be contiguous";
+ }
+ 
++inline void CheckStridedTopK(const TensorView& t, const char* name) {
++  TVM_FFI_CHECK(t.ndim() == 3, ValueError) << name << " must have rank 3";
++  TVM_FFI_CHECK(t.stride(2) == 1, ValueError)
++      << name << " top-k entries must be contiguous";
++  TVM_FFI_CHECK(t.stride(0) > 0 && t.stride(1) > 0, ValueError)
++      << name << " head and query strides must be positive";
++}
++
++inline bool IsPackedHndKvPair(const TensorView& k, const TensorView& v) {
++  if (k.ndim() != 4 || v.ndim() != 4) {
++    return false;
++  }
++  for (int axis = 0; axis < 4; ++axis) {
++    if (k.size(axis) != v.size(axis) || k.stride(axis) != v.stride(axis)) {
++      return false;
++    }
++  }
++  const int64_t num_kv_heads = k.size(1);
++  const int64_t block_size = k.size(2);
++  const int64_t head_dim = k.size(3);
++  const int64_t packed_width = 2 * head_dim;
++  const int64_t element_bits =
++      static_cast<int64_t>(k.dtype().bits) * static_cast<int64_t>(k.dtype().lanes);
++  if (element_bits % CHAR_BIT != 0) {
++    return false;
++  }
++  const int64_t element_size_bytes = element_bits / CHAR_BIT;
++  const uintptr_t k_ptr = reinterpret_cast<uintptr_t>(k.data_ptr());
++  const uintptr_t v_ptr = reinterpret_cast<uintptr_t>(v.data_ptr());
++  return block_size == 128 && head_dim == 128 && k.stride(3) == 1 &&
++         k.stride(2) == packed_width && k.stride(1) == block_size * packed_width &&
++         k.stride(0) == num_kv_heads * block_size * packed_width && v_ptr >= k_ptr &&
++         v_ptr - k_ptr == head_dim * element_size_bytes;
++}
++
++inline void CheckContiguousOrPackedHndKvPair(const TensorView& k, const TensorView& v) {
++  // Separate contiguous K/V tensors do not share the backing-storage relationship required by
++  // IsPackedHndKvPair, so keep the two supported layouts as distinct alternatives.
++  TVM_FFI_CHECK(
++      (k.IsContiguous() && v.IsContiguous()) || IsPackedHndKvPair(k, v), ValueError)
++      << "K/V must be contiguous or exact views split from a compact packed HND cache";
++}
++
+ inline void CheckDtype(const TensorView& t, const char* name, int code, int bits, int lanes) {
+   DLDataType d = t.dtype();
+   TVM_FFI_CHECK((int)d.code == code && (int)d.bits == bits && (int)d.lanes == lanes, TypeError)
+@@ -182,14 +225,19 @@ inline CUtensorMap EncodeTma_K(const TensorView& t) {
+   TVM_FFI_CHECK(d1 > 0 && d2 > 0, ValueError)
+       << "TMA source 'K' trailing dims must be positive";
+   int64_t outer2 = t.numel() / (d1 * d2);
++  CheckDenseLeadingFold(t, 2, "K");
++  int64_t s2 = t.stride(t.ndim() - 2);
++  int64_t s3 = t.stride(t.ndim() - 3);
++  TVM_FFI_CHECK(s2 > 0 && s3 > 0, ValueError)
++      << "TMA source 'K' physical strides must be positive";
+   uint64_t global_dim[3] = {(uint64_t)(128), (uint64_t)(d2), (uint64_t)(outer2)};
+   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0, ValueError)
+       << "TMA descriptor for 'K' resolved a non-positive global dim";
+   TVM_FFI_CHECK(128u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2], ValueError)
+       << "TMA box (128, 128, 1) exceeds resolved global dims for 'K'";
+   uint64_t global_strides[2] = {
+-      (uint64_t)((d1 * 8) / 8),
+-      (uint64_t)(((d2 * d1) * 8) / 8),
++      (uint64_t)((s2 * 8) / 8),
++      (uint64_t)((s3 * 8) / 8),
+   };
+   uint32_t box_dim[3] = {128u, 128u, 1u};
+   uint32_t elem_strides[3] = {1u, 1u, 1u};
+@@ -215,14 +263,19 @@ inline CUtensorMap EncodeTma_V(const TensorView& t) {
+   TVM_FFI_CHECK(d1 > 0 && d2 > 0, ValueError)
+       << "TMA source 'V' trailing dims must be positive";
+   int64_t outer2 = t.numel() / (d1 * d2);
++  CheckDenseLeadingFold(t, 2, "V");
++  int64_t s2 = t.stride(t.ndim() - 2);
++  int64_t s3 = t.stride(t.ndim() - 3);
++  TVM_FFI_CHECK(s2 > 0 && s3 > 0, ValueError)
++      << "TMA source 'V' physical strides must be positive";
+   uint64_t global_dim[3] = {(uint64_t)(128), (uint64_t)(d2), (uint64_t)(outer2)};
+   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0, ValueError)
+       << "TMA descriptor for 'V' resolved a non-positive global dim";
+   TVM_FFI_CHECK(128u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2], ValueError)
+       << "TMA box (128, 128, 1) exceeds resolved global dims for 'V'";
+   uint64_t global_strides[2] = {
+-      (uint64_t)((d1 * 8) / 8),
+-      (uint64_t)(((d2 * d1) * 8) / 8),
++      (uint64_t)((s2 * 8) / 8),
++      (uint64_t)((s3 * 8) / 8),
+   };
+   uint32_t box_dim[3] = {128u, 128u, 1u};
+   uint32_t elem_strides[3] = {1u, 1u, 1u};
+@@ -245,10 +298,9 @@ void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_V, TensorView arg_O,
+   CheckDtype(arg_Q, "Q", 1, 8, 1);
+   CheckCudaTensor(arg_K, "K");
+   CheckDtype(arg_K, "K", 1, 8, 1);
+-  CheckContiguous(arg_K, "K");
+   CheckCudaTensor(arg_V, "V");
+   CheckDtype(arg_V, "V", 1, 8, 1);
+-  CheckContiguous(arg_V, "V");
++  CheckContiguousOrPackedHndKvPair(arg_K, arg_V);
+   CheckCudaTensor(arg_O, "O");
+   CheckDtype(arg_O, "O", 4, 16, 1);
+   CheckContiguous(arg_O, "O");
+@@ -263,7 +315,7 @@ void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_V, TensorView arg_O,
+   CheckContiguous(arg_kv_indptr, "kv_indptr");
+   CheckCudaTensor(arg_task_kind, "task_kind");
+   CheckDtype(arg_task_kind, "task_kind", 0, 32, 1);
+-  CheckContiguous(arg_task_kind, "task_kind");
++  CheckStridedTopK(arg_task_kind, "task_kind");
+   CheckCudaTensor(arg_task_request, "task_request");
+   CheckDtype(arg_task_request, "task_request", 0, 32, 1);
+   CheckContiguous(arg_task_request, "task_request");
+@@ -330,6 +382,19 @@ void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_V, TensorView arg_O,
+       << "num_q_heads must be divisible by num_kv_heads";
+   TVM_FFI_CHECK(arg_num_kv_heads >= 1, ValueError)
+       << "num_kv_heads must be >= " << 1      << ", got " << arg_num_kv_heads;
++  constexpr int64_t kAttentionTopK = 16;
++  TVM_FFI_CHECK(arg_task_kind.size(0) == arg_num_kv_heads &&
++                    arg_task_kind.size(1) == arg_total_q &&
++                    arg_task_kind.size(2) == kAttentionTopK,
++                ValueError)
++      << "task_kind must have shape (num_kv_heads, total_q, " << kAttentionTopK << ")";
++  const bool task_kind_head_major = arg_task_kind.IsContiguous();
++  const bool task_kind_token_major =
++      arg_task_kind.stride(0) == kAttentionTopK &&
++      arg_task_kind.stride(1) == arg_num_kv_heads * kAttentionTopK &&
++      arg_task_kind.stride(2) == 1;
++  TVM_FFI_CHECK(task_kind_head_major || task_kind_token_major, ValueError)
++      << "task_kind must be compact head-major or an exact compact token-major transpose";
+ 
+ 
+   CUtensorMap p_Q = EncodeTma_Q(arg_Q);
+@@ -354,12 +419,16 @@ void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_V, TensorView arg_O,
+   dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
+   dim3 block(384u, 1u, 1u);
+ 
++  const void* kernel = task_kind_token_major && !task_kind_head_major
++                           ? reinterpret_cast<const void*>(
++                                 kernel_blackwell_batch_attention_msa_decode_uniform_fp8_natural_sm100_v1<true>)
++                           : reinterpret_cast<const void*>(
++                                 kernel_blackwell_batch_attention_msa_decode_uniform_fp8_natural_sm100_v1<false>);
+   cudaError_t status = cudaFuncSetAttribute(
+-      kernel_blackwell_batch_attention_msa_decode_uniform_fp8_natural_sm100_v1, cudaFuncAttributeMaxDynamicSharedMemorySize, 156672);
++      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 156672);
+   TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
+       << "cudaFuncSetAttribute(kernel_blackwell_batch_attention_msa_decode_uniform_fp8_natural_sm100_v1) failed: " << cudaGetErrorString(status);
+-  status = cudaLaunchKernel(reinterpret_cast<const void*>(kernel_blackwell_batch_attention_msa_decode_uniform_fp8_natural_sm100_v1), grid, block, kargs,
+-                            156672u, stream);
++  status = cudaLaunchKernel(kernel, grid, block, kargs, 156672u, stream);
+   TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
+       << "kernel_blackwell_batch_attention_msa_decode_uniform_fp8_natural_sm100_v1 launch failed: " << cudaGetErrorString(status);
+ }
+diff --git a/csrc/blackwell_msa/sm103a/blackwell_msa_decode_uniform_fp8_qkv_paged.cu b/csrc/blackwell_msa/sm103a/blackwell_msa_decode_uniform_fp8_qkv_paged.cu
+index 96eedfd697e..2acb16552d1 100644
+--- a/csrc/blackwell_msa/sm103a/blackwell_msa_decode_uniform_fp8_qkv_paged.cu
++++ b/csrc/blackwell_msa/sm103a/blackwell_msa_decode_uniform_fp8_qkv_paged.cu
+@@ -536,8 +536,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
+     return result;
+ }
+ 
+-extern "C" {
+-
++template <bool kTaskKindTokenMajor>
+ __global__ __launch_bounds__(384) void
+ kernel_blackwell_batch_attention_msa_decode_uniform_fp8_natural_sm100_v1(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* __restrict__ O, float* __restrict__ msa_lse, int* __restrict__ kv_indices, int* __restrict__ kv_indptr, int* __restrict__ task_kind, int* __restrict__ task_request, int* __restrict__ task_kv_head, int total_q, int seqlen_q, int num_q_heads, int num_kv_heads, float softmax_scale_log2, float output_scale, int msa_max_pages)
+ {
+@@ -1272,6 +1271,15 @@ kernel_blackwell_batch_attention_msa_decode_uniform_fp8_natural_sm100_v1(const _
+                 int query = work_idx_l / (unsigned int)num_kv_heads;
+                 int kv_head = work_idx_l % (unsigned int)num_kv_heads;
+                 int group_size = num_q_heads / num_kv_heads;
++                constexpr int kAttentionTopK = 16;
++                int task_kind_base;
++                if constexpr (kTaskKindTokenMajor) {
++                    // Token-major storage is [query, kv_head, topk]. Since work_idx_l is
++                    // query * num_kv_heads + kv_head, it already linearizes the first two axes.
++                    task_kind_base = work_idx_l * kAttentionTopK;
++                } else {
++                    task_kind_base = (kv_head * total_q + query) * kAttentionTopK;
++                }
+                 mbarrier_wait(q_empty_addr, _phase_q_empty_0);
+                 _phase_q_empty_0 ^= 1;
+                 if (elect_sync()) {
+@@ -1290,7 +1298,7 @@ kernel_blackwell_batch_attention_msa_decode_uniform_fp8_natural_sm100_v1(const _
+                         int valid_cols_1 = 128;
+                         int batch = query / seqlen_q;
+                         int query_in_batch = query - batch * seqlen_q;
+-                        int selected_block = task_kind[(kv_head * total_q + query) * 16 + selected_position];
++                        int selected_block = task_kind[task_kind_base + selected_position];
+                         int kv_len = task_kv_head[batch];
+                         int valid_cols_0 = 0;
+                         if (selected_block >= 0) {
+@@ -1353,7 +1361,7 @@ kernel_blackwell_batch_attention_msa_decode_uniform_fp8_natural_sm100_v1(const _
+                         int next_valid_cols = 128;
+                         int batch_1 = query / seqlen_q;
+                         int query_in_batch_1 = query - batch_1 * seqlen_q;
+-                        int selected_block_1 = task_kind[(kv_head * total_q + query) * 16 + selected_position_1];
++                        int selected_block_1 = task_kind[task_kind_base + selected_position_1];
+                         int kv_len_1 = task_kv_head[batch_1];
+                         int valid_cols_2 = 0;
+                         if (selected_block_1 >= 0) {
+@@ -1882,5 +1890,3 @@ kernel_blackwell_batch_attention_msa_decode_uniform_fp8_natural_sm100_v1(const _
+         asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(tmem_addr_storage[0]), "r"(512));
+     }
+ }
+-
+-} // extern "C"
+diff --git a/csrc/blackwell_msa/sm103a/blackwell_msa_decode_uniform_fp8_qkv_paged_binding.cu b/csrc/blackwell_msa/sm103a/blackwell_msa_decode_uniform_fp8_qkv_paged_binding.cu
+index 544e765f7c8..063fe9d2e02 100644
+--- a/csrc/blackwell_msa/sm103a/blackwell_msa_decode_uniform_fp8_qkv_paged_binding.cu
++++ b/csrc/blackwell_msa/sm103a/blackwell_msa_decode_uniform_fp8_qkv_paged_binding.cu
+@@ -64,6 +64,49 @@ inline void CheckContiguous(const TensorView& t, const char* name) {
+   TVM_FFI_CHECK(t.IsContiguous(), ValueError) << name << " must be contiguous";
+ }
+ 
++inline void CheckStridedTopK(const TensorView& t, const char* name) {
++  TVM_FFI_CHECK(t.ndim() == 3, ValueError) << name << " must have rank 3";
++  TVM_FFI_CHECK(t.stride(2) == 1, ValueError)
++      << name << " top-k entries must be contiguous";
++  TVM_FFI_CHECK(t.stride(0) > 0 && t.stride(1) > 0, ValueError)
++      << name << " head and query strides must be positive";
++}
++
++inline bool IsPackedHndKvPair(const TensorView& k, const TensorView& v) {
++  if (k.ndim() != 4 || v.ndim() != 4) {
++    return false;
++  }
++  for (int axis = 0; axis < 4; ++axis) {
++    if (k.size(axis) != v.size(axis) || k.stride(axis) != v.stride(axis)) {
++      return false;
++    }
++  }
++  const int64_t num_kv_heads = k.size(1);
++  const int64_t block_size = k.size(2);
++  const int64_t head_dim = k.size(3);
++  const int64_t packed_width = 2 * head_dim;
++  const int64_t element_bits =
++      static_cast<int64_t>(k.dtype().bits) * static_cast<int64_t>(k.dtype().lanes);
++  if (element_bits % CHAR_BIT != 0) {
++    return false;
++  }
++  const int64_t element_size_bytes = element_bits / CHAR_BIT;
++  const uintptr_t k_ptr = reinterpret_cast<uintptr_t>(k.data_ptr());
++  const uintptr_t v_ptr = reinterpret_cast<uintptr_t>(v.data_ptr());
++  return block_size == 128 && head_dim == 128 && k.stride(3) == 1 &&
++         k.stride(2) == packed_width && k.stride(1) == block_size * packed_width &&
++         k.stride(0) == num_kv_heads * block_size * packed_width && v_ptr >= k_ptr &&
++         v_ptr - k_ptr == head_dim * element_size_bytes;
++}
++
++inline void CheckContiguousOrPackedHndKvPair(const TensorView& k, const TensorView& v) {
++  // Separate contiguous K/V tensors do not share the backing-storage relationship required by
++  // IsPackedHndKvPair, so keep the two supported layouts as distinct alternatives.
++  TVM_FFI_CHECK(
++      (k.IsContiguous() && v.IsContiguous()) || IsPackedHndKvPair(k, v), ValueError)
++      << "K/V must be contiguous or exact views split from a compact packed HND cache";
++}
++
+ inline void CheckDtype(const TensorView& t, const char* name, int code, int bits, int lanes) {
+   DLDataType d = t.dtype();
+   TVM_FFI_CHECK((int)d.code == code && (int)d.bits == bits && (int)d.lanes == lanes, TypeError)
+@@ -182,14 +225,19 @@ inline CUtensorMap EncodeTma_K(const TensorView& t) {
+   TVM_FFI_CHECK(d1 > 0 && d2 > 0, ValueError)
+       << "TMA source 'K' trailing dims must be positive";
+   int64_t outer2 = t.numel() / (d1 * d2);
++  CheckDenseLeadingFold(t, 2, "K");
++  int64_t s2 = t.stride(t.ndim() - 2);
++  int64_t s3 = t.stride(t.ndim() - 3);
++  TVM_FFI_CHECK(s2 > 0 && s3 > 0, ValueError)
++      << "TMA source 'K' physical strides must be positive";
+   uint64_t global_dim[3] = {(uint64_t)(128), (uint64_t)(d2), (uint64_t)(outer2)};
+   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0, ValueError)
+       << "TMA descriptor for 'K' resolved a non-positive global dim";
+   TVM_FFI_CHECK(128u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2], ValueError)
+       << "TMA box (128, 128, 1) exceeds resolved global dims for 'K'";
+   uint64_t global_strides[2] = {
+-      (uint64_t)((d1 * 8) / 8),
+-      (uint64_t)(((d2 * d1) * 8) / 8),
++      (uint64_t)((s2 * 8) / 8),
++      (uint64_t)((s3 * 8) / 8),
+   };
+   uint32_t box_dim[3] = {128u, 128u, 1u};
+   uint32_t elem_strides[3] = {1u, 1u, 1u};
+@@ -215,14 +263,19 @@ inline CUtensorMap EncodeTma_V(const TensorView& t) {
+   TVM_FFI_CHECK(d1 > 0 && d2 > 0, ValueError)
+       << "TMA source 'V' trailing dims must be positive";
+   int64_t outer2 = t.numel() / (d1 * d2);
++  CheckDenseLeadingFold(t, 2, "V");
++  int64_t s2 = t.stride(t.ndim() - 2);
++  int64_t s3 = t.stride(t.ndim() - 3);
++  TVM_FFI_CHECK(s2 > 0 && s3 > 0, ValueError)
++      << "TMA source 'V' physical strides must be positive";
+   uint64_t global_dim[3] = {(uint64_t)(128), (uint64_t)(d2), (uint64_t)(outer2)};
+   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0, ValueError)
+       << "TMA descriptor for 'V' resolved a non-positive global dim";
+   TVM_FFI_CHECK(128u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2], ValueError)
+       << "TMA box (128, 128, 1) exceeds resolved global dims for 'V'";
+   uint64_t global_strides[2] = {
+-      (uint64_t)((d1 * 8) / 8),
+-      (uint64_t)(((d2 * d1) * 8) / 8),
++      (uint64_t)((s2 * 8) / 8),
++      (uint64_t)((s3 * 8) / 8),
+   };
+   uint32_t box_dim[3] = {128u, 128u, 1u};
+   uint32_t elem_strides[3] = {1u, 1u, 1u};
+@@ -245,10 +298,9 @@ void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_V, TensorView arg_O,
+   CheckDtype(arg_Q, "Q", 1, 8, 1);
+   CheckCudaTensor(arg_K, "K");
+   CheckDtype(arg_K, "K", 1, 8, 1);
+-  CheckContiguous(arg_K, "K");
+   CheckCudaTensor(arg_V, "V");
+   CheckDtype(arg_V, "V", 1, 8, 1);
+-  CheckContiguous(arg_V, "V");
++  CheckContiguousOrPackedHndKvPair(arg_K, arg_V);
+   CheckCudaTensor(arg_O, "O");
+   CheckDtype(arg_O, "O", 4, 16, 1);
+   CheckContiguous(arg_O, "O");
+@@ -263,7 +315,7 @@ void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_V, TensorView arg_O,
+   CheckContiguous(arg_kv_indptr, "kv_indptr");
+   CheckCudaTensor(arg_task_kind, "task_kind");
+   CheckDtype(arg_task_kind, "task_kind", 0, 32, 1);
+-  CheckContiguous(arg_task_kind, "task_kind");
++  CheckStridedTopK(arg_task_kind, "task_kind");
+   CheckCudaTensor(arg_task_request, "task_request");
+   CheckDtype(arg_task_request, "task_request", 0, 32, 1);
+   CheckContiguous(arg_task_request, "task_request");
+@@ -330,6 +382,19 @@ void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_V, TensorView arg_O,
+       << "num_q_heads must be divisible by num_kv_heads";
+   TVM_FFI_CHECK(arg_num_kv_heads >= 1, ValueError)
+       << "num_kv_heads must be >= " << 1      << ", got " << arg_num_kv_heads;
++  constexpr int64_t kAttentionTopK = 16;
++  TVM_FFI_CHECK(arg_task_kind.size(0) == arg_num_kv_heads &&
++                    arg_task_kind.size(1) == arg_total_q &&
++                    arg_task_kind.size(2) == kAttentionTopK,
++                ValueError)
++      << "task_kind must have shape (num_kv_heads, total_q, " << kAttentionTopK << ")";
++  const bool task_kind_head_major = arg_task_kind.IsContiguous();
++  const bool task_kind_token_major =
++      arg_task_kind.stride(0) == kAttentionTopK &&
++      arg_task_kind.stride(1) == arg_num_kv_heads * kAttentionTopK &&
++      arg_task_kind.stride(2) == 1;
++  TVM_FFI_CHECK(task_kind_head_major || task_kind_token_major, ValueError)
++      << "task_kind must be compact head-major or an exact compact token-major transpose";
+ 
+ 
+   CUtensorMap p_Q = EncodeTma_Q(arg_Q);
+@@ -354,12 +419,16 @@ void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_V, TensorView arg_O,
+   dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
+   dim3 block(384u, 1u, 1u);
+ 
++  const void* kernel = task_kind_token_major && !task_kind_head_major
++                           ? reinterpret_cast<const void*>(
++                                 kernel_blackwell_batch_attention_msa_decode_uniform_fp8_natural_sm100_v1<true>)
++                           : reinterpret_cast<const void*>(
++                                 kernel_blackwell_batch_attention_msa_decode_uniform_fp8_natural_sm100_v1<false>);
+   cudaError_t status = cudaFuncSetAttribute(
+-      kernel_blackwell_batch_attention_msa_decode_uniform_fp8_natural_sm100_v1, cudaFuncAttributeMaxDynamicSharedMemorySize, 156672);
++      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 156672);
+   TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
+       << "cudaFuncSetAttribute(kernel_blackwell_batch_attention_msa_decode_uniform_fp8_natural_sm100_v1) failed: " << cudaGetErrorString(status);
+-  status = cudaLaunchKernel(reinterpret_cast<const void*>(kernel_blackwell_batch_attention_msa_decode_uniform_fp8_natural_sm100_v1), grid, block, kargs,
+-                            156672u, stream);
++  status = cudaLaunchKernel(kernel, grid, block, kargs, 156672u, stream);
+   TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
+       << "kernel_blackwell_batch_attention_msa_decode_uniform_fp8_natural_sm100_v1 launch failed: " << cudaGetErrorString(status);
+ }
+diff --git a/flashinfer/msa_ops/_blackwell_sm100.py b/flashinfer/msa_ops/_blackwell_sm100.py
+index d4e55556683..45f6ddb8394 100644
+--- a/flashinfer/msa_ops/_blackwell_sm100.py
++++ b/flashinfer/msa_ops/_blackwell_sm100.py
+@@ -265,8 +265,13 @@ def _check_warmed_launch(
+     signature: tuple,
+     *,
+     capturing: bool,
++    allow_unwarmed_capture: bool = False,
+ ) -> None:
+-    if capturing and (workspace is None or signature not in workspace._warmed_launches):
++    if (
++        capturing
++        and not allow_unwarmed_capture
++        and (workspace is None or signature not in workspace._warmed_launches)
++    ):
+         raise RuntimeError(
+             "MSA CUDA graph capture requires an explicit "
+             "MSASparseAttentionWorkspace warmed by an eager call with the "
+@@ -400,6 +405,9 @@ def _validate_attention_tensors(
+     k: torch.Tensor,
+     v: torch.Tensor,
+     q2k_indices: torch.Tensor,
++    *,
++    allow_packed_hnd_kv: bool = False,
++    allow_strided_q2k: bool = False,
+ ) -> tuple[int, int, int, int]:
+     if not isinstance(q, torch.Tensor) or not q.is_cuda:
+         raise ValueError("q must be a CUDA tensor")
+@@ -422,13 +430,16 @@ def _validate_attention_tensors(
+     if k.shape != v.shape or k.dtype != v.dtype:
+         raise ValueError("k/v must have the same shape and dtype")
+     if not k.is_contiguous() or not v.is_contiguous():
+-        if k.ndim == 4:
++        if allow_packed_hnd_kv and _is_packed_hnd_kv(k, v):
++            pass
++        elif k.ndim == 4:
+             raise ValueError(
+-                "MSA on compute capability 10.0/10.3 does not directly support "
+-                "K/V views split from a packed paged cache; pass separate "
+-                "contiguous K and V tensors (implicit copies are not performed)"
++                "MSA on compute capability 10.0/10.3 does not support this "
++                "strided paged K/V layout; pass separate contiguous K and V "
++                "tensors or exact HND views split from a compact packed cache"
+             )
+-        raise ValueError("k/v must be contiguous")
++        else:
++            raise ValueError("k/v must be contiguous")
+     fp8_kv = k.dtype == torch.float8_e4m3fn
+     if fp8_kv:
+         if q.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+@@ -452,11 +463,23 @@ def _validate_attention_tensors(
+         or q2k_indices.dtype != torch.int32
+         or q2k_indices.ndim != 3
+         or tuple(q2k_indices.shape[:2]) != (num_kv_heads, total_q)
+-        or not q2k_indices.is_contiguous()
++        or (
++            not q2k_indices.is_contiguous()
++            and (
++                not allow_strided_q2k
++                or q2k_indices.stride()
++                != (
++                    _ATTENTION_TOPK,
++                    num_kv_heads * _ATTENTION_TOPK,
++                    1,
++                )
++            )
++        )
+     ):
+         raise ValueError(
+-            "q2k_indices must be contiguous CUDA int32 with shape "
+-            "(num_kv_heads, total_q, topk)"
++            "q2k_indices must be CUDA int32 with shape "
++            "(num_kv_heads, total_q, topk) and either be compact head-major "
++            "or an exact compact token-major transpose"
+         )
+     topk = int(q2k_indices.shape[2])
+     if topk not in _SUPPORTED_ATTENTION_TOPK:
+@@ -466,6 +489,33 @@ def _validate_attention_tensors(
+     return total_q, num_q_heads, num_kv_heads, group_size
+ 
+ 
++def _is_packed_hnd_kv(k: torch.Tensor, v: torch.Tensor) -> bool:
++    """Return whether K/V are exact views of a compact packed HND cache."""
++
++    if (
++        k.ndim != 4
++        or v.ndim != 4
++        or k.shape != v.shape
++        or k.dtype != v.dtype
++        or k.device != v.device
++        or k.shape[2:] != (_BLOCK_SIZE, _HEAD_DIM)
++        or k.stride() != v.stride()
++    ):
++        return False
++    num_kv_heads = int(k.shape[1])
++    packed_width = 2 * _HEAD_DIM
++    expected_strides = (
++        num_kv_heads * _BLOCK_SIZE * packed_width,
++        _BLOCK_SIZE * packed_width,
++        packed_width,
++        1,
++    )
++    return (
++        k.stride() == expected_strides
++        and v.data_ptr() - k.data_ptr() == _HEAD_DIM * k.element_size()
++    )
++
++
+ def _prepare_layout(
+     *,
+     q: torch.Tensor,
+@@ -1676,6 +1726,7 @@ def _run_fp8_direct_module(
+     stream_ptr: int,
+     workspace: Optional[MSASparseAttentionWorkspace],
+     capturing: bool,
++    allow_unwarmed_capture: bool = False,
+ ) -> None:
+     variants = {
+         "q1_exact": f"decode_q1_bf16_query_fp8_kv_exact_{'paged' if paged else 'flat'}",
+@@ -1730,7 +1781,12 @@ def _run_fp8_direct_module(
+     signature = _launch_signature(
+         variant=variant, target=target, tensors=tensors, scalars=scalars, grid=grid
+     )
+-    _check_warmed_launch(workspace, signature, capturing=capturing)
++    _check_warmed_launch(
++        workspace,
++        signature,
++        capturing=capturing,
++        allow_unwarmed_capture=allow_unwarmed_capture,
++    )
+     _get_module(variant, target).run(*tensors, *scalars, *grid, stream_ptr)
+     _record_successful_launch(workspace, signature, capturing=capturing)
+ 
+@@ -2341,6 +2397,8 @@ def blackwell_msa_sparse_decode_attention(
+     partial_dtype: Optional[torch.dtype] = None,
+     force_fused: Optional[bool] = None,
+     workspace: Optional[MSASparseAttentionWorkspace] = None,
++    out: Optional[torch.Tensor] = None,
++    lse_out: Optional[torch.Tensor] = None,
+ ):
+     """Run sparse decode on compute capability 10.0 or 10.3."""
+ 
+@@ -2355,8 +2413,23 @@ def blackwell_msa_sparse_decode_attention(
+         v_global_scale=v_global_scale,
+         allow_uniform_fp8=True,
+     )
++    uniform_fp8_paged_layouts_allowed = (
++        page_table is not None
++        and force_fused is True
++        and causal
++        and q_offset is None
++        and 1 <= seqlen_q <= 32
++        and q.dtype == k.dtype == v.dtype == torch.float8_e4m3fn
++        and q2k_indices.ndim == 3
++        and q2k_indices.shape[2] == _ATTENTION_TOPK
++    )
+     total_q, num_q_heads, num_kv_heads, _ = _validate_attention_tensors(
+-        q, k, v, q2k_indices
++        q,
++        k,
++        v,
++        q2k_indices,
++        allow_packed_hnd_kv=uniform_fp8_paged_layouts_allowed,
++        allow_strided_q2k=uniform_fp8_paged_layouts_allowed,
+     )
+     if seqlen_q <= 0 or total_q % seqlen_q:
+         raise ValueError("q rows must equal batch_size * positive seqlen_q")
+@@ -2364,7 +2437,10 @@ def blackwell_msa_sparse_decode_attention(
+         raise ValueError("force_fused must be True, False, or None")
+     batch_size = total_q // seqlen_q
+     capturing = torch.cuda.is_current_stream_capturing()
+-    if capturing and workspace is None:
++    externally_buffered_direct = (
++        uniform_fp8_paged_layouts_allowed and out is not None and lse_out is not None
++    )
++    if capturing and workspace is None and not externally_buffered_direct:
+         raise RuntimeError(
+             "CUDA graph capture of MSA on compute capability 10.0/10.3 "
+             "requires an explicit MSASparseAttentionWorkspace warmed with the "
+@@ -2447,20 +2523,52 @@ def blackwell_msa_sparse_decode_attention(
+             raise ValueError(
+                 "non-TopK16 Blackwell MSA attention is restricted to exact routes"
+             )
+-        out = _workspace_buffer(
+-            workspace,
+-            "decode_out",
+-            tuple(q.shape),
+-            dtype=(torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype),
+-            device=q.device,
+-        )
+-        lse = _workspace_buffer(
+-            workspace,
+-            "decode_lse",
+-            (total_q, num_q_heads),
+-            dtype=torch.float32,
+-            device=q.device,
+-        )
++        out_dtype = torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype
++        if out is None:
++            out = _workspace_buffer(
++                workspace,
++                "decode_out",
++                tuple(q.shape),
++                dtype=out_dtype,
++                device=q.device,
++            )
++        elif not isinstance(out, torch.Tensor):
++            raise TypeError("out must be a torch.Tensor")
++        elif (
++            tuple(out.shape) != tuple(q.shape)
++            or out.dtype != out_dtype
++            or out.device != q.device
++            or not out.is_contiguous()
++        ):
++            raise ValueError(
++                f"out must be contiguous {out_dtype} with shape "
++                f"{tuple(q.shape)} on {q.device}"
++            )
++        if lse_out is not None:
++            if not return_softmax_lse:
++                raise ValueError("lse_out requires return_softmax_lse=True")
++            if not isinstance(lse_out, torch.Tensor):
++                raise TypeError("lse_out must be a torch.Tensor")
++            expected_lse_shape = (total_q, num_q_heads)
++            if (
++                tuple(lse_out.shape) != expected_lse_shape
++                or lse_out.dtype != torch.float32
++                or lse_out.device != q.device
++                or not lse_out.is_contiguous()
++            ):
++                raise ValueError(
++                    "lse_out must be contiguous torch.float32 with shape "
++                    f"{expected_lse_shape} on {q.device}"
++                )
++            lse = lse_out
++        else:
++            lse = _workspace_buffer(
++                workspace,
++                "decode_lse",
++                (total_q, num_q_heads),
++                dtype=torch.float32,
++                device=q.device,
++            )
+         if non16_variant is not None:
+             _run_decode_module(
+                 variant=non16_variant,
+@@ -2601,6 +2709,7 @@ def blackwell_msa_sparse_decode_attention(
+                 stream_ptr=stream_ptr,
+                 workspace=workspace,
+                 capturing=capturing,
++                allow_unwarmed_capture=externally_buffered_direct,
+             )
+             return (out, lse) if return_softmax_lse else out
+         variant = _decode_variant(
+diff --git a/flashinfer/msa_ops/sparse_decode.py b/flashinfer/msa_ops/sparse_decode.py
+index 12879cc9a23..0b9b39f103c 100644
+--- a/flashinfer/msa_ops/sparse_decode.py
++++ b/flashinfer/msa_ops/sparse_decode.py
+@@ -104,6 +104,7 @@ def _combine_partials(
+     split_counts: torch.Tensor,  # [total_q, Hkv] int32
+     group_size: int,
+     out_dtype: torch.dtype,
++    out: Optional[torch.Tensor] = None,
+     lse_out: Optional[torch.Tensor] = None,
+     out_scale: float = 1.0,
+     lse_t_partial: Optional[torch.Tensor] = None,
+@@ -111,9 +112,12 @@ def _combine_partials(
+ ) -> torch.Tensor:
+     """Fused CuTe-DSL LSE-weighted reduction over each query's split slots."""
+     topk, total_q, num_qo_heads, head_dim = o_partial.shape
+-    out = torch.empty(
+-        (total_q, num_qo_heads, head_dim), dtype=out_dtype, device=o_partial.device
+-    )
++    if out is None:
++        out = torch.empty(
++            (total_q, num_qo_heads, head_dim),
++            dtype=out_dtype,
++            device=o_partial.device,
++        )
+     has_lse_out = lse_out is not None
+     has_lse_t = lse_t_out is not None
+     dev = o_partial.device
+@@ -194,6 +198,8 @@ def msa_sparse_decode_attention(
+     partial_dtype: Optional[torch.dtype] = None,
+     force_fused: Optional[bool] = None,
+     workspace: Optional[MSASparseAttentionWorkspace] = None,
++    out: Optional[torch.Tensor] = None,
++    lse_out: Optional[torch.Tensor] = None,
+ ):
+     """Sparse decode attention for SM100/SM103 and SM120/SM121 GPUs.
+ 
+@@ -215,8 +221,9 @@ def msa_sparse_decode_attention(
+         On the paged path, ``k``/``v`` may also be views split from a cache
+         that packs K and V in one ``2 * head_dim`` content dim per token
+         on SM120/SM121 (see ``supports_packed_kv``). Compute capability
+-        10.0/10.3 requires separate contiguous K and V tensors and never
+-        copies packed views implicitly.
++        10.0/10.3 also accepts exact HND views split from a contiguous
++        ``(num_pages, num_kv_heads, 128, 256)`` FP8 cache on the paged causal
++        uniform-FP8 Q/K/V route; no packed views are copied implicitly.
+     q2k_indices : torch.Tensor
+         ``(num_kv_heads, batch_size * seqlen_q, topk)`` int32, ascending,
+         ``-1`` tail-padded (the format produced by
+@@ -270,6 +277,15 @@ def msa_sparse_decode_attention(
+         capability 10.0/10.3. Warm the workspace eagerly with the exact
+         tensors, options, and capture stream before capture. It is not used by
+         the SM120/SM121 backend.
++    out : torch.Tensor, optional
++        Caller-provided contiguous output tensor. It must have shape
++        ``(batch_size * seqlen_q, num_qo_heads, 128)``, reside on the same
++        device as ``q``, and use the result dtype (BF16 for uniform FP8 Q/K/V,
++        otherwise the query's compute dtype).
++    lse_out : torch.Tensor, optional
++        Caller-provided contiguous FP32 log-sum-exp output with shape
++        ``(batch_size * seqlen_q, num_qo_heads)``. This requires
++        ``return_softmax_lse=True``.
+ 
+     Returns
+     -------
+@@ -299,6 +315,8 @@ def msa_sparse_decode_attention(
+             partial_dtype=partial_dtype,
+             force_fused=force_fused,
+             workspace=workspace,
++            out=out,
++            lse_out=lse_out,
+         )
+     if workspace is not None:
+         raise ValueError(
+@@ -332,6 +350,36 @@ def msa_sparse_decode_attention(
+     if head_dim != 128:
+         raise ValueError(f"head_dim must be 128, got {head_dim}")
+     batch_size = total_q // seqlen_q
++    if lse_out is not None:
++        if not return_softmax_lse:
++            raise ValueError("lse_out requires return_softmax_lse=True")
++        expected_lse_shape = (total_q, num_qo_heads)
++        if not isinstance(lse_out, torch.Tensor):
++            raise TypeError("lse_out must be a torch.Tensor")
++        if (
++            tuple(lse_out.shape) != expected_lse_shape
++            or lse_out.dtype != torch.float32
++            or lse_out.device != q.device
++            or not lse_out.is_contiguous()
++        ):
++            raise ValueError(
++                "lse_out must be contiguous torch.float32 with shape "
++                f"{expected_lse_shape} on {q.device}"
++            )
++    if out is not None:
++        expected_shape = (total_q, num_qo_heads, head_dim)
++        if not isinstance(out, torch.Tensor):
++            raise TypeError("out must be a torch.Tensor")
++        if (
++            tuple(out.shape) != expected_shape
++            or out.dtype != compute_dtype
++            or out.device != q.device
++            or not out.is_contiguous()
++        ):
++            raise ValueError(
++                f"out must be contiguous {compute_dtype} with shape "
++                f"{expected_shape} on {q.device}"
++            )
+     num_kv_heads = k.shape[1]
+     if num_qo_heads % num_kv_heads != 0:
+         raise ValueError("num_qo_heads must be a multiple of num_kv_heads")
+@@ -458,10 +506,18 @@ def msa_sparse_decode_attention(
+ 
+     if fused:
+         # The split-path partial buffers collapse to dummies.
+-        out_buf = torch.empty(
+-            (total_q, num_qo_heads, head_dim), dtype=compute_dtype, device=dev
++        out_buf = (
++            out
++            if out is not None
++            else torch.empty(
++                (total_q, num_qo_heads, head_dim), dtype=compute_dtype, device=dev
++            )
++        )
++        lse_buf = (
++            lse_out
++            if lse_out is not None
++            else torch.empty((total_q, num_qo_heads), dtype=torch.float32, device=dev)
+         )
+-        lse_buf = torch.empty((total_q, num_qo_heads), dtype=torch.float32, device=dev)
+         # topk (shape[0]) and head_dim (shape[3]) are static in the compiled
+         # signature.
+         o_partial = torch.empty((topk, 1, 1, head_dim), dtype=partial_dtype, device=dev)
+@@ -601,8 +657,7 @@ def msa_sparse_decode_attention(
+             return out_buf, lse_buf
+         return out_buf
+ 
+-    lse_out = None
+-    if return_softmax_lse:
++    if return_softmax_lse and lse_out is None:
+         lse_out = torch.empty((total_q, num_qo_heads), dtype=torch.float32, device=dev)
+     out = _combine_partials(
+         o_partial,
+@@ -610,6 +665,7 @@ def msa_sparse_decode_attention(
+         split_counts,
+         group_size,
+         compute_dtype,
++        out=out,
+         lse_out=lse_out,
+         out_scale=float(v_global_scale) if v_global_scale is not None else 1.0,
+     )
+diff --git a/tests/msa_ops/test_blackwell_msa_packed_kv.py b/tests/msa_ops/test_blackwell_msa_packed_kv.py
+new file mode 100644
+index 00000000000..b2cd214bfc3
+--- /dev/null
++++ b/tests/msa_ops/test_blackwell_msa_packed_kv.py
+@@ -0,0 +1,224 @@
++"""Packed-HND KV coverage for the SM100/SM103 uniform-FP8 MSA route."""
++
++import pytest
++import torch
++
++from flashinfer.msa_ops._blackwell_sm100 import _is_packed_hnd_kv
++from flashinfer.utils import get_compute_capability
++
++
++_BLOCK_SIZE = 128
++_HEAD_DIM = 128
++_TOPK = 16
++
++
++def _packed_cache(
++    *, num_pages: int, num_kv_heads: int, device: torch.device | str
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    packed = torch.randn(
++        num_pages,
++        num_kv_heads,
++        _BLOCK_SIZE,
++        2 * _HEAD_DIM,
++        dtype=torch.bfloat16,
++        device=device,
++    ).to(torch.float8_e4m3fn)
++    key, value = packed.split(_HEAD_DIM, dim=-1)
++    return packed, key, value
++
++
++def _require_sm10x() -> torch.device:
++    if not torch.cuda.is_available():
++        pytest.skip("requires CUDA")
++    device = torch.device("cuda", torch.cuda.current_device())
++    if get_compute_capability(device) not in {(10, 0), (10, 3)}:
++        pytest.skip("requires SM100 or SM103")
++    return device
++
++
++def test_packed_hnd_geometry_detection() -> None:
++    packed, key, value = _packed_cache(num_pages=2, num_kv_heads=2, device="cpu")
++    assert not key.is_contiguous()
++    assert not value.is_contiguous()
++    assert key.untyped_storage().data_ptr() == packed.untyped_storage().data_ptr()
++    assert value.untyped_storage().data_ptr() == packed.untyped_storage().data_ptr()
++    assert _is_packed_hnd_kv(key, value)
++
++    wrong_offset = packed[..., 127:255]
++    assert not _is_packed_hnd_kv(key, wrong_offset)
++
++    nhd = torch.empty(2, _BLOCK_SIZE, 2, 2 * _HEAD_DIM).permute(0, 2, 1, 3)
++    nhd_key, nhd_value = nhd.split(_HEAD_DIM, dim=-1)
++    assert not _is_packed_hnd_kv(nhd_key, nhd_value)
++
++    other = torch.empty_like(packed)
++    other_value = other[..., _HEAD_DIM:]
++    assert not _is_packed_hnd_kv(key, other_value)
++
++
++@pytest.mark.parametrize(("seqlen_q", "num_kv_heads"), [(1, 1), (4, 4)])
++def test_uniform_fp8_packed_hnd_decode_matches_contiguous(
++    seqlen_q: int, num_kv_heads: int
++) -> None:
++    device = _require_sm10x()
++    from flashinfer.msa_ops import msa_sparse_decode_attention
++
++    torch.manual_seed(0)
++    batch_size = 4
++    pages_per_request = 20
++    num_q_heads = 16
++    num_pages = batch_size * pages_per_request
++    packed, key, value = _packed_cache(
++        num_pages=num_pages,
++        num_kv_heads=num_kv_heads,
++        device=device,
++    )
++    query = torch.randn(
++        batch_size * seqlen_q,
++        num_q_heads,
++        _HEAD_DIM,
++        dtype=torch.bfloat16,
++        device=device,
++    ).to(torch.float8_e4m3fn)
++    page_table = torch.arange(num_pages, dtype=torch.int32, device=device).view(
++        batch_size, pages_per_request
++    )
++    seq_lens = torch.full(
++        (batch_size,),
++        pages_per_request * _BLOCK_SIZE,
++        dtype=torch.int32,
++        device=device,
++    )
++    selected = torch.arange(_TOPK, dtype=torch.int32, device=device)
++    q2k_token_major = (
++        selected.view(1, 1, _TOPK)
++        .expand(batch_size * seqlen_q, num_kv_heads, _TOPK)
++        .contiguous()
++    )
++    q2k_indices = q2k_token_major.transpose(0, 1)
++    q2k_contiguous = q2k_indices.contiguous()
++    if num_kv_heads > 1:
++        assert not q2k_indices.is_contiguous()
++        assert q2k_indices.untyped_storage().data_ptr() == (
++            q2k_token_major.untyped_storage().data_ptr()
++        )
++    kwargs = {
++        "page_table": page_table,
++        "seqused_k": seq_lens,
++        "seqlen_q": seqlen_q,
++        "causal": True,
++        "softmax_scale": 0.7 * _HEAD_DIM**-0.5,
++        "return_softmax_lse": True,
++        "k_global_scale": 1.25,
++        "v_global_scale": 0.75,
++        "force_fused": True,
++    }
++
++    expected_out, expected_lse = msa_sparse_decode_attention(
++        query,
++        key.contiguous(),
++        value.contiguous(),
++        q2k_contiguous,
++        **kwargs,
++    )
++    provided_out = torch.empty_like(expected_out)
++    actual_out, actual_lse = msa_sparse_decode_attention(
++        query,
++        key,
++        value,
++        q2k_indices,
++        out=provided_out,
++        **kwargs,
++    )
++
++    assert key.untyped_storage().data_ptr() == packed.untyped_storage().data_ptr()
++    assert value.untyped_storage().data_ptr() == packed.untyped_storage().data_ptr()
++    assert actual_out.data_ptr() == provided_out.data_ptr()
++    torch.testing.assert_close(actual_out, expected_out, rtol=0, atol=0)
++    torch.testing.assert_close(actual_lse, expected_lse, rtol=0, atol=0)
++
++
++def test_uniform_fp8_packed_hnd_decode_cuda_graph() -> None:
++    device = _require_sm10x()
++    from flashinfer.msa_ops import msa_sparse_decode_attention
++
++    torch.manual_seed(1)
++    batch_size = 4
++    seqlen_q = 4
++    pages_per_request = 16
++    num_pages = batch_size * pages_per_request
++    num_kv_heads = 4
++    _, key, value = _packed_cache(
++        num_pages=num_pages, num_kv_heads=num_kv_heads, device=device
++    )
++    query = torch.randn(
++        batch_size * seqlen_q,
++        16,
++        _HEAD_DIM,
++        dtype=torch.bfloat16,
++        device=device,
++    ).to(torch.float8_e4m3fn)
++    page_table = torch.arange(num_pages, dtype=torch.int32, device=device).view(
++        batch_size, pages_per_request
++    )
++    seq_lens = torch.full(
++        (batch_size,),
++        pages_per_request * _BLOCK_SIZE,
++        dtype=torch.int32,
++        device=device,
++    )
++    q2k_indices = (
++        torch.arange(_TOPK, dtype=torch.int32, device=device)
++        .view(1, 1, _TOPK)
++        .expand(batch_size * seqlen_q, num_kv_heads, _TOPK)
++        .contiguous()
++        .transpose(0, 1)
++    )
++    assert not q2k_indices.is_contiguous()
++    provided_out = torch.empty(
++        batch_size * seqlen_q,
++        16,
++        _HEAD_DIM,
++        dtype=torch.bfloat16,
++        device=device,
++    )
++    provided_lse = torch.empty(
++        batch_size * seqlen_q,
++        16,
++        dtype=torch.float32,
++        device=device,
++    )
++
++    def run():
++        return msa_sparse_decode_attention(
++            query,
++            key,
++            value,
++            q2k_indices,
++            page_table=page_table,
++            seqused_k=seq_lens,
++            seqlen_q=seqlen_q,
++            causal=True,
++            return_softmax_lse=True,
++            force_fused=True,
++            out=provided_out,
++            lse_out=provided_lse,
++        )
++
++    capture_stream = torch.cuda.Stream(device=device)
++    with torch.cuda.stream(capture_stream):
++        expected_out, expected_lse = run()
++    capture_stream.synchronize()
++    expected_out = expected_out.clone()
++    expected_lse = expected_lse.clone()
++
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph, stream=capture_stream):
++        graph_out, graph_lse = run()
++    assert graph_out.data_ptr() == provided_out.data_ptr()
++    assert graph_lse.data_ptr() == provided_lse.data_ptr()
++    graph.replay()
++    torch.cuda.synchronize(device)
++
++    torch.testing.assert_close(graph_out, expected_out, rtol=0, atol=0)
++    torch.testing.assert_close(graph_lse, expected_lse, rtol=0, atol=0)

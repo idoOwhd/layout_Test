@@ -1,0 +1,478 @@
+diff --git a/flash_attn/cute/copy_utils.py b/flash_attn/cute/copy_utils.py
+index d8c6083c8cc..fd987784e85 100644
+--- a/flash_attn/cute/copy_utils.py
++++ b/flash_attn/cute/copy_utils.py
+@@ -239,6 +239,60 @@ def cpasync_bulk_s2cluster(
+     )
+ 
+ 
++@dsl_user_op
++def tma_tile_g2s(
++    smem_ptr: Int32,
++    tmap_ptr: cutlass.Int64,
++    col: Int32,
++    row: Int32,
++    mbar_ptr: Int32,
++    *,
++    loc=None,
++    ip=None,
++):
++    """2D TMA tile copy from global to shared memory.
++
++    Loads one tile of boxDim=(width, height) at (col, row) from the tensor
++    described by tmap_ptr into smem_ptr.  Used for paged KV cache loading.
++    """
++    llvm.inline_asm(
++        None,
++        [
++            Int32(smem_ptr).ir_value(loc=loc, ip=ip),
++            cutlass.Int64(tmap_ptr).ir_value(loc=loc, ip=ip),
++            Int32(col).ir_value(loc=loc, ip=ip),
++            Int32(row).ir_value(loc=loc, ip=ip),
++            Int32(mbar_ptr).ir_value(loc=loc, ip=ip),
++        ],
++        "cp.async.bulk.tensor.2d.tile.shared::cta.global"
++        ".mbarrier::complete_tx::bytes"
++        " [$0], [$1, {$2, $3}], [$4];",
++        "r,l,r,r,r",
++        has_side_effects=True,
++        is_align_stack=False,
++        asm_dialect=llvm.AsmDialect.AD_ATT,
++    )
++
++
++@dsl_user_op
++def fence_tma_desc_i64(
++    desc_ptr_i64: cutlass.Int64,
++    *,
++    loc=None,
++    ip=None,
++):
++    """Fence for TMA descriptor acquire on GPU."""
++    llvm.inline_asm(
++        None,
++        [cutlass.Int64(desc_ptr_i64).ir_value(loc=loc, ip=ip)],
++        "fence.proxy.tensormap::generic.acquire.gpu [$0], 128;",
++        "l",
++        has_side_effects=True,
++        is_align_stack=False,
++        asm_dialect=llvm.AsmDialect.AD_ATT,
++    )
++
++
+ @dsl_user_op
+ def cpasync_bulk_g2s(
+     gmem_ptr: cute.Pointer,
+diff --git a/flash_attn/cute/flash_fwd_sm100.py b/flash_attn/cute/flash_fwd_sm100.py
+index 6c9c20d0b76..715a415c430 100644
+--- a/flash_attn/cute/flash_fwd_sm100.py
++++ b/flash_attn/cute/flash_fwd_sm100.py
+@@ -32,6 +32,7 @@
+ from cutlass.cutlass_dsl import BaseDSL
+ 
+ from quack import copy_utils, layout_utils
++from flash_attn.cute import copy_utils as local_copy_utils
+ 
+ from flash_attn.cute.paged_kv import PagedKVManager
+ from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
+@@ -111,11 +112,16 @@ def __init__(
+         mask_mod: cutlass.Constexpr | None = None,
+         has_aux_tensors: cutlass.Constexpr = False,
+         paged_kv_non_tma: bool = False,
++        paged_kv_page_size: int = 0,
+         is_varlen_q: bool = False,
+         use_2cta_instrs: bool = False,
+         use_clc_scheduler: bool = False,
+     ):
+-        self.use_tma_KV = not paged_kv_non_tma
++        self.use_tma_paged_KV = paged_kv_page_size > 0
++        self.tma_paged_page_size = paged_kv_page_size
++        self.use_tma_KV = not paged_kv_non_tma or self.use_tma_paged_KV
++        if self.use_tma_paged_KV:
++            assert n_block_size % paged_kv_page_size == 0
+         # self.dtype = dtype
+         # padding head_dim to a multiple of 16 as k_block_size
+         hdim_multiple_of = 16
+@@ -354,6 +360,12 @@ def __call__(
+         aux_tensors: Optional[list] = None,
+         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
+         stream: cuda.CUstream = None,
++        # tmap tensors hold 128-byte TMA descriptors; passed through to keep alive on-device.
++        # K/V_ptr hold the device pointers to the descriptors.
++        tma_paged_tmap_K: Optional[cute.Tensor] = None,
++        tma_paged_tmap_V: Optional[cute.Tensor] = None,
++        tma_paged_K_ptr: Optional[cute.Tensor] = None,
++        tma_paged_V_ptr: Optional[cute.Tensor] = None,
+     ):
+         """Execute the Fused Multi-Head Attention operation on the provided tensors.
+ 
+@@ -542,7 +554,18 @@ def __call__(
+ 
+         tma_atom_K = None
+         tma_atom_V = None
+-        if const_expr(self.use_tma_KV):
++        if const_expr(self.use_tma_paged_KV):
++            # TMA-paged: create atoms for SMEM layout / tma_partition,
++            # but actual copies use raw PTX with host-created descriptors
++            tma_atom_K, mK = cute.nvgpu.make_tiled_tma_atom_B(
++                tma_load_op, mK, cute.select(sK_layout, mode=[0, 1, 2]),
++                self.mma_tiler_qk, tiled_mma_qk, cta_layout_vmnk.shape,
++            )
++            tma_atom_V, mV = cute.nvgpu.make_tiled_tma_atom_B(
++                tma_load_op, mV, cute.select(sV_layout, mode=[0, 1, 2]),
++                self.mma_tiler_pv, tiled_mma_pv, cta_layout_vmnk.shape,
++            )
++        elif const_expr(self.use_tma_KV):
+             # TMA load for K
+             tma_atom_K, mK = cute.nvgpu.make_tiled_tma_atom_B(
+                 tma_load_op,
+@@ -719,6 +742,10 @@ class SharedStorage:
+             aux_tensors,
+             fastdiv_mods,
+             head_divmod,
++            tma_paged_tmap_K,
++            tma_paged_tmap_V,
++            tma_paged_K_ptr,
++            tma_paged_V_ptr,
+         ).launch(
+             grid=grid_dim,
+             block=[self.threads_per_cta, 1, 1],
+@@ -765,6 +792,10 @@ def kernel(
+         aux_tensors: Optional[list] = None,
+         fastdiv_mods=(None, None),
+         head_divmod=None,
++        tma_paged_tmap_K: Optional[cute.Tensor] = None,
++        tma_paged_tmap_V: Optional[cute.Tensor] = None,
++        tma_paged_K_ptr: Optional[cute.Tensor] = None,
++        tma_paged_V_ptr: Optional[cute.Tensor] = None,
+     ):
+         """The device kernel implementation of the Fused Multi-Head Attention.
+ 
+@@ -1083,6 +1114,14 @@ def kernel(
+         # ///////////////////////////////////////////////////////////////////////////////
+         #  LOAD
+         # ///////////////////////////////////////////////////////////////////////////////
++        tma_paged_K_desc_i64 = cutlass.Int64(0)
++        tma_paged_V_desc_i64 = cutlass.Int64(0)
++        if const_expr(self.use_tma_paged_KV and tma_paged_K_ptr is not None):
++            tma_paged_K_desc_i64 = tma_paged_K_ptr[0]
++            tma_paged_V_desc_i64 = tma_paged_V_ptr[0]
++            local_copy_utils.fence_tma_desc_i64(tma_paged_K_desc_i64)
++            local_copy_utils.fence_tma_desc_i64(tma_paged_V_desc_i64)
++
+         if warp_idx >= self.load_warp_ids[0] and warp_idx <= self.load_warp_ids[-1]:
+             cute.arch.setmaxregister_decrease(self.num_regs_other)
+             self.load(
+@@ -1106,6 +1145,8 @@ def kernel(
+                 SeqlenInfoCls,
+                 blocksparse_tensors,
+                 tile_scheduler=tile_scheduler,
++                tma_paged_K_desc_i64=tma_paged_K_desc_i64,
++                tma_paged_V_desc_i64=tma_paged_V_desc_i64,
+             )
+ 
+         # ///////////////////////////////////////////////////////////////////////////////
+@@ -1269,6 +1310,8 @@ def load(
+         SeqlenInfoCls: Callable,
+         blocksparse_tensors: Optional[BlockSparseTensors],
+         tile_scheduler: TileSchedulerProtocol,
++        tma_paged_K_desc_i64: cutlass.Int64 = cutlass.Int64(0),
++        tma_paged_V_desc_i64: cutlass.Int64 = cutlass.Int64(0),
+     ):
+         num_load_threads = len(self.load_warp_ids) * cute.arch.WARP_SIZE
+         tidx = cute.arch.thread_idx()[0] % num_load_threads
+@@ -1338,7 +1381,17 @@ def load(
+                     phase=q_producer_phase,
+                 )
+ 
+-            if const_expr(self.use_tma_KV):
++            if const_expr(self.use_tma_paged_KV):
++                tKsK, tKgK = cpasync.tma_partition(
++                    tma_atom_K, 0, cute.make_layout(1),
++                    cute.group_modes(sK, 0, 3), cute.group_modes(tSgK, 0, 3),
++                )
++                tVsV, tVgV = cpasync.tma_partition(
++                    tma_atom_V, 0, cute.make_layout(1),
++                    cute.group_modes(sV, 0, 3), cute.group_modes(tOgV, 0, 3),
++                )
++                paged_kv_manager = None
++            elif const_expr(self.use_tma_KV):
+                 tKsK, tKgK = cpasync.tma_partition(
+                     tma_atom_K,
+                     0,  # no multicast
+@@ -1384,6 +1437,10 @@ def load(
+                 sK,
+                 pipeline_kv=pipeline_kv,
+                 K_or_V="K",
++                tma_paged_mPageTable=mPageTable if const_expr(self.use_tma_paged_KV) else None,
++                tma_paged_batch_idx=batch_idx,
++                tma_paged_desc_i64=tma_paged_K_desc_i64,
++                tma_paged_col_offset=head_idx_kv * self.head_dim_padded,
+             )
+             load_V = partial(
+                 self.load_KV,
+@@ -1394,6 +1451,10 @@ def load(
+                 sV,
+                 pipeline_kv=pipeline_kv,
+                 K_or_V="V",
++                tma_paged_mPageTable=mPageTable if const_expr(self.use_tma_paged_KV) else None,
++                tma_paged_batch_idx=batch_idx,
++                tma_paged_desc_i64=tma_paged_V_desc_i64,
++                tma_paged_col_offset=head_idx_kv * self.head_dim_v_padded,
+             )
+ 
+             if const_expr(not self.use_block_sparsity):
+@@ -2868,24 +2929,64 @@ def load_KV(
+         producer_state: pipeline.PipelineState,
+         K_or_V: Literal["K", "V"],
+         page_idx: Optional[Int32] = None,
++        tma_paged_mPageTable: Optional[cute.Tensor] = None,
++        tma_paged_batch_idx: Int32 = Int32(0),
++        tma_paged_desc_i64: cutlass.Int64 = cutlass.Int64(0),
++        tma_paged_col_offset: Int32 = Int32(0),
+         extra_tx_count: Optional[Int32] = None,
+     ):
+         assert K_or_V in ("K", "V")
+         stage, phase = producer_state.index, producer_state.phase
+-        extra_tx_count_kv = self.tma_copy_bytes[K_or_V] - self.tma_copy_bytes["K"]
+-        extra_tx_count = (
+-            extra_tx_count_kv + (extra_tx_count if extra_tx_count is not None else 0) if const_expr(self.use_tma_KV)
+-            else None
+-        )
+-        extra_kwargs = {"extra_tx_count": extra_tx_count} if const_expr(self.use_tma_KV) else {}
+-        pipeline_kv.producer_acquire(producer_state, **extra_kwargs)
+-        if const_expr(K_or_V == "K" and self.uneven_kv_smem):
+-            # Before this round, the smem location was occupied by V, which is smaller than
+-            # K. So we need to wait for the stage after that (stage 1) to be empty as well.
+-            if stage == 0:
+-                pipeline_kv.sync_object_empty.wait(1, phase)
+ 
+-        if const_expr(self.use_tma_KV):
++        if const_expr(self.use_tma_paged_KV):
++            # TMA-paged: manual pipeline management (bypass producer_acquire)
++            pipeline_kv.sync_object_empty.wait(stage, phase)
++            if const_expr(K_or_V == "K" and self.uneven_kv_smem):
++                if stage == 0:
++                    pipeline_kv.sync_object_empty.wait(1, phase)
++        else:
++            extra_tx_count_kv = self.tma_copy_bytes[K_or_V] - self.tma_copy_bytes["K"]
++            extra_tx_count = (
++                extra_tx_count_kv + (extra_tx_count if extra_tx_count is not None else 0) if const_expr(self.use_tma_KV)
++                else None
++            )
++            extra_kwargs = {"extra_tx_count": extra_tx_count} if const_expr(self.use_tma_KV) else {}
++            pipeline_kv.producer_acquire(producer_state, **extra_kwargs)
++            if const_expr(K_or_V == "K" and self.uneven_kv_smem):
++                if stage == 0:
++                    pipeline_kv.sync_object_empty.wait(1, phase)
++
++        if const_expr(self.use_tma_paged_KV):
++            # TMA-paged: raw PTX tma_tile_g2s with host-created descriptors.
++            # Gate ensures head_dim * elem_size <= 128 → one TMA tile per page.
++            head_dim = self.head_dim_v_padded if const_expr(K_or_V == "V") else self.head_dim_padded
++            elem_bytes = self.k_dtype.width // 8
++            row_bytes = head_dim * elem_bytes
++            page_size = self.tma_paged_page_size
++            pages_per_nblock = self.n_block_size // page_size
++            total_bytes = self.n_block_size * row_bytes
++            bytes_per_page = page_size * row_bytes
++
++            sX_stage = sX[None, None, None, stage]
++            smem_data_base = sX_stage.iterator.toint()
++            tmap_i64 = tma_paged_desc_i64
++            first_logical_page = block * pages_per_nblock
++            phys_page_starts = tuple(
++                tma_paged_mPageTable[tma_paged_batch_idx, first_logical_page + p] * page_size
++                for p in range(pages_per_nblock)
++            )
++            with cute.arch.elect_one():
++                cute.arch.mbarrier_arrive_and_expect_tx(
++                    pipeline_kv.producer_get_barrier(producer_state), total_bytes
++                )
++                mbar_i32 = pipeline_kv.producer_get_barrier(producer_state).toint()
++                for p in cutlass.range_constexpr(pages_per_nblock):
++                    smem_ptr = smem_data_base + Int32(p * bytes_per_page)
++                    local_copy_utils.tma_tile_g2s(
++                        smem_ptr, tmap_i64,
++                        tma_paged_col_offset, phys_page_starts[p], mbar_i32,
++                    )
++        elif const_expr(self.use_tma_KV):
+             assert tXgX is not None and tXsX is not None and tma_atom is not None
+             tXsX_cur = tXsX[None, stage]
+             if const_expr(self.uneven_kv_smem):
+diff --git a/flash_attn/cute/interface.py b/flash_attn/cute/interface.py
+index 872960a298b..b0596f48c87 100644
+--- a/flash_attn/cute/interface.py
++++ b/flash_attn/cute/interface.py
+@@ -70,6 +70,54 @@
+     normalize_block_sparse_config_bwd,
+ )
+ 
++def _create_tma_paged_descriptor(
++    data_ptr, dtype, head_dim, num_kv_heads, page_size, total_rows, row_stride_bytes, device,
++):
++    """Create a CUtensorMap descriptor for TMA-based paged KV loading.
++
++    Views K/V as 2D: dim0 = num_kv_heads * head_dim, dim1 = total_rows.
++    boxDim = (head_dim, page_size); requires head_dim * elem_size <= 128.
++    """
++    dtype_map = {
++        torch.float16: cuda.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_FLOAT16,
++        torch.bfloat16: cuda.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
++        torch.float32: cuda.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
++    }
++    elem_size = {torch.float16: 2, torch.bfloat16: 2, torch.float32: 4}[dtype]
++    row_bytes = head_dim * elem_size
++    global_dim0 = num_kv_heads * head_dim
++
++    if row_bytes >= 128 and row_bytes % 128 == 0:
++        swizzle = cuda.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_128B
++    elif row_bytes >= 64 and row_bytes % 64 == 0:
++        swizzle = cuda.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_64B
++    elif row_bytes >= 32 and row_bytes % 32 == 0:
++        swizzle = cuda.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_32B
++    else:
++        swizzle = cuda.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_NONE
++
++    err, desc = cuda.cuTensorMapEncodeTiled(
++        dtype_map[dtype],
++        2,  # tensorRank
++        data_ptr,
++        (cuda.cuuint64_t(global_dim0), cuda.cuuint64_t(total_rows)),
++        (cuda.cuuint64_t(row_stride_bytes),),
++        (cuda.cuuint32_t(head_dim), cuda.cuuint32_t(page_size)),
++        (cuda.cuuint32_t(1), cuda.cuuint32_t(1)),
++        cuda.CUtensorMapInterleave.CU_TENSOR_MAP_INTERLEAVE_NONE,
++        swizzle,
++        cuda.CUtensorMapL2promotion.CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
++        cuda.CUtensorMapFloatOOBfill.CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
++    )
++    if err != cuda.CUresult.CUDA_SUCCESS:
++        raise RuntimeError(f"cuTensorMapEncodeTiled failed: {err}")
++    tmap_gpu = torch.empty(16, dtype=torch.int64, device=device)
++    (err,) = cuda.cuMemcpyHtoD(tmap_gpu.data_ptr(), desc.getPtr(), 128)
++    if err != cuda.CUresult.CUDA_SUCCESS:
++        raise RuntimeError(f"cuMemcpyHtoD failed: {err}")
++    return tmap_gpu
++
++
+ def _parse_arch_str(arch_str):
+     """Parse arch string (e.g. 'sm_80', 'sm_90a', '80', '100') to int (e.g. 80, 90, 100)."""
+     import re
+@@ -602,6 +650,21 @@ def _flash_attn_fwd(
+     else:
+         aux_tensor_metadata = None
+ 
++    # Auto-detect TMA-paged KV: use TMA for paged KV when the page count per
++    # n-block is a small power of two and each row fits in a single TMA tile.
++    _pages_per_nblock = (
++        tile_n // page_size
++        if page_size is not None and page_size < tile_n and tile_n % page_size == 0
++        else 0
++    )
++    _elem_sz = q.element_size()
++    _use_tma_paged = (
++        arch // 10 in [10, 11]
++        and _pages_per_nblock in (2, 4, 8)
++        and head_dim * _elem_sz <= 128             # single TMA tile per page
++        and head_dim_v * _elem_sz <= 128
++    )
++
+     compile_key = (
+         dtype,
+         head_dim,
+@@ -629,7 +692,9 @@ def _flash_attn_fwd(
+         is_split_kv,
+         pack_gqa,
+         arch,
+-        page_size not in [None, tile_n],  # paged KV non-TMA
++        page_size not in [None, tile_n] and not _use_tma_paged,  # paged KV non-TMA
++        _use_tma_paged,
++        page_size if _use_tma_paged else None,
+         use_2cta_instrs,
+         q_subtile_factor,
+         mma_pv_is_rs,
+@@ -738,7 +803,8 @@ def _flash_attn_fwd(
+                 score_mod=score_mod,
+                 mask_mod=mask_mod,
+                 has_aux_tensors=aux_tensors is not None,
+-                paged_kv_non_tma=page_size not in [None, tile_n],
++                paged_kv_non_tma=False if _use_tma_paged else (page_size not in [None, tile_n]),
++                paged_kv_page_size=page_size if _use_tma_paged else 0,
+                 is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
+                 q_subtile_factor=q_subtile_factor,
+                 use_2cta_instrs=use_2cta_instrs,
+@@ -771,6 +837,27 @@ def _flash_attn_fwd(
+                 f"Unsupported compute capability: {arch}. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
+             )
+         # TODO: check @can_implement
++        tma_paged_compile_tensors = []
++        if _use_tma_paged:
++            elem_size = q.element_size()
++            total_rows = k.shape[0] * k.shape[1]
++            tmap_K = _create_tma_paged_descriptor(
++                k.data_ptr(), k.dtype, head_dim, num_head_kv,
++                page_size, total_rows, k.shape[2] * k.shape[3] * elem_size, device,
++            )
++            tmap_V = _create_tma_paged_descriptor(
++                v.data_ptr(), v.dtype, head_dim_v, num_head_kv,
++                page_size, total_rows, v.shape[2] * v.shape[3] * elem_size, device,
++            )
++            K_ptr_tensor = torch.tensor([tmap_K.data_ptr()], dtype=torch.int64, device=device)
++            V_ptr_tensor = torch.tensor([tmap_V.data_ptr()], dtype=torch.int64, device=device)
++            tma_paged_compile_tensors = [
++                to_cute_tensor(tmap_K, assumed_align=64),
++                to_cute_tensor(tmap_V, assumed_align=64),
++                to_cute_tensor(K_ptr_tensor),
++                to_cute_tensor(V_ptr_tensor),
++            ]
++
+         _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
+             fa_fwd,
+             q_tensor,
+@@ -790,6 +877,7 @@ def _flash_attn_fwd(
+             sparse_tensors,
+             cute_aux_tensors,
+             current_stream,
++            *tma_paged_compile_tensors,
+             options="--enable-tvm-ffi",
+         )
+ 
+@@ -797,6 +885,29 @@ def _flash_attn_fwd(
+     # - Use those fake metadata to populate compilation cache
+     # - Return "fake" output tensors, which could be needed in follow-up fake operations
+     # Thus, we skip the actual kernel invocation here.
++    tma_paged_runtime_tensors = []
++    if _use_tma_paged and not is_fake_mode():
++        cache_key = (device, k.data_ptr(), v.data_ptr(), k.shape, v.shape, k.dtype, v.dtype)
++        if not hasattr(_flash_attn_fwd, "_tma_paged_cache"):
++            _flash_attn_fwd._tma_paged_cache = {}
++        cache = _flash_attn_fwd._tma_paged_cache
++        if cache_key not in cache:
++            elem_size = q.element_size()
++            total_rows = k.shape[0] * k.shape[1]
++            tmap_K = _create_tma_paged_descriptor(
++                k.data_ptr(), k.dtype, head_dim, num_head_kv,
++                page_size, total_rows, k.shape[2] * k.shape[3] * elem_size, device,
++            )
++            tmap_V = _create_tma_paged_descriptor(
++                v.data_ptr(), v.dtype, head_dim_v, num_head_kv,
++                page_size, total_rows, v.shape[2] * v.shape[3] * elem_size, device,
++            )
++            K_ptr_tensor = torch.tensor([tmap_K.data_ptr()], dtype=torch.int64, device=device)
++            V_ptr_tensor = torch.tensor([tmap_V.data_ptr()], dtype=torch.int64, device=device)
++            cache[cache_key] = (tmap_K, tmap_V, K_ptr_tensor, V_ptr_tensor)
++        tmap_K, tmap_V, K_ptr_tensor, V_ptr_tensor = cache[cache_key]
++        tma_paged_runtime_tensors = [tmap_K, tmap_V, K_ptr_tensor, V_ptr_tensor]
++
+     if not is_fake_mode():
+         _flash_attn_fwd.compile_cache[compile_key](
+             q.detach(),
+@@ -815,6 +926,7 @@ def _flash_attn_fwd(
+             learnable_sink,
+             normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
+             aux_tensors,
++            *tma_paged_runtime_tensors,
+         )
+     if is_split_kv:
+         _flash_attn_fwd_combine(

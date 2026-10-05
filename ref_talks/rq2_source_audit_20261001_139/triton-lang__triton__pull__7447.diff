@@ -1,0 +1,1060 @@
+diff --git a/bin/RegisterTritonDialects.h b/bin/RegisterTritonDialects.h
+index 0d4a2bee8c03..def9bd187be1 100644
+--- a/bin/RegisterTritonDialects.h
++++ b/bin/RegisterTritonDialects.h
+@@ -4,6 +4,7 @@
+ #include "third_party/nvidia/include/Dialect/NVGPU/IR/Dialect.h"
+ #include "third_party/nvidia/include/Dialect/NVWS/IR/Dialect.h"
+ #include "third_party/proton/dialect/include/Dialect/Proton/IR/Dialect.h"
++#include "triton/Dialect/Gluon/Transforms/Passes.h"
+ #include "triton/Dialect/Triton/IR/Dialect.h"
+ #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+ #include "triton/Dialect/TritonInstrument/IR/Dialect.h"
+@@ -50,6 +51,7 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
+   mlir::triton::gpu::registerTritonGPUPasses();
+   mlir::triton::nvidia_gpu::registerTritonNvidiaGPUPasses();
+   mlir::triton::instrument::registerTritonInstrumentPasses();
++  mlir::triton::gluon::registerGluonPasses();
+   mlir::test::registerTestAliasPass();
+   mlir::test::registerTestAlignmentPass();
+   mlir::test::registerAMDTestAlignmentPass();
+@@ -105,5 +107,6 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
+       mlir::gpu::GPUDialect, mlir::LLVM::LLVMDialect, mlir::NVVM::NVVMDialect,
+       mlir::triton::nvgpu::NVGPUDialect, mlir::triton::nvws::NVWSDialect,
+       mlir::triton::amdgpu::TritonAMDGPUDialect,
+-      mlir::triton::proton::ProtonDialect, mlir::ROCDL::ROCDLDialect>();
++      mlir::triton::proton::ProtonDialect, mlir::ROCDL::ROCDLDialect,
++      mlir::triton::gluon::GluonDialect>();
+ }
+diff --git a/include/triton/Dialect/CMakeLists.txt b/include/triton/Dialect/CMakeLists.txt
+index 98c93509131f..c813fbbd7d28 100644
+--- a/include/triton/Dialect/CMakeLists.txt
++++ b/include/triton/Dialect/CMakeLists.txt
+@@ -2,3 +2,4 @@ add_subdirectory(Triton)
+ add_subdirectory(TritonGPU)
+ add_subdirectory(TritonNvidiaGPU)
+ add_subdirectory(TritonInstrument)
++add_subdirectory(Gluon)
+diff --git a/include/triton/Dialect/Gluon/CMakeCache.txt b/include/triton/Dialect/Gluon/CMakeCache.txt
+new file mode 100644
+index 000000000000..9f57627c321f
+--- /dev/null
++++ b/include/triton/Dialect/Gluon/CMakeCache.txt
+@@ -0,0 +1,2 @@
++add_subdirectory(IR)
++add_subdirectory(Transforms)
+diff --git a/include/triton/Dialect/Gluon/CMakeLists.txt b/include/triton/Dialect/Gluon/CMakeLists.txt
+new file mode 100644
+index 000000000000..9f57627c321f
+--- /dev/null
++++ b/include/triton/Dialect/Gluon/CMakeLists.txt
+@@ -0,0 +1,2 @@
++add_subdirectory(IR)
++add_subdirectory(Transforms)
+diff --git a/include/triton/Dialect/Gluon/IR/CMakeLists.txt b/include/triton/Dialect/Gluon/IR/CMakeLists.txt
+new file mode 100644
+index 000000000000..8d10348edf1f
+--- /dev/null
++++ b/include/triton/Dialect/Gluon/IR/CMakeLists.txt
+@@ -0,0 +1,16 @@
++set(MLIR_BINARY_DIR ${CMAKE_BINARY_DIR})
++
++set(LLVM_TARGET_DEFINITIONS GluonDialect.td)
++mlir_tablegen(Dialect.h.inc -gen-dialect-decls -dialect=gluon)
++mlir_tablegen(Dialect.cpp.inc -gen-dialect-defs -dialect=gluon)
++mlir_tablegen(Ops.h.inc -gen-op-decls)
++mlir_tablegen(Ops.cpp.inc -gen-op-defs)
++add_mlir_doc(GluonDialect GluonDialect dialects/ -gen-dialect-doc)
++add_public_tablegen_target(GluonTableGen)
++
++set(LLVM_TARGET_DEFINITIONS GluonAttrDefs.td)
++mlir_tablegen(GluonAttrDefs.h.inc -gen-attrdef-decls)
++mlir_tablegen(GluonAttrDefs.cpp.inc -gen-attrdef-defs)
++mlir_tablegen(OpsEnums.h.inc -gen-enum-decls)
++mlir_tablegen(OpsEnums.cpp.inc -gen-enum-defs)
++add_public_tablegen_target(GluonAttrDefsIncGen)
+diff --git a/include/triton/Dialect/Gluon/IR/Dialect.h b/include/triton/Dialect/Gluon/IR/Dialect.h
+new file mode 100644
+index 000000000000..c93141be4039
+--- /dev/null
++++ b/include/triton/Dialect/Gluon/IR/Dialect.h
+@@ -0,0 +1,8 @@
++#pragma once
++#include "triton/Dialect/Triton/IR/Dialect.h"
++#include "triton/Dialect/TritonGPU/IR/Dialect.h"
++
++#include "triton/Dialect/Gluon/IR/Dialect.h.inc"
++
++#define GET_ATTRDEF_CLASSES
++#include "triton/Dialect/Gluon/IR/GluonAttrDefs.h.inc"
+diff --git a/include/triton/Dialect/Gluon/IR/GluonAttrDefs.td b/include/triton/Dialect/Gluon/IR/GluonAttrDefs.td
+new file mode 100644
+index 000000000000..41741164179e
+--- /dev/null
++++ b/include/triton/Dialect/Gluon/IR/GluonAttrDefs.td
+@@ -0,0 +1,15 @@
++#ifndef GLUON_ATTRDEFS
++#define GLUON_ATTRDEFS
++
++include "mlir/IR/AttrTypeBase.td"
++include "triton/Dialect/Gluon/IR/GluonDialect.td"
++
++def Gluon_AutoEncodingAttr : AttrDef<Gluon_Dialect, "AutoEncoding"> {
++  let mnemonic = "auto_encoding";
++  let attrName = "gluon.auto_encoding";
++  let description = [{
++    An encoding that is inferred from neighboring ops in the graph.
++  }];
++}
++
++#endif
+diff --git a/include/triton/Dialect/Gluon/IR/GluonDialect.td b/include/triton/Dialect/Gluon/IR/GluonDialect.td
+new file mode 100644
+index 000000000000..37e55f12ed66
+--- /dev/null
++++ b/include/triton/Dialect/Gluon/IR/GluonDialect.td
+@@ -0,0 +1,22 @@
++#ifndef GLUON_DIALECT
++#define GLUON_DIALECT
++
++include "mlir/IR/OpBase.td"
++
++def Gluon_Dialect : Dialect {
++  let name = "gluon";
++  let cppNamespace = "::mlir::triton::gluon";
++  let description = [{
++    Gluon dialect.
++  }];
++
++  let dependentDialects = [
++    "triton::TritonDialect",
++    "triton::gpu::TritonGPUDialect",
++    "mlir::gpu::GPUDialect",
++  ];
++  let useDefaultAttributePrinterParser = 1;
++  let usePropertiesForAttributes = 1;
++}
++
++#endif
+diff --git a/include/triton/Dialect/Gluon/Transforms/CMakeLists.txt b/include/triton/Dialect/Gluon/Transforms/CMakeLists.txt
+new file mode 100644
+index 000000000000..a2d298d0c102
+--- /dev/null
++++ b/include/triton/Dialect/Gluon/Transforms/CMakeLists.txt
+@@ -0,0 +1,3 @@
++set(LLVM_TARGET_DEFINITIONS Passes.td)
++mlir_tablegen(Passes.h.inc -gen-pass-decls -name Gluon)
++add_public_tablegen_target(GluonTransformsIncGen)
+diff --git a/include/triton/Dialect/Gluon/Transforms/Passes.h b/include/triton/Dialect/Gluon/Transforms/Passes.h
+new file mode 100644
+index 000000000000..353d21e04fd9
+--- /dev/null
++++ b/include/triton/Dialect/Gluon/Transforms/Passes.h
+@@ -0,0 +1,13 @@
++#pragma once
++#include "mlir/IR/BuiltinOps.h"
++#include "mlir/Pass/Pass.h"
++#include "triton/Dialect/Gluon/IR/Dialect.h"
++#include <memory>
++
++namespace mlir::triton::gluon {
++
++#define GEN_PASS_DECL
++#define GEN_PASS_REGISTRATION
++#include "triton/Dialect/Gluon/Transforms/Passes.h.inc"
++
++} // namespace mlir::triton::gluon
+diff --git a/include/triton/Dialect/Gluon/Transforms/Passes.td b/include/triton/Dialect/Gluon/Transforms/Passes.td
+new file mode 100644
+index 000000000000..84990c80d31c
+--- /dev/null
++++ b/include/triton/Dialect/Gluon/Transforms/Passes.td
+@@ -0,0 +1,14 @@
++#ifndef GLUON_PASSES
++#define GLUON_PASSES
++
++include "mlir/Pass/PassBase.td"
++
++def GluonResolveAutoEncodingsPass : Pass<"gluon-resolve-auto-encodings", "mlir::ModuleOp"> {
++  let summary = "Resolve automatic encodings";
++  let dependentDialects = [
++    "mlir::triton::gpu::TritonGPUDialect",
++  ];
++
++}
++
++#endif
+diff --git a/include/triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h b/include/triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h
+index d616a97ea0d1..aabf9c8389f0 100644
+--- a/include/triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h
++++ b/include/triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h
+@@ -46,7 +46,6 @@ std::unique_ptr<Pass> createTritonNvidiaGPUPlanCTAPass(
+ 
+ /// Generate the code for registering passes.
+ #define GEN_PASS_REGISTRATION
+-#define GEN_PASS_DECL_TRITONNVIDIAGPULEGALIZETMALAYOUTS
+ #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h.inc"
+ 
+ } // namespace nvidia_gpu
+diff --git a/lib/Dialect/CMakeLists.txt b/lib/Dialect/CMakeLists.txt
+index 98c93509131f..c813fbbd7d28 100644
+--- a/lib/Dialect/CMakeLists.txt
++++ b/lib/Dialect/CMakeLists.txt
+@@ -2,3 +2,4 @@ add_subdirectory(Triton)
+ add_subdirectory(TritonGPU)
+ add_subdirectory(TritonNvidiaGPU)
+ add_subdirectory(TritonInstrument)
++add_subdirectory(Gluon)
+diff --git a/lib/Dialect/Gluon/CMakeLists.txt b/lib/Dialect/Gluon/CMakeLists.txt
+new file mode 100644
+index 000000000000..9f57627c321f
+--- /dev/null
++++ b/lib/Dialect/Gluon/CMakeLists.txt
+@@ -0,0 +1,2 @@
++add_subdirectory(IR)
++add_subdirectory(Transforms)
+diff --git a/lib/Dialect/Gluon/IR/CMakeLists.txt b/lib/Dialect/Gluon/IR/CMakeLists.txt
+new file mode 100644
+index 000000000000..51b58d2fd509
+--- /dev/null
++++ b/lib/Dialect/Gluon/IR/CMakeLists.txt
+@@ -0,0 +1,11 @@
++add_triton_library(GluonIR
++  Dialect.cpp
++
++  DEPENDS
++  GluonTableGen
++  GluonAttrDefsIncGen
++
++  LINK_LIBS PUBLIC
++  TritonIR
++  TritonGPUIR
++)
+diff --git a/lib/Dialect/Gluon/IR/Dialect.cpp b/lib/Dialect/Gluon/IR/Dialect.cpp
+new file mode 100644
+index 000000000000..6a60a9171466
+--- /dev/null
++++ b/lib/Dialect/Gluon/IR/Dialect.cpp
+@@ -0,0 +1,114 @@
++#include "triton/Dialect/Gluon/IR/Dialect.h"
++
++#include "mlir/IR/DialectImplementation.h"
++#include "mlir/Support/LLVM.h"
++#include "llvm/ADT/TypeSwitch.h"
++
++using namespace mlir;
++using namespace mlir::triton::gpu;
++namespace gluon = mlir::triton::gluon;
++
++#define GET_ATTRDEF_CLASSES
++#include "triton/Dialect/Gluon/IR/Dialect.cpp.inc"
++#include "triton/Dialect/Gluon/IR/GluonAttrDefs.cpp.inc"
++
++namespace {
++
++// Layout inference for AutoEncodingAttr -> always propagate AutoEncodingAttr to
++// results
++struct GluonInferLayoutInterface : public triton::DialectInferLayoutInterface {
++  using DialectInferLayoutInterface::DialectInferLayoutInterface;
++
++  LogicalResult inferAutoEncoding(Attribute operandEncoding,
++                                  Attribute &resultEncoding) const {
++    assert(isa<gluon::AutoEncodingAttr>(operandEncoding));
++    resultEncoding = operandEncoding;
++    return success();
++  }
++
++  LogicalResult
++  inferReduceOpEncoding(Attribute operandEncoding, unsigned axis,
++                        Attribute &resultEncoding,
++                        std::optional<Location> loc) const override {
++    return inferAutoEncoding(operandEncoding, resultEncoding);
++  }
++
++  LogicalResult
++  inferTransOpEncoding(Attribute operandEncoding, ArrayRef<int64_t> shape,
++                       ArrayRef<int32_t> order, Attribute &resultEncoding,
++                       std::optional<Location> loc) const override {
++    return inferAutoEncoding(operandEncoding, resultEncoding);
++  }
++
++  LogicalResult
++  inferExpandDimsOpEncoding(Attribute operandEncoding, unsigned axis,
++                            Attribute &resultEncoding,
++                            std::optional<Location> location) const override {
++    return inferAutoEncoding(operandEncoding, resultEncoding);
++  }
++
++  LogicalResult
++  inferDotOpEncoding(Attribute operandEncoding, unsigned opIdx,
++                     Attribute resultEncoding,
++                     std::optional<Location> location) const override {
++    return inferAutoEncoding(operandEncoding, resultEncoding);
++  }
++
++  LogicalResult
++  verifyDotOpEncodingCompatibility(Operation *op, Attribute operandEncodingA,
++                                   Attribute operandEncodingB) const override {
++    return success();
++  }
++
++  LogicalResult
++  verifyLayoutsAreEqual(ArrayRef<int64_t> shape, Attribute expected,
++                        Attribute got,
++                        std::optional<Location> loc) const override {
++    return success(expected == got);
++  }
++
++  LogicalResult
++  inferReshapeOpEncoding(ArrayRef<int64_t> srcShape, Attribute srcEnc,
++                         ArrayRef<int64_t> dstShape, Attribute &dstEnc,
++                         std::optional<Location> loc) const override {
++    return inferAutoEncoding(srcEnc, dstEnc);
++  }
++
++  LogicalResult
++  inferDefaultJoinOpEncoding(Attribute srcEnc, Attribute &dstEnc,
++                             ArrayRef<int64_t> shape,
++                             std::optional<Location> loc) const override {
++    return inferAutoEncoding(srcEnc, dstEnc);
++  }
++
++  LogicalResult
++  inferSplitOpEncoding(Attribute srcEnc, Attribute &dstEnc,
++                       ArrayRef<int64_t> shape,
++                       std::optional<Location> loc) const override {
++    return inferAutoEncoding(srcEnc, dstEnc);
++  }
++
++  LogicalResult
++  inferFp4ToFpOpEncoding(ArrayRef<int64_t> shape, int axis, Attribute srcEnc,
++                         Attribute &dstEnc, bool fwdInference,
++                         std::optional<Location> loc) const override {
++    return inferAutoEncoding(srcEnc, dstEnc);
++  }
++};
++} // namespace
++
++namespace mlir::triton::gluon {
++
++void GluonDialect::initialize() {
++  addAttributes<
++#define GET_ATTRDEF_LIST
++#include "triton/Dialect/Gluon/IR/GluonAttrDefs.cpp.inc"
++      >();
++  addOperations<
++#define GET_OP_LIST
++#include "triton/Dialect/Gluon/IR/Ops.cpp.inc"
++      >();
++  addInterfaces<GluonInferLayoutInterface>();
++}
++
++} // namespace mlir::triton::gluon
+diff --git a/lib/Dialect/Gluon/Transforms/CMakeLists.txt b/lib/Dialect/Gluon/Transforms/CMakeLists.txt
+new file mode 100644
+index 000000000000..716e225352ef
+--- /dev/null
++++ b/lib/Dialect/Gluon/Transforms/CMakeLists.txt
+@@ -0,0 +1,12 @@
++add_triton_library(GluonTransforms
++  ResolveAutoEncodings.cpp
++
++  DEPENDS
++  GluonTransformsIncGen
++
++  LINK_LIBS PUBLIC
++  TritonIR
++  TritonGPUIR
++  GluonIR
++  MLIRTransformUtils
++)
+diff --git a/lib/Dialect/Gluon/Transforms/ResolveAutoEncodings.cpp b/lib/Dialect/Gluon/Transforms/ResolveAutoEncodings.cpp
+new file mode 100644
+index 000000000000..70b39fb27559
+--- /dev/null
++++ b/lib/Dialect/Gluon/Transforms/ResolveAutoEncodings.cpp
+@@ -0,0 +1,215 @@
++#include "mlir/IR/BuiltinAttributes.h"
++#include "mlir/IR/Visitors.h"
++#include "mlir/Support/LLVM.h"
++#include "triton/Dialect/Gluon/IR/Dialect.h"
++#include "triton/Dialect/Gluon/Transforms/Passes.h"
++#include "triton/Dialect/TritonGPU/IR/Dialect.h"
++#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
++#include "llvm/ADT/MapVector.h"
++#include "llvm/ADT/PriorityWorklist.h"
++#include "llvm/Support/Debug.h"
++#include "llvm/Support/LogicalResult.h"
++
++namespace ttg = mlir::triton::gpu;
++
++namespace mlir::triton::gluon {
++
++#define GEN_PASS_DEF_GLUONRESOLVEAUTOENCODINGSPASS
++#include "triton/Dialect/Gluon/Transforms/Passes.h.inc"
++
++#define DEBUG_TYPE "gluon-resolve-auto-encodings"
++#define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
++#define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
++
++namespace {
++
++bool isAutoEncodingTensorType(Type ty) {
++  auto tensorTy = dyn_cast<RankedTensorType>(ty);
++  return tensorTy && isa<gluon::AutoEncodingAttr>(tensorTy.getEncoding());
++}
++
++LogicalResult inferAutoLayouts(FuncOp func) {
++  // Disallow auto encoding accross function call boundaries
++  for (auto argTy : func.getArgumentTypes()) {
++    if (isAutoEncodingTensorType(argTy)) {
++      return func->emitError(
++          "Functions taking auto encoding must be fully inlined");
++    }
++  }
++  for (auto resultTy : func.getResultTypes()) {
++    if (isAutoEncodingTensorType(resultTy))
++      return func->emitError(
++          "Functions returning auto encoding must be fully inlined");
++  }
++
++  llvm::MapVector<Value, Attribute> valueToEncoding;
++  llvm::PriorityWorklist<Value> worklist;
++
++  auto updateEncoding = [&](ArrayRef<Value> values,
++                            Attribute enc) -> LogicalResult {
++    for (auto value : values) {
++      auto [it, inserted] = valueToEncoding.insert({value, enc});
++      if (!inserted) {
++        if (it->second != enc) {
++          auto defOp = value.getDefiningOp();
++          auto op = defOp ? defOp : func;
++          return op->emitOpError("Found conflicting encodings for value");
++        }
++      } else {
++        LLVM_DEBUG({
++          DBGS() << "Setting value:\n\t" << value << "\nto encoding:\n\t" << enc
++                 << "\n";
++        });
++        worklist.insert(value);
++      }
++    }
++    return success();
++  };
++
++  // 1. Set seed values from layout conversions
++  auto res = func.walk([&](ttg::ConvertLayoutOp cvtOp) -> WalkResult {
++    auto src = cvtOp.getSrc();
++    auto res = cvtOp.getResult();
++    auto srcEnc = src.getType().getEncoding();
++    auto resEnc = res.getType().getEncoding();
++    auto isAutoSrc = isa<gluon::AutoEncodingAttr>(srcEnc);
++    auto isAutoRes = isa<gluon::AutoEncodingAttr>(resEnc);
++    if (isAutoSrc && !isAutoRes) {
++      return updateEncoding({src}, resEnc);
++    }
++    return WalkResult::advance();
++  });
++
++  if (res.wasInterrupted())
++    return failure();
++
++  // 2. Propagate encodings through the graph until fixed point, or conflict
++  while (!worklist.empty()) {
++    auto val = worklist.pop_back_val();
++    auto enc = valueToEncoding[val];
++    assert(enc);
++
++    // Propagate to users
++    for (OpOperand &use : val.getUses()) {
++      auto op = use.getOwner();
++      if (isa<scf::ForOp, scf::WhileOp>(op)) {
++        auto offset = 3 * isa<scf::ForOp>(op);
++        auto tiedArgs = getTiedArgs(op, use.getOperandNumber() - offset);
++        if (failed(updateEncoding(tiedArgs, enc)))
++          return failure();
++      } else if (isa<scf::YieldOp>(op)) {
++        auto tiedArgs = getTiedArgs(op, use.getOperandNumber());
++        if (failed(updateEncoding(tiedArgs, enc)))
++          return failure();
++      } else {
++        auto dstEnc = inferDstEncoding(op, enc);
++        if (dstEnc) {
++          if (failed(updateEncoding(llvm::to_vector_of<Value>(op->getResults()),
++                                    dstEnc)))
++            return failure();
++        }
++      }
++    }
++
++    // Propagate to defining ops
++    if (auto opResult = dyn_cast<OpResult>(val)) {
++      auto definingOp = opResult.getOwner();
++      if (isa<scf::ForOp, scf::WhileOp, scf::IfOp>(definingOp)) {
++        auto tiedArgs = getTiedArgs(definingOp, opResult.getResultNumber());
++        if (failed(updateEncoding(tiedArgs, enc)))
++          return failure();
++      } else {
++        auto srcEncoding = inferSrcEncoding(definingOp, enc);
++        if (srcEncoding) {
++          if (failed(updateEncoding(
++                  llvm::to_vector_of<Value>(definingOp->getOperands()),
++                  srcEncoding)))
++            return failure();
++        }
++      }
++    } else if (auto blockArg = dyn_cast<BlockArgument>(val)) {
++      auto parentOp = blockArg.getOwner()->getParentOp();
++      if (isa<scf::ForOp, scf::WhileOp>(parentOp)) {
++        auto offset = isa<scf::ForOp>(parentOp);
++        auto tiedArgs = getTiedArgs(parentOp, blockArg.getArgNumber() - offset);
++        if (failed(updateEncoding(tiedArgs, enc)))
++          return failure();
++      }
++    }
++  }
++
++  // 3. Transfer propagated encodings into the graph
++  auto ctx = func.getContext();
++  for (auto &[val, enc] : valueToEncoding) {
++    auto existingTy = cast<RankedTensorType>(val.getType());
++    assert(isa<gluon::AutoEncodingAttr>(existingTy.getEncoding()));
++    auto ty = existingTy.cloneWithEncoding(enc);
++    val.setType(ty);
++
++    if (auto opResult = dyn_cast<OpResult>(val)) {
++      if (auto constantOp = dyn_cast<arith::ConstantOp>(opResult.getOwner())) {
++        auto value = cast<SplatElementsAttr>(constantOp.getValueAttr());
++        auto newValue =
++            SplatElementsAttr::get(ty, value.getSplatValue<Attribute>());
++        constantOp.setValueAttr(newValue);
++      }
++    }
++  }
++  return success();
++}
++
++LogicalResult inferAutoLayouts(ModuleOp &mod) {
++  for (auto &op : *mod.getBody()) {
++    auto func = dyn_cast<FuncOp>(&op);
++    if (!func)
++      continue;
++    if (failed(inferAutoLayouts(func)))
++      return failure();
++  }
++  return success();
++}
++
++} // anonymous namespace
++
++class GluonResolveAutoEncodingsPass
++    : public impl::GluonResolveAutoEncodingsPassBase<
++          GluonResolveAutoEncodingsPass> {
++public:
++  using BaseT =
++      impl::GluonResolveAutoEncodingsPassBase<GluonResolveAutoEncodingsPass>;
++  using BaseT::BaseT;
++
++  void runOnOperation() override {
++    MLIRContext *context = &getContext();
++    ModuleOp m = getOperation();
++    // Do layout inference
++    if (failed(inferAutoLayouts(m)))
++      return signalPassFailure();
++
++    // Double check we didn't miss anything
++    auto res = m.walk([](Operation *op) -> WalkResult {
++      for (auto resTy : op->getResultTypes()) {
++        if (isAutoEncodingTensorType(resTy)) {
++          return op->emitOpError("Failed to infer return type");
++        }
++      }
++      return success();
++    });
++    if (res.wasInterrupted())
++      return signalPassFailure();
++
++    res = m.walk([](Block *block) -> WalkResult {
++      for (auto argTy : block->getArgumentTypes()) {
++        if (isAutoEncodingTensorType(argTy)) {
++          return block->getParentOp()->emitError(
++              "Failed to infer block argument type");
++        }
++      }
++      return success();
++    });
++    if (res.wasInterrupted())
++      return signalPassFailure();
++  }
++};
++
++} // namespace mlir::triton::gluon
+diff --git a/python/src/gluon_ir.cc b/python/src/gluon_ir.cc
+index 906d3336ec8c..e99dbabfcd56 100644
+--- a/python/src/gluon_ir.cc
++++ b/python/src/gluon_ir.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "mlir/IR/BuiltinTypes.h"
+ #include "mlir/IR/Types.h"
++#include "triton/Dialect/Gluon/IR/Dialect.h"
+ #include "triton/Dialect/TritonGPU/IR/Attributes.h"
+ #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+ #include "triton/Dialect/TritonGPU/IR/Types.h"
+@@ -16,6 +17,7 @@ namespace py = pybind11;
+ namespace tt = triton;
+ namespace ttg = triton::gpu;
+ namespace ttng = triton::nvidia_gpu;
++namespace gluon = mlir::triton::gluon;
+ 
+ // Helper to check if an MLIR type or attribute has a verifier method.
+ template <typename AttrOrType>
+@@ -83,6 +85,7 @@ struct GluonOpBuilder : public TritonOpBuilder {
+ };
+ 
+ struct GluonLayouts {
++  py::handle AutoLayout;
+   py::handle BlockedLayout;
+   py::handle SliceLayout;
+   py::handle DistributedLinearLayout;
+@@ -93,6 +96,7 @@ struct GluonLayouts {
+   GluonLayouts() {
+     auto layouts =
+         py::module::import("triton.experimental.gluon.language._layouts");
++    AutoLayout = py::object(layouts.attr("AutoLayout")).release();
+     BlockedLayout = py::object(layouts.attr("BlockedLayout")).release();
+     SliceLayout = py::object(layouts.attr("SliceLayout")).release();
+     DistributedLinearLayout =
+@@ -138,10 +142,10 @@ py::object layoutToGluon(Attribute layout) {
+     auto ctaLayout = mma.getCTALayout();
+     return layouts.NVMMADistributedLayout(
+         std::vector<unsigned>{mma.getVersionMajor(), mma.getVersionMinor()},
+-        toStdVector(mma.getWarpsPerCTA()),
++        toStdVector(mma.getWarpsPerCTA()), toStdVector(mma.getInstrShape()),
+         toStdVector(ctaLayout.getCTAsPerCGA()),
+         toStdVector(ctaLayout.getCTASplitNum()),
+-        toStdVector(ctaLayout.getCTAOrder()), toStdVector(mma.getInstrShape()));
++        toStdVector(ctaLayout.getCTAOrder()));
+   } else if (auto nvmma = dyn_cast<ttg::NVMMASharedEncodingAttr>(layout)) {
+     auto ctaLayout = nvmma.getCTALayout();
+     return layouts.NVMMASharedLayout(
+@@ -158,6 +162,8 @@ py::object layoutToGluon(Attribute layout) {
+         swizzled.getOrder(), toStdVector(ctaLayout.getCTAsPerCGA()),
+         toStdVector(ctaLayout.getCTASplitNum()),
+         toStdVector(ctaLayout.getCTAOrder()));
++  } else if (auto autoEnc = dyn_cast<gluon::AutoEncodingAttr>(layout)) {
++    return layouts.AutoLayout();
+   }
+   throw py::value_error("Unhandled encoding encountered");
+ }
+@@ -262,6 +268,10 @@ void init_gluon_ir(py::module &&m) {
+                  ctx, swizzleByteWidth, transposed, elementBitwidth, fp4Padded,
+                  ctaLayout);
+            })
++      .def("get_auto_layout",
++           [](GluonOpBuilder &self) -> Attribute {
++             return self.getChecked<gluon::AutoEncodingAttr>(self.getContext());
++           })
+       .def("get_swizzled_shared_layout",
+            [](GluonOpBuilder &self, int vec, int perPhase, int maxPhase,
+               std::vector<unsigned> &order, std::vector<unsigned> &ctasPerCga,
+@@ -495,11 +505,6 @@ void init_gluon_ir(py::module &&m) {
+            [](TritonOpBuilder &self, Value &arg, Type retTy) -> Value {
+              return self.create<tt::BroadcastOp>(retTy, arg);
+            })
+-      .def(
+-          "create_expand_dims",
+-          [](TritonOpBuilder &self, Value &arg, int axis, Type retTy) -> Value {
+-            return self.create<tt::ExpandDimsOp>(retTy, arg, axis);
+-          })
+       .def("create_warp_return",
+            [](GluonOpBuilder &self) -> Operation * {
+              return self.create<ttg::WarpReturnOp>();
+diff --git a/python/src/ir.cc b/python/src/ir.cc
+index eb05fc1aefdd..819919835c92 100644
+--- a/python/src/ir.cc
++++ b/python/src/ir.cc
+@@ -27,6 +27,7 @@
+ #include "mlir/Transforms/LocationSnapshot.h"
+ 
+ #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
++#include "triton/Dialect/Gluon/IR/Dialect.h"
+ #include "triton/Dialect/Triton/IR/Dialect.h"
+ #include "triton/Dialect/Triton/IR/Types.h"
+ #include "triton/Dialect/Triton/IR/Utility.h"
+@@ -304,7 +305,7 @@ void init_triton_ir(py::module &&m) {
+                     math::MathDialect, arith::ArithDialect, scf::SCFDialect,
+                     ::mlir::gpu::GPUDialect, cf::ControlFlowDialect,
+                     ::mlir::triton::proton::ProtonDialect, LLVM::LLVMDialect,
+-                    mlir::ub::UBDialect>();
++                    mlir::ub::UBDialect, mlir::triton::gluon::GluonDialect>();
+     mlir::LLVM::registerInlinerInterface(registry);
+     registerBuiltinDialectTranslation(registry);
+     registerLLVMDialectTranslation(registry);
+diff --git a/python/src/passes.cc b/python/src/passes.cc
+index f857749a008a..4f8c6d9b2d97 100644
+--- a/python/src/passes.cc
++++ b/python/src/passes.cc
+@@ -7,6 +7,7 @@
+ #include "triton/Analysis/Membar.h"
+ #include "triton/Conversion/TritonGPUToLLVM/Passes.h"
+ #include "triton/Conversion/TritonToTritonGPU/Passes.h"
++#include "triton/Dialect/Gluon/Transforms/Passes.h"
+ #include "triton/Dialect/Triton/Transforms/Passes.h"
+ #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
+ #include "triton/Dialect/TritonInstrument/Transforms/Passes.h"
+@@ -111,6 +112,13 @@ void init_triton_passes_llvmir(py::module &&m) {
+   ADD_PASS_WRAPPER_0("add_di_scope", mlir::createLLVMDIScope);
+ }
+ 
++void init_gluon_passes(py::module &&m) {
++  using namespace mlir;
++  namespace gluon = mlir::triton::gluon;
++  ADD_PASS_WRAPPER_0("add_resolve_auto_encodings",
++                     gluon::createGluonResolveAutoEncodingsPass);
++}
++
+ void init_triton_passes(py::module &&m) {
+   init_triton_analysis(m.def_submodule("analysis"));
+   init_triton_passes_common(m.def_submodule("common"));
+@@ -118,4 +126,5 @@ void init_triton_passes(py::module &&m) {
+   init_triton_passes_ttir(m.def_submodule("ttir"));
+   init_triton_passes_ttgpuir(m.def_submodule("ttgpuir"));
+   init_triton_passes_llvmir(m.def_submodule("llvmir"));
++  init_gluon_passes(m.def_submodule("gluon"));
+ }
+diff --git a/python/test/gluon/test_frontend.py b/python/test/gluon/test_frontend.py
+index fe266bc8e5fb..76de9c46837e 100644
+--- a/python/test/gluon/test_frontend.py
++++ b/python/test/gluon/test_frontend.py
+@@ -1171,3 +1171,16 @@ def kernel():
+ } loc(#loc)
+ #loc = loc(unknown)
+ """)
++
++
++@filecheck_test
++@gluon.jit
++def test_auto_layout():
++    # CHECK: [[X_1D:%.*]] = arith.constant dense<7> : tensor<16xi32, #gluon.auto_encoding>
++    # CHECK: [[Y_1D:%.*]] = arith.constant dense<2> : tensor<8xi32, #gluon.auto_encoding>
++    x = ttgl.full([16], 7, ttgl.int32, layout=ttgl.AutoLayout())[:, None]
++    y = ttgl.full([8], 2, ttgl.int32, layout=ttgl.AutoLayout())[None, :]
++    # CHECK: arith.addi {{.*}} : tensor<16x8xi32, #gluon.auto_encoding>
++    z = x + y
++    # CHECK: (tensor<16x8xi32, #gluon.auto_encoding>) -> tensor<16xi32, #gluon.auto_encoding
++    ttgl.sum(z, axis=1)
+diff --git a/python/triton/experimental/gluon/language/_layouts.py b/python/triton/experimental/gluon/language/_layouts.py
+index 65893b834442..643471519b26 100644
+--- a/python/triton/experimental/gluon/language/_layouts.py
++++ b/python/triton/experimental/gluon/language/_layouts.py
+@@ -3,6 +3,7 @@
+ from triton.language.core import _unwrap_if_constexpr, _unwrap_shape, constexpr_type
+ 
+ __all__ = [
++    "AutoLayout",
+     "BlockedLayout",
+     "SliceLayout",
+     "DistributedLinearLayout",
+@@ -31,6 +32,16 @@ def type(self):
+         return constexpr_type(self)
+ 
+ 
++@dataclass(frozen=True)
++class AutoLayout(DistributedLayout):
++
++    def _to_ir(self, builder):
++        return builder.get_auto_layout()
++
++    def mangle(self):
++        return "AL"
++
++
+ @dataclass(frozen=True)
+ class BlockedLayout(DistributedLayout):
+     """
+diff --git a/python/triton/experimental/gluon/language/_semantic.py b/python/triton/experimental/gluon/language/_semantic.py
+index 2802d52714ce..184437878521 100644
+--- a/python/triton/experimental/gluon/language/_semantic.py
++++ b/python/triton/experimental/gluon/language/_semantic.py
+@@ -1,7 +1,7 @@
+ from typing import Sequence, List, TypeVar, Tuple, Callable
+ from triton.language.semantic import TritonSemantic
+ from . import _core as ttgl
+-from ._layouts import SliceLayout
++from ._layouts import SliceLayout, AutoLayout
+ from triton._C.libtriton.gluon_ir import GluonOpBuilder
+ from triton.compiler.code_generator import flatten_values_to_ir, unflatten_ir_values
+ 
+@@ -22,10 +22,15 @@ class GluonSemantic(TritonSemantic[TensorTy]):
+     def __init__(self, builder: GluonOpBuilder):
+         self.builder = builder
+ 
++    def _wrap_handle_infer_layout(self, handle, scalar_ty, shape):
++        if shape == []:
++            ty = scalar_ty
++        else:
++            ty = ttgl.distributed_type(scalar_ty, shape, self.builder.get_gluon_layout_from_tensor(handle))
++        return self.tensor(handle, ty)
++
+     def _wrap_tensor_infer_layout(self, tensor):
+-        ty = ttgl.distributed_type(tensor.type.scalar, tensor.shape,
+-                                   self.builder.get_gluon_layout_from_tensor(tensor.handle))
+-        return self.tensor(tensor.handle, ty)
++        return self._wrap_handle_infer_layout(tensor.handle, tensor.type.scalar, tensor.shape)
+ 
+     def _broadcast_shapes(self, lhs_shape: List[int], rhs_shape: List[int]):
+         if len(lhs_shape) != len(rhs_shape):
+@@ -53,14 +58,14 @@ def expand_dims(self, input: TensorTy, axis: int) -> TensorTy:
+         _check(isinstance(input.type, ttgl.distributed_type),
+                lambda: f"expected expand_dims input to be a distributed_type but got: {input.type!r}")
+         layout = input.type.layout
+-        _check(isinstance(layout, SliceLayout),
++        _check(isinstance(layout, (SliceLayout, AutoLayout)),
+                lambda: f"expected expand_dims input to have a SliceLayout, but got: {layout}")
+-        _check(layout.dim == axis,
+-               lambda: f"expected expand_dims input layout to be sliced in axis {axis} but got {layout.dim}")
++        _check(
++            isinstance(layout, AutoLayout) or layout.dim == axis,
++            lambda: f"expected expand_dims input layout to be sliced in axis {axis} but got {layout.dim}")
+ 
+-        ret_ty = ttgl.distributed_type(input.type.scalar, dst_shape, layout.parent)
+-        handle = self.builder.create_expand_dims(input.handle, axis, ret_ty.to_ir(self.builder))
+-        return self.tensor(handle, ret_ty)
++        handle = self.builder.create_expand_dims(input.handle, axis)
++        return self._wrap_handle_infer_layout(handle, input.type.scalar, dst_shape)
+ 
+     def join(self, a: TensorTy, b: TensorTy) -> TensorTy:
+         a, b = self.broadcast_impl_value(a, b)
+@@ -230,7 +235,6 @@ def reduction(self, inputs: Sequence[TensorTy], axis: int, region_builder_fn) ->
+         _check(0 <= axis < rank, lambda: f"expected reduction axis to be in the range [0, {rank}) but got {axis}")
+         self._check_same_layout(inputs)
+         ret_shape = [s for i, s in enumerate(shape) if i != axis]
+-        ret_layout = SliceLayout(axis, inputs[0].type.layout)
+         assert all(t.type.shape == shape for t in inputs), "all reduction inputs must have the same shape"
+ 
+         reduce_op = self.builder.create_reduce([t.handle for t in inputs], axis)
+@@ -238,7 +242,7 @@ def reduction(self, inputs: Sequence[TensorTy], axis: int, region_builder_fn) ->
+         assert reduce_op.verify()
+ 
+         return tuple(
+-            self.wrap_tensor(reduce_op.get_result(i), inputs[i].type.scalar, ret_shape, ret_layout)
++            self._wrap_handle_infer_layout(reduce_op.get_result(i), inputs[i].type.scalar, ret_shape)
+             for i in range(len(inputs)))
+ 
+     def warp_specialize(self, default_args, default_partition, worker_args, worker_partitions,
+diff --git a/test/Gluon/auto_encoding.mlir b/test/Gluon/auto_encoding.mlir
+new file mode 100644
+index 000000000000..ad692d2bcf63
+--- /dev/null
++++ b/test/Gluon/auto_encoding.mlir
+@@ -0,0 +1,98 @@
++// RUN: triton-opt %s -split-input-file --gluon-resolve-auto-encodings | FileCheck %s
++
++#blocked = #ttg.blocked<{sizePerThread = [4, 4], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
++
++module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
++  tt.func public @infer_simple() -> tensor<8x16xi32, #blocked> {
++    // CHECK-DAG: [[BLOCKED:#.*]] = #ttg.blocked<{sizePerThread = [4, 4], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
++    // CHECK: [[CST:%.*]] = arith.constant dense<7> : tensor<16xi32, #ttg.slice<{dim = 0, parent = [[BLOCKED]]}>>
++    // CHECK: [[SLICE:%.*]] = tt.expand_dims [[CST]] {axis = 0 : i32} : tensor<16xi32, #ttg.slice<{dim = 0, parent = [[BLOCKED]]}>> -> tensor<1x16xi32, [[BLOCKED]]>
++    // CHECK: [[BROADCAST:%.*]] = tt.broadcast [[SLICE]] : tensor<1x16xi32, [[BLOCKED]]> -> tensor<8x16xi32, [[BLOCKED]]>
++    // CHECK: [[RES:%.*]] = ttg.convert_layout [[BROADCAST]] : tensor<8x16xi32, [[BLOCKED]]> -> tensor<8x16xi32, [[BLOCKED]]>
++    // CHECK: tt.return [[RES]] : tensor<8x16xi32, [[BLOCKED]]>
++    %x_1d = arith.constant dense<7> : tensor<16xi32, #gluon.auto_encoding>
++    %x_slice = tt.expand_dims %x_1d {axis = 0 : i32} : tensor<16xi32, #gluon.auto_encoding> -> tensor<1x16xi32, #gluon.auto_encoding>
++    %x_2d = tt.broadcast %x_slice : tensor<1x16xi32, #gluon.auto_encoding> -> tensor<8x16xi32, #gluon.auto_encoding>
++    %cvt = ttg.convert_layout %x_2d : tensor<8x16xi32, #gluon.auto_encoding> -> tensor<8x16xi32, #blocked>
++    tt.return %cvt : tensor<8x16xi32, #blocked>
++  }
++}
++
++// -----
++
++#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
++#blocked1 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
++
++module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
++  tt.func public @infer_with_convert() -> tensor<16xi32, #blocked1> {
++    // CHECK-DAG: [[BLOCKED:#.*]] = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
++    // CHECK-DAG: [[BLOCKED1:#.*]] = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
++    // CHECK: [[CST:%.*]] = arith.constant dense<7> : tensor<16xi32, [[BLOCKED]]>
++    // CHECK: [[CVT1:%.*]] = ttg.convert_layout [[CST]] : tensor<16xi32, [[BLOCKED]]> -> tensor<16xi32, [[BLOCKED1]]>
++    // CHECK: [[ADD:%.*]] = arith.addi [[CVT1]], [[CVT1]] : tensor<16xi32, [[BLOCKED1]]>
++    // CHECK: [[CVT2:%.*]] = ttg.convert_layout [[ADD]] : tensor<16xi32, [[BLOCKED1]]> -> tensor<16xi32, [[BLOCKED1]]>
++    // CHECK: tt.return [[CVT2]] : tensor<16xi32, [[BLOCKED1]]>
++    %0 = arith.constant dense<7> : tensor<16xi32, #blocked>
++    %cvt1 = ttg.convert_layout %0 : tensor<16xi32, #blocked> -> tensor<16xi32, #gluon.auto_encoding>
++    %add = arith.addi %cvt1, %cvt1 : tensor<16xi32, #gluon.auto_encoding>
++    %cvt2 = ttg.convert_layout %add : tensor<16xi32, #gluon.auto_encoding> -> tensor<16xi32, #blocked1>
++    tt.return %cvt2 : tensor<16xi32, #blocked1>
++  }
++}
++
++
++// -----
++
++#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
++
++module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
++  tt.func public @infer_if(%arg0 : i1) -> tensor<16xi32, #blocked> {
++    // CHECK-DAG: [[BLOCKED:#.*]] = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
++    // CHECK: [[C1:%.*]] = arith.constant dense<1> : tensor<16xi32, [[BLOCKED]]>
++    // CHECK: [[C2:%.*]] = arith.constant dense<2> : tensor<16xi32, [[BLOCKED]]>
++    // CHECK: [[IF:%.*]] = scf.if %arg0 -> (tensor<16xi32, [[BLOCKED]]>) {
++    // CHECK:   scf.yield [[C1]] : tensor<16xi32, [[BLOCKED]]>
++    // CHECK: } else {
++    // CHECK:   scf.yield [[C2]] : tensor<16xi32, [[BLOCKED]]>
++    // CHECK: }
++    // CHECK: [[RES:%.*]] = ttg.convert_layout [[IF]] : tensor<16xi32, [[BLOCKED]]> -> tensor<16xi32, [[BLOCKED]]>
++    // CHECK: tt.return [[RES]] : tensor<16xi32, [[BLOCKED]]>
++    %c1 = arith.constant dense<1> : tensor<16xi32, #gluon.auto_encoding>
++    %c2 = arith.constant dense<2> : tensor<16xi32, #gluon.auto_encoding>
++    %z = scf.if %arg0 -> tensor<16xi32, #gluon.auto_encoding> {
++      scf.yield %c1 : tensor<16xi32, #gluon.auto_encoding>
++    } else {
++      scf.yield %c2 : tensor<16xi32, #gluon.auto_encoding>
++    }
++    %cvt = ttg.convert_layout %z : tensor<16xi32, #gluon.auto_encoding> -> tensor<16xi32, #blocked>
++    tt.return %cvt : tensor<16xi32, #blocked>
++  }
++}
++
++// -----
++
++#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
++
++module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32} {
++  tt.func public @infer_for(%arg0: i32) -> tensor<32xi32, #blocked> {
++    // CHECK-DAG: [[BLOCKED:#.*]] = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
++    // CHECK: [[RANGE:%.*]] = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32, [[BLOCKED]]>
++    // CHECK: [[IF:%.*]] = scf.for {{%.*}} = %c0_i32 to %arg0 step %c1_i32 iter_args([[ITER_ARG:%.*]] = [[RANGE]]) -> (tensor<32xi32, [[BLOCKED]]>) : i32 {
++    // CHECK:   [[CST:%.*]] = arith.constant dense<2> : tensor<32xi32, [[BLOCKED]]>
++    // CHECK:   [[MUL:%.*]] = arith.muli [[ITER_ARG]], [[CST]] : tensor<32xi32, [[BLOCKED]]>
++    // CHECK:   scf.yield [[MUL]] : tensor<32xi32, [[BLOCKED]]>
++    // CHECK: }
++    // CHECK: [[CVT:%.*]] = ttg.convert_layout [[IF]] : tensor<32xi32, [[BLOCKED]]> -> tensor<32xi32, [[BLOCKED]]>
++    // CHECK: tt.return [[CVT]] : tensor<32xi32, [[BLOCKED]]>
++    %c0_i32 = arith.constant 0 : i32
++    %c1_i32 = arith.constant 1 : i32
++    %0 = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32, #gluon.auto_encoding>
++    %1 = scf.for %arg1 = %c0_i32 to %arg0 step %c1_i32 iter_args(%arg2 = %0) -> (tensor<32xi32, #gluon.auto_encoding>) : i32 {
++      %cst = arith.constant dense<2> : tensor<32xi32, #gluon.auto_encoding>
++      %2 = arith.muli %arg2, %cst : tensor<32xi32, #gluon.auto_encoding>
++      scf.yield %2 : tensor<32xi32, #gluon.auto_encoding>
++    }
++    %cvt = ttg.convert_layout %1 : tensor<32xi32, #gluon.auto_encoding> -> tensor<32xi32, #blocked>
++    tt.return %cvt : tensor<32xi32, #blocked>
++  }
++}
+diff --git a/test/Gluon/invalid_auto_encoding.mlir b/test/Gluon/invalid_auto_encoding.mlir
+new file mode 100644
+index 000000000000..e36469cc49e0
+--- /dev/null
++++ b/test/Gluon/invalid_auto_encoding.mlir
+@@ -0,0 +1,49 @@
++// RUN: triton-opt %s -split-input-file --gluon-resolve-auto-encodings --verify-diagnostics
++
++#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
++#blocked1 = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
++
++module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
++  tt.func public @infer_conflict() -> (tensor<16xi32, #blocked>, tensor<16xi32, #blocked1>) {
++    // expected-error @+1 {{Found conflicting encodings for value}}
++    %0 = arith.constant dense<7> : tensor<16xi32, #gluon.auto_encoding>
++    %cvt1 = ttg.convert_layout %0 : tensor<16xi32, #gluon.auto_encoding> -> tensor<16xi32, #blocked>
++    %cvt2 = ttg.convert_layout %0 : tensor<16xi32, #gluon.auto_encoding> -> tensor<16xi32, #blocked1>
++    tt.return %cvt1, %cvt2 : tensor<16xi32, #blocked>, tensor<16xi32, #blocked1>
++  }
++}
++
++// -----
++
++#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
++#blocked1 = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
++
++module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
++  tt.func public @infer_no_seed(%arg0 : !tt.ptr<i32>) {
++    // expected-error @+1 {{Failed to infer return type}}
++    %0 = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32, #gluon.auto_encoding>
++    %1 = tt.splat %arg0 : !tt.ptr<i32> -> tensor<32x!tt.ptr<i32>, #gluon.auto_encoding>
++    %2 = tt.addptr %1, %0 : tensor<32x!tt.ptr<i32>, #gluon.auto_encoding>, tensor<32xi32, #gluon.auto_encoding>
++    tt.store %2, %0 : tensor<32x!tt.ptr<i32>, #gluon.auto_encoding>
++    tt.return
++  }
++}
++
++// -----
++
++module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
++  // expected-error @+1 {{Functions taking auto encoding must be fully inlined}}
++  tt.func public @function_argument(%arg0 : tensor<32xi32, #gluon.auto_encoding>) {
++    tt.return
++  }
++}
++
++// -----
++
++module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
++  // expected-error @+1 {{Functions returning auto encoding must be fully inlined}}
++  tt.func public @function_return() -> tensor<32xi32, #gluon.auto_encoding> {
++    %0 = arith.constant dense<0> : tensor<32xi32, #gluon.auto_encoding>
++    tt.return %0 : tensor<32xi32, #gluon.auto_encoding>
++  }
++}
+diff --git a/third_party/amd/backend/compiler.py b/third_party/amd/backend/compiler.py
+index 4521bc2230d4..f757662b9731 100644
+--- a/third_party/amd/backend/compiler.py
++++ b/third_party/amd/backend/compiler.py
+@@ -265,12 +265,13 @@ def make_ttgir(mod, metadata, options):
+         return mod
+ 
+     @staticmethod
+-    def ttgir_opt(src, metadata, options):
++    def gluon_to_ttgir(src, metadata, options):
+         mod = src
+         pm = ir.pass_manager(mod.context)
+         pm.enable_debug()
+ 
+         passes.ttgpuir.add_inliner(pm)
++        passes.gluon.add_resolve_auto_encodings(pm)
+         passes.common.add_sccp(pm)
+         passes.ttir.add_loop_aware_cse(pm)
+         passes.ttgpuir.add_canonicalizer(pm)
+@@ -433,7 +434,7 @@ def add_stages(self, stages, options, language):
+             stages["ttir"] = lambda src, metadata: self.make_ttir(src, metadata, options)
+             stages["ttgir"] = lambda src, metadata: self.make_ttgir(src, metadata, options)
+         elif language == Language.GLUON:
+-            stages["ttgir"] = lambda src, metadata: self.ttgir_opt(src, metadata, options)
++            stages["ttgir"] = lambda src, metadata: self.gluon_to_ttgir(src, metadata, options)
+         stages["llir"] = lambda src, metadata: self.make_llir(src, metadata, options)
+         stages["amdgcn"] = lambda src, metadata: self.make_amdgcn(src, metadata, options)
+         stages["hsaco"] = lambda src, metadata: self.make_hsaco(src, metadata, options)
+diff --git a/third_party/nvidia/backend/compiler.py b/third_party/nvidia/backend/compiler.py
+index 141a22cfe1c1..19d0bf5b23c4 100644
+--- a/third_party/nvidia/backend/compiler.py
++++ b/third_party/nvidia/backend/compiler.py
+@@ -308,12 +308,13 @@ def make_ttgir(mod, metadata, opt, capability):
+         metadata["tensordesc_meta"] = tensordesc_meta
+         return mod
+ 
+-    def ttgir_opt(self, src, metadata, options, capability):
++    def gluon_to_ttgir(self, src, metadata, options, capability):
+         mod = src
+         pm = ir.pass_manager(mod.context)
+         pm.enable_debug()
+ 
+         passes.ttgpuir.add_inliner(pm)
++        passes.gluon.add_resolve_auto_encodings(pm)
+         passes.common.add_sccp(pm)
+         passes.ttir.add_loop_aware_cse(pm)
+         passes.ttgpuir.add_canonicalizer(pm)
+@@ -465,7 +466,7 @@ def add_stages(self, stages, options, language):
+             stages["ttir"] = lambda src, metadata: self.make_ttir(src, metadata, options, capability)
+             stages["ttgir"] = lambda src, metadata: self.make_ttgir(src, metadata, options, capability)
+         elif language == Language.GLUON:
+-            stages["ttgir"] = lambda src, metadata: self.ttgir_opt(src, metadata, options, capability)
++            stages["ttgir"] = lambda src, metadata: self.gluon_to_ttgir(src, metadata, options, capability)
+         stages["llir"] = lambda src, metadata: self.make_llir(src, metadata, options, capability)
+         stages["ptx"] = lambda src, metadata: self.make_ptx(src, metadata, options, self.target.arch)
+         stages["cubin"] = lambda src, metadata: self.make_cubin(src, metadata, options, self.target.arch)

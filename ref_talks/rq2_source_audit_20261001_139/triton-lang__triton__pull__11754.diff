@@ -1,0 +1,890 @@
+diff --git a/include/triton/Dialect/TritonGPU/Transforms/Schedule.h b/include/triton/Dialect/TritonGPU/Transforms/Schedule.h
+index 4d914b93dd07..99f337d53014 100644
+--- a/include/triton/Dialect/TritonGPU/Transforms/Schedule.h
++++ b/include/triton/Dialect/TritonGPU/Transforms/Schedule.h
+@@ -34,7 +34,7 @@ bool pipelineTMAStores(LoopLikeOpInterface loop);
+ /// ops.
+ // TODO: this should be included as part of the pipeline but currently the wgmma
+ // wait modeling is problematic.
+-void asyncLaunchDots(scf::ForOp forOp);
++void asyncLaunchDots(scf::ForOp forOp, unsigned numStages);
+ 
+ /// Post process the pipelined loop by updating the wait ops with the right
+ /// number of groups in flight.
+diff --git a/lib/Dialect/TritonGPU/Transforms/Pipeliner/SoftwarePipeliner.cpp b/lib/Dialect/TritonGPU/Transforms/Pipeliner/SoftwarePipeliner.cpp
+index fff6b7c65aab..0731ca6d28e2 100644
+--- a/lib/Dialect/TritonGPU/Transforms/Pipeliner/SoftwarePipeliner.cpp
++++ b/lib/Dialect/TritonGPU/Transforms/Pipeliner/SoftwarePipeliner.cpp
+@@ -39,8 +39,9 @@ static void pipelineWgmma(ModuleOp moduleOp, unsigned numStages) {
+   moduleOp->walk([&](scf::ForOp forOp) { loops.push_back(forOp); });
+ 
+   for (scf::ForOp forOp : loops) {
+-    if (getNumStagesOrDefault(forOp, numStages) >= 1)
+-      mlir::triton::asyncLaunchDots(forOp);
++    int loopNumStages = getNumStagesOrDefault(forOp, numStages);
++    if (loopNumStages >= 1)
++      mlir::triton::asyncLaunchDots(forOp, loopNumStages);
+   }
+ }
+ 
+diff --git a/lib/Dialect/TritonGPU/Transforms/Pipeliner/WGMMAPipeline.cpp b/lib/Dialect/TritonGPU/Transforms/Pipeliner/WGMMAPipeline.cpp
+index 9ce29380b29e..641103d8f82e 100644
+--- a/lib/Dialect/TritonGPU/Transforms/Pipeliner/WGMMAPipeline.cpp
++++ b/lib/Dialect/TritonGPU/Transforms/Pipeliner/WGMMAPipeline.cpp
+@@ -390,6 +390,27 @@ splitRSDots(const llvm::MapVector<Operation *, int> &dots) {
+ 
+ } // namespace
+ 
++static ttg::LocalAllocOp getComputedOperandAlloc(Value operand,
++                                                 scf::ForOp forOp) {
++  auto alloc = operand.getDefiningOp<ttg::LocalAllocOp>();
++  if (!alloc || alloc->getParentOp() != forOp || !alloc.getSrc() ||
++      !alloc->hasOneUse() || forOp.isDefinedOutsideOfLoop(alloc.getSrc()))
++    return {};
++
++  // Only buffer loads and their layout or floating-point conversions.
++  // Unpacking and scaling can require much larger buffers.
++  Value source = alloc.getSrc();
++  while (Operation *op = source.getDefiningOp()) {
++    if (isa<tt::LoadOp, ttg::LocalLoadOp>(op))
++      return alloc;
++    if (!isa<ttg::ConvertLayoutOp, tt::TransOp, tt::ReshapeOp, tt::FpToFpOp,
++             arith::ExtFOp, arith::TruncFOp>(op))
++      return {};
++    source = op->getOperand(0);
++  }
++  return {};
++}
++
+ // Determines whether a given MMAv3 dot op, represented as ttng.warp_group_dot,
+ // needs a wait immediately after it.
+ //
+@@ -441,10 +462,13 @@ splitRSDots(const llvm::MapVector<Operation *, int> &dots) {
+ // in the loop's iter_args.  (Rule (2) above ensures this is well-defined.)
+ //
+ static std::optional<int> dotCanBeProperlyAsync(ttng::WarpGroupDotOp dotOp,
+-                                                scf::ForOp forOp) {
++                                                scf::ForOp forOp,
++                                                bool bufferComputedOperands) {
+   LDBG("Considering whether to make MMAv3 dot properly async: " << dotOp);
+ 
+   auto checkOperand = [&](Value operand) {
++    if (bufferComputedOperands && getComputedOperandAlloc(operand, forOp))
++      return true;
+     // We can always make RSGEMM async s long as the RHS can be multi-buffered
+     if (isa<RankedTensorType>(operand.getType())) {
+       return true;
+@@ -592,6 +616,43 @@ static std::optional<int> dotCanBeProperlyAsync(ttng::WarpGroupDotOp dotOp,
+   return std::nullopt;
+ }
+ 
++// A computed operand needs distinct storage while the preceding iteration's
++// WGMMA is still reading it. The existing WGMMA waits bound this lifetime to
++// two iterations and protect register operands separately.
++static scf::ForOp
++multibufferComputedOperands(scf::ForOp forOp,
++                            ArrayRef<ttg::LocalAllocOp> allocs) {
++  if (allocs.empty())
++    return forOp;
++
++  OpBuilder builder(forOp);
++  auto loc = forOp.getLoc();
++  Value zero = arith::ConstantIntOp::create(builder, loc, 0, 32);
++  Value one = arith::ConstantIntOp::create(builder, loc, 1, 32);
++  auto newForOp = replaceForOpWithNewSignature(builder, forOp, {zero});
++  forOp.erase();
++  forOp = newForOp;
++  Value bufferIdx = forOp.getRegionIterArgs().back();
++  auto yield = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
++  builder.setInsertionPoint(yield);
++  Value nextBufferIdx = arith::XOrIOp::create(builder, loc, bufferIdx, one);
++  yield.getResultsMutable().append(ValueRange{nextBufferIdx});
++
++  for (auto alloc : allocs) {
++    Value buffers = triton::createAlloc(
++        forOp, cast<RankedTensorType>(alloc.getSrc().getType()), alloc.getLoc(),
++        cast<ttg::SharedEncodingTrait>(alloc.getType().getEncoding()), 2);
++    if (auto alignment = alloc.getAlignmentAttr())
++      buffers.getDefiningOp()->setAttr("alignment", alignment);
++    builder.setInsertionPoint(alloc);
++    Value view = triton::createSingleBufferView(builder, buffers, bufferIdx);
++    ttg::LocalStoreOp::create(builder, alloc.getLoc(), alloc.getSrc(), view);
++    triton::replaceUsesAndPropagateType(builder, alloc, view);
++    alloc.erase();
++  }
++  return forOp;
++}
++
+ // If necessary, insert a dot-wait inside the loop, waiting for the results of
+ // the properly-async dots from iteration i-1 to complete.  (We pipeline to
+ // depth 2, so there are at most 2 copies of each warp_group_dot in flight at a
+@@ -719,7 +780,7 @@ static void insertAsyncWarpGroupDotWaitInLoop(
+ // We assume we have space for each dot to be pipelined to depth 2, i.e. each
+ // dot op in the loop can have at most 2 warp_group_dot ops in flight at once.
+ // (Each warp_group_dot op usually corresponds to a series of wgmma.async ops.)
+-void triton::asyncLaunchDots(scf::ForOp forOp) {
++void triton::asyncLaunchDots(scf::ForOp forOp, unsigned numStages) {
+   LDBG("Original loop:\n" << *forOp);
+ 
+   // First, change every MMAv3 ttng.warp_group_dot {isAsync=false}
+@@ -734,12 +795,24 @@ void triton::asyncLaunchDots(scf::ForOp forOp) {
+   // sync immediately after.  If it can be properly async, we know its only use
+   // is in the loop's `yield` statement; asyncDots maps the op to its index in
+   // the yield op.
++  // Extra computed-operand buffers can hurt ordinary-load pipelines.
++  // Limit them to TMA pipelines.
++  bool bufferComputedOperands =
++      numStages > 1 &&
++      !forOp.getBody()->getOps<ttng::TMALoadLikeOpInterface>().empty();
+   IRRewriter builder(forOp.getContext());
+   llvm::MapVector<Operation *, int /*iterArgIdx*/> properlyAsyncDots;
++  SmallVector<ttg::LocalAllocOp> computedOperands;
+   for (auto WarpGroupDotOp : forOp.getBody()->getOps<ttng::WarpGroupDotOp>()) {
+     WarpGroupDotOp.setIsAsync(true);
+-    if (auto iterArgIdx = dotCanBeProperlyAsync(WarpGroupDotOp, forOp)) {
++    if (auto iterArgIdx = dotCanBeProperlyAsync(WarpGroupDotOp, forOp,
++                                                bufferComputedOperands)) {
+       properlyAsyncDots[WarpGroupDotOp] = *iterArgIdx;
++      SmallVector<Value, 2> operands{WarpGroupDotOp.getA(),
++                                     WarpGroupDotOp.getB()};
++      for (Value operand : operands)
++        if (auto alloc = getComputedOperandAlloc(operand, forOp))
++          computedOperands.push_back(alloc);
+     } else {
+       builder.setInsertionPointAfter(WarpGroupDotOp);
+       auto wait = ttng::WarpGroupDotWaitOp::create(
+@@ -755,6 +828,8 @@ void triton::asyncLaunchDots(scf::ForOp forOp) {
+     return;
+   }
+ 
++  forOp = multibufferComputedOperands(forOp, computedOperands);
++
+   // Split RS dots into dots with K = 16 (the instruction size of MMAv3)
+   // If we split them in nSplit dots, we will be able to keep nSplit-1 dots
+   // in flight at a time.
+diff --git a/python/triton_kernels/tests/test_matmul.py b/python/triton_kernels/tests/test_matmul.py
+index a948040bd00e..58fdee1f69cd 100644
+--- a/python/triton_kernels/tests/test_matmul.py
++++ b/python/triton_kernels/tests/test_matmul.py
+@@ -693,32 +693,56 @@ def make_tensor_scale(start, end, shape):
+                f"ref_y_scale: {ref_y_scale}, tri_y_scale: {tri_y_scale.item()}"
+ 
+ 
+-@pytest.mark.parametrize("shape, fp8_lhs, constraints", [
+-    ((273, 544, 576), True, dict(block_m=64, block_n=256, block_k=128, split_k=1, is_persistent=True)),
+-    ((273, 544, 576), False, dict(block_m=128, block_n=256, block_k=128, split_k=1, is_persistent=True, swap_xw=False)),
+-    ((128, 256, 1024), True, {}),
+-    ((273, 544, 576), False, {}),
++@pytest.mark.parametrize("shape, a_dtype, b_dtype, b_transpose, out_dtype, constraints", [
++    ((273, 544, 576), torch.float8_e4m3fn, torch.bfloat16, True, torch.bfloat16,
++     dict(block_m=64, block_n=256, block_k=128, split_k=1, is_persistent=True)),
++    ((273, 544, 576), torch.bfloat16, torch.float8_e4m3fn, True, torch.bfloat16,
++     dict(block_m=128, block_n=256, block_k=128, split_k=1, is_persistent=True, swap_xw=False)),
++    ((128, 256, 1024), torch.float8_e4m3fn, torch.bfloat16, True, torch.bfloat16, {}),
++    ((273, 544, 576), torch.bfloat16, torch.float8_e4m3fn, True, torch.bfloat16, {}),
++] + [
++    # Keep TMA strides aligned while exercising tails in all three dimensions.
++    ((129, 272, 1040), dtype, dtype, b_transpose, out_dtype,
++     dict(block_m=128, block_n=256, block_k=128, split_k=1, is_persistent=True))
++    for dtype, b_transpose, out_dtype in itertools.product(
++        (torch.float8_e4m3fn, torch.float8_e5m2), (False, True),
++        (torch.float8_e4m3fn, torch.float8_e5m2, torch.float16, torch.bfloat16))
++] + [
++    ((129, 272, 1040), a_dtype, torch.float32, False, out_dtype,
++     dict(block_m=128, block_n=256, block_k=32, split_k=1, is_persistent=True,
++          swap_xw=False, epilogue_subtile=epilogue_subtile))
++    for a_dtype, out_dtype, epilogue_subtile in [
++        (torch.float32, torch.float8_e5m2, 1),
++        (torch.bfloat16, torch.float8_e4m3fn, 1),
++        (torch.float8_e5m2, torch.bfloat16, 2),
++        (torch.float16, torch.float64, 4),
++    ]
+ ])
+ @pytest.mark.parametrize("max_num_imprecise_acc", [None, 32])
+-def test_matmul_mixed_fp8_resource_limits(shape, fp8_lhs, constraints, max_num_imprecise_acc, device,
+-                                         opt_flags_scope):
++def test_matmul_resource_limits(shape, a_dtype, b_dtype, b_transpose, out_dtype, constraints,
++                                max_num_imprecise_acc, device, opt_flags_scope):
+     if is_cuda() and torch.cuda.get_device_capability()[0] < 9:
+         pytest.skip("requires Hopper or newer")
+     if is_hip() and constraints.get("is_persistent"):
+         pytest.skip("Persistent kernel not supported on AMD GPU")
++    if is_hopper() and out_dtype == torch.float64:
++        pytest.skip("128x256 FP64 output requires Blackwell epilogue subtiles")
+ 
+     torch.manual_seed(0)
+     m, n, k = shape
+-    a_dtype, b_dtype = (torch.float8_e4m3fn, torch.bfloat16) if fp8_lhs else (torch.bfloat16, torch.float8_e4m3fn)
+     a = torch.randn((m, k), device=device).to(a_dtype)
+-    b = torch.randn((n, k), device=device).to(b_dtype).mT
++    b = torch.randn((n, k) if b_transpose else (k, n), device=device).to(b_dtype)
++    if b_transpose:
++        b = b.mT
+ 
+     opt_flags.update_opt_flags_constraints(constraints)
+     actual = matmul(a, b, None, precision_config=PrecisionConfig(
+-        out_dtype=torch.bfloat16, max_num_imprecise_acc=max_num_imprecise_acc))
++        out_dtype=out_dtype, max_num_imprecise_acc=max_num_imprecise_acc, allow_tf32=True))
+ 
+-    expected = torch.matmul(a.float(), b.float()).to(torch.bfloat16)
+-    assert_close(expected, actual)
++    expected = torch.matmul(a.float(), b.float())
++    # Compare in FP32 with tolerances for TF32 and output rounding.
++    eps = torch.finfo(out_dtype).eps
++    assert_close(expected, actual.float(), maxtol=max(2e-2, eps), rmstol=max(4e-3, eps / 4))
+ 
+ 
+ @pytest.mark.parametrize("dtype, other_dtype, allow_tf32", [
+diff --git a/python/triton_kernels/triton_kernels/matmul_details/opt_flags_details/opt_flags_nvidia.py b/python/triton_kernels/triton_kernels/matmul_details/opt_flags_details/opt_flags_nvidia.py
+index 7f75e5e205ba..8758be50e174 100644
+--- a/python/triton_kernels/triton_kernels/matmul_details/opt_flags_details/opt_flags_nvidia.py
++++ b/python/triton_kernels/triton_kernels/matmul_details/opt_flags_details/opt_flags_nvidia.py
+@@ -178,6 +178,7 @@ def compute_num_stages(
+     device_props = torch.cuda.get_device_properties(0)
+     smem_capacity = device_props.shared_memory_per_block_optin
+     smem_capacity //= occupancy_target
++    additional_smem = 0
+     if is_promoted:
+         rhs_size = act_size if swap_xw else weight_size
+         dot_size = compute_dtype.bitwidth / 8
+@@ -192,6 +193,17 @@ def compute_num_stages(
+             # The regular pipeline replaces one input slot with that widened tile.
+             rhs_elements = block_k * (block_m if swap_xw else block_n)
+             smem_capacity -= int(rhs_elements * (dot_size if is_persistent else dot_size - rhs_size))
++            if (is_persistent and target_info.cuda_capability_geq(9, 0)
++                    and (compute_dtype in (FP16, BF16) or compute_dtype == FP32 and precision_config.allow_tf32)):
++                # Async MMA keeps a second widened RHS tile live. Hopper's
++                # computed inputs replace a slot in their raw input rings.
++                additional_smem = rhs_elements * dot_size
++                if not has_native_mxfp:
++                    lhs_size = weight_size if swap_xw else act_size
++                    lhs_elements = block_k * (block_n if swap_xw else block_m)
++                    if lhs_size < dot_size:
++                        additional_smem -= lhs_elements * lhs_size
++                    additional_smem -= rhs_elements * rhs_size
+     if has_native_mxfp:
+         # 4-bit e2m1 operands are padded 2x
+         # https://docs.nvidia.com/cuda/parallel-thread-execution/#packing-format-used-for-matrix-a-and-b-by-kind-mxf8f6f4-in-shared-memory
+@@ -261,6 +273,14 @@ def compute_num_stages(
+         smem_capacity -= epilogue_smem
+         if x_transpose:
+             smem_capacity -= int(block_m * block_k * act_size)
++        if (not has_native_mxfp and compute_dtype is not None and compute_dtype.bitwidth == 8 and not w_transpose):
++            # Native FP8 also needs a K-contiguous copy of row-major weights.
++            # Two computed slots replace one slot in the raw input ring.
++            additional_smem += block_k * block_n * weight_size
++        if (has_native_mxfp and compute_dtype == FP32 and precision_config.allow_tf32
++                and (lhs_dtype if swap_xw else rhs_dtype) == FP32 and (x_transpose if swap_xw else not w_transpose)):
++            # A computed FP32 RHS keeps both layout copies beside its raw ring.
++            additional_smem += block_k * (block_m if swap_xw else block_n) * 4
+         if rhs_dtype == FP32 and (not w_transpose
+                                   or has_native_mxfp and compute_dtype == FP32 and not precision_config.allow_tf32):
+             # FP32 B can need a separate layout-conversion tile after its TMA load.
+@@ -282,4 +302,9 @@ def compute_num_stages(
+         max_stages = 4
+     if precision_config.max_num_imprecise_acc is not None:
+         max_stages = min(max_stages, 3)
+-    return min(smem_capacity // int(stage_size), max_stages)
++    num_stages = min(smem_capacity // int(stage_size), max_stages)
++    if num_stages > 1 and additional_smem > 0:
++        # One stage retains a single converted tile, which the original budget
++        # already proved fits; do not shrink the output tile unnecessarily.
++        num_stages = max(1, min((smem_capacity - int(additional_smem)) // int(stage_size), max_stages))
++    return num_stages
+diff --git a/test/NVWS/lower_aref.mlir b/test/NVWS/lower_aref.mlir
+index 5e6cf8cf2455..530b659a8cef 100644
+--- a/test/NVWS/lower_aref.mlir
++++ b/test/NVWS/lower_aref.mlir
+@@ -707,3 +707,216 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
+     tt.return
+   }
+ }
++
++
++// -----
++
++#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 32}>
++#smem = #ttg.shared_memory
++#intermediate = #ttng.tensor_memory_encoding<blockM = 128, blockN = 64, colStride = 1>
++#accumulator = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
++module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
++  // An accumulator consumed by another MMA is not an initialized operand tile.
++  // CHECK-LABEL: @chained_mma_operand
++  tt.func @chained_mma_operand(%a: !ttg.memdesc<128x64xf32, #shared, #smem>, %b: !ttg.memdesc<64x64xf32, #shared, #smem>, %c: !ttg.memdesc<64x128xf32, #shared, #smem>, %tiles: i32) {
++    %c0 = arith.constant 0 : i32
++    %c1 = arith.constant 1 : i32
++    %false = arith.constant false
++    %true = arith.constant true
++    // CHECK: ttng.tmem_alloc : () -> !ttg.memdesc<1x128x64xf32
++    // CHECK-NOT: !ttg.memdesc<2x128x64xf32
++    %buffer = ttng.tmem_alloc : () -> !ttg.memdesc<1x128x64xf32, #intermediate, #ttng.tensor_memory, mutable>
++    %value = nvws.aref.create %buffer : <[!ttg.memdesc<1x128x64xf32, #intermediate, #ttng.tensor_memory, mutable>]>
++    %out = ttng.tmem_alloc : () -> !ttg.memdesc<128x128xf32, #accumulator, #ttng.tensor_memory, mutable>
++    scf.for %k = %c0 to %tiles step %c1 : i32 {
++      %dst, %put_token = nvws.aref.put.enter %value {ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128x64xf32, #intermediate, #ttng.tensor_memory, mutable>]> -> !ttg.memdesc<128x64xf32, #intermediate, #ttng.tensor_memory, mutable, 1x128x64>, !ttg.async.token
++      // CHECK: ttng.tc_gen5_mma
++      // CHECK-NOT: is_async
++      // CHECK: ttng.tc_gen5_commit
++      ttng.tc_gen5_mma %a, %b, %dst[], %false, %true {ttg.partition = array<i32: 0>} : !ttg.memdesc<128x64xf32, #shared, #smem>, !ttg.memdesc<64x64xf32, #shared, #smem>, !ttg.memdesc<128x64xf32, #intermediate, #ttng.tensor_memory, mutable, 1x128x64>
++      nvws.aref.put.exit %value, %put_token [#nvws.async_op<tc5mma>] {ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128x64xf32, #intermediate, #ttng.tensor_memory, mutable>]>, !ttg.async.token
++      %src, %get_token = nvws.aref.get.enter %value {ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x128x64xf32, #intermediate, #ttng.tensor_memory, mutable>]> -> !ttg.memdesc<128x64xf32, #intermediate, #ttng.tensor_memory, mutable, 1x128x64>, !ttg.async.token
++      // CHECK: ttng.tc_gen5_mma
++      // CHECK-NOT: is_async
++      // CHECK: ttng.tc_gen5_commit
++      ttng.tc_gen5_mma %src, %c, %out[], %false, %true {ttg.partition = array<i32: 1>} : !ttg.memdesc<128x64xf32, #intermediate, #ttng.tensor_memory, mutable, 1x128x64>, !ttg.memdesc<64x128xf32, #shared, #smem>, !ttg.memdesc<128x128xf32, #accumulator, #ttng.tensor_memory, mutable>
++      nvws.aref.get.exit %value, %get_token [#nvws.async_op<tc5mma>] {ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x128x64xf32, #intermediate, #ttng.tensor_memory, mutable>]>, !ttg.async.token
++    } {tt.warp_specialize, tt.num_stages = 2 : i32, ttg.partition.stages = [0 : i32, 1 : i32], ttg.warp_specialize.tag = 0 : i32, ttg.partition = array<i32: 0, 1>}
++    tt.return
++  }
++}
++
++
++// -----
++
++#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
++#smem = #ttg.shared_memory
++#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 64, colStride = 1>
++#acc = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
++#reg = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>
++module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
++  // Caller-owned storage cannot be resized, so its synchronous MMA is retained.
++  // CHECK-LABEL: @external_mma_operand
++  tt.func @external_mma_operand(%buffer: !ttg.memdesc<1x128x64xf16, #tmem, #ttng.tensor_memory, mutable>, %value: tensor<128x64xf16, #reg>, %b: !ttg.memdesc<64x128xf16, #shared, #smem>, %tiles: i32) {
++    %c0 = arith.constant 0 : i32
++    %c1 = arith.constant 1 : i32
++    %false = arith.constant false
++    %true = arith.constant true
++    %aref = nvws.aref.create %buffer : <[!ttg.memdesc<1x128x64xf16, #tmem, #ttng.tensor_memory, mutable>]>
++    %out = ttng.tmem_alloc : () -> !ttg.memdesc<128x128xf32, #acc, #ttng.tensor_memory, mutable>
++    scf.for %k = %c0 to %tiles step %c1 : i32 {
++      %dst, %put_token = nvws.aref.put.enter %aref {ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128x64xf16, #tmem, #ttng.tensor_memory, mutable>]> -> !ttg.memdesc<128x64xf16, #tmem, #ttng.tensor_memory, mutable, 1x128x64>, !ttg.async.token
++      ttng.tmem_store %value, %dst[], %true {ttg.partition = array<i32: 0>} : tensor<128x64xf16, #reg> -> !ttg.memdesc<128x64xf16, #tmem, #ttng.tensor_memory, mutable, 1x128x64>
++      nvws.aref.put.exit %aref, %put_token [#nvws.async_op<none>] {ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128x64xf16, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token
++      %src, %get_token = nvws.aref.get.enter %aref {ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x128x64xf16, #tmem, #ttng.tensor_memory, mutable>]> -> !ttg.memdesc<128x64xf16, #tmem, #ttng.tensor_memory, mutable, 1x128x64>, !ttg.async.token
++      // CHECK: ttng.tc_gen5_mma
++      // CHECK-NOT: is_async
++      // CHECK: ttng.tc_gen5_commit
++      ttng.tc_gen5_mma %src, %b, %out[], %false, %true {ttg.partition = array<i32: 1>} : !ttg.memdesc<128x64xf16, #tmem, #ttng.tensor_memory, mutable, 1x128x64>, !ttg.memdesc<64x128xf16, #shared, #smem>, !ttg.memdesc<128x128xf32, #acc, #ttng.tensor_memory, mutable>
++      nvws.aref.get.exit %aref, %get_token [#nvws.async_op<tc5mma>] {ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x128x64xf16, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token
++    } {tt.warp_specialize, tt.num_stages = 2 : i32, ttg.partition.stages = [0 : i32, 1 : i32], ttg.warp_specialize.tag = 0 : i32, ttg.partition = array<i32: 0, 1>}
++    tt.return
++  }
++}
++
++// -----
++
++#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
++#smem = #ttg.shared_memory
++#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 64, colStride = 1>
++#acc = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
++#reg = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>
++module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
++  // Aliased storage cannot be resized through only one of its arefs.
++  // CHECK-LABEL: @aliased_mma_operand
++  tt.func @aliased_mma_operand(%value: tensor<128x64xf16, #reg>, %b: !ttg.memdesc<64x128xf16, #shared, #smem>, %tiles: i32) {
++    %c0 = arith.constant 0 : i32
++    %c1 = arith.constant 1 : i32
++    %false = arith.constant false
++    %true = arith.constant true
++    // CHECK: ttng.tmem_alloc : () -> !ttg.memdesc<1x128x64xf16
++    // CHECK-NOT: !ttg.memdesc<2x128x64xf16
++    %buffer = ttng.tmem_alloc : () -> !ttg.memdesc<1x128x64xf16, #tmem, #ttng.tensor_memory, mutable>
++    %alias = nvws.aref.create %buffer : <[!ttg.memdesc<1x128x64xf16, #tmem, #ttng.tensor_memory, mutable>]>
++    %aref = nvws.aref.create %buffer : <[!ttg.memdesc<1x128x64xf16, #tmem, #ttng.tensor_memory, mutable>]>
++    %out = ttng.tmem_alloc : () -> !ttg.memdesc<128x128xf32, #acc, #ttng.tensor_memory, mutable>
++    scf.for %k = %c0 to %tiles step %c1 : i32 {
++      %dst, %put_token = nvws.aref.put.enter %aref {ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128x64xf16, #tmem, #ttng.tensor_memory, mutable>]> -> !ttg.memdesc<128x64xf16, #tmem, #ttng.tensor_memory, mutable, 1x128x64>, !ttg.async.token
++      ttng.tmem_store %value, %dst[], %true {ttg.partition = array<i32: 0>} : tensor<128x64xf16, #reg> -> !ttg.memdesc<128x64xf16, #tmem, #ttng.tensor_memory, mutable, 1x128x64>
++      nvws.aref.put.exit %aref, %put_token [#nvws.async_op<none>] {ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128x64xf16, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token
++      %src, %get_token = nvws.aref.get.enter %aref {ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x128x64xf16, #tmem, #ttng.tensor_memory, mutable>]> -> !ttg.memdesc<128x64xf16, #tmem, #ttng.tensor_memory, mutable, 1x128x64>, !ttg.async.token
++      // CHECK: ttng.tc_gen5_mma
++      // CHECK-NOT: is_async
++      // CHECK: ttng.tc_gen5_commit
++      ttng.tc_gen5_mma %src, %b, %out[], %false, %true {ttg.partition = array<i32: 1>} : !ttg.memdesc<128x64xf16, #tmem, #ttng.tensor_memory, mutable, 1x128x64>, !ttg.memdesc<64x128xf16, #shared, #smem>, !ttg.memdesc<128x128xf32, #acc, #ttng.tensor_memory, mutable>
++      nvws.aref.get.exit %aref, %get_token [#nvws.async_op<tc5mma>] {ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x128x64xf16, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token
++    } {tt.warp_specialize, tt.num_stages = 2 : i32, ttg.partition.stages = [0 : i32, 1 : i32], ttg.warp_specialize.tag = 0 : i32, ttg.partition = array<i32: 0, 1>}
++    %write, %write_token = nvws.aref.put.enter %alias : <[!ttg.memdesc<1x128x64xf16, #tmem, #ttng.tensor_memory, mutable>]> -> !ttg.memdesc<128x64xf16, #tmem, #ttng.tensor_memory, mutable, 1x128x64>, !ttg.async.token
++    ttng.tmem_store %value, %write[], %true : tensor<128x64xf16, #reg> -> !ttg.memdesc<128x64xf16, #tmem, #ttng.tensor_memory, mutable, 1x128x64>
++    nvws.aref.put.exit %alias, %write_token [#nvws.async_op<none>] : <[!ttg.memdesc<1x128x64xf16, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token
++    %read, %read_token = nvws.aref.get.enter %alias : <[!ttg.memdesc<1x128x64xf16, #tmem, #ttng.tensor_memory, mutable>]> -> !ttg.memdesc<128x64xf16, #tmem, #ttng.tensor_memory, mutable, 1x128x64>, !ttg.async.token
++    %result, %load_token = ttng.tmem_load %read[] : !ttg.memdesc<128x64xf16, #tmem, #ttng.tensor_memory, mutable, 1x128x64> -> tensor<128x64xf16, #reg>
++    nvws.aref.get.exit %alias, %read_token [#nvws.async_op<none>] : <[!ttg.memdesc<1x128x64xf16, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token
++    "use"(%result) : (tensor<128x64xf16, #reg>) -> ()
++    tt.return
++  }
++}
++
++// -----
++
++#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
++#smem = #ttg.shared_memory
++#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 64, colStride = 1>
++#reg = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>
++#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
++module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
++  // Descriptor-load buffering retains its existing exclusion of TMEM arefs.
++  // CHECK-LABEL: @combined_tmem_descriptor_load
++  tt.func @combined_tmem_descriptor_load(%value: tensor<128x64xf16, #reg>, %desc: !tt.tensordesc<64x128xf16, #shared>, %tiles: i32) {
++    %c0 = arith.constant 0 : i32
++    %c1 = arith.constant 1 : i32
++    %true = arith.constant true
++    // CHECK: ttng.tmem_alloc : () -> !ttg.memdesc<1x128x64xf16
++    %a = ttng.tmem_alloc : () -> !ttg.memdesc<1x128x64xf16, #tmem, #ttng.tensor_memory, mutable>
++    // CHECK: ttg.local_alloc : () -> !ttg.memdesc<1x64x128xf16
++    %b = ttg.local_alloc : () -> !ttg.memdesc<1x64x128xf16, #shared, #smem, mutable>
++    %aref = nvws.aref.create %a, %b : <[!ttg.memdesc<1x128x64xf16, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<1x64x128xf16, #shared, #smem, mutable>]>
++    scf.for %k = %c0 to %tiles step %c1 : i32 {
++      %a_dst, %b_dst, %put = nvws.aref.put.enter %aref {ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128x64xf16, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<1x64x128xf16, #shared, #smem, mutable>]> -> !ttg.memdesc<128x64xf16, #tmem, #ttng.tensor_memory, mutable, 1x128x64>, !ttg.memdesc<64x128xf16, #shared, #smem, mutable, 1x64x128>, !ttg.async.token
++      ttng.tmem_store %value, %a_dst[], %true {ttg.partition = array<i32: 0>} : tensor<128x64xf16, #reg> -> !ttg.memdesc<128x64xf16, #tmem, #ttng.tensor_memory, mutable, 1x128x64>
++      nvws.descriptor_load %desc[%c0, %c0] 16384 %b_dst {ttg.partition = array<i32: 0>} : !tt.tensordesc<64x128xf16, #shared>, i32, i32, !ttg.memdesc<64x128xf16, #shared, #smem, mutable, 1x64x128>
++      nvws.aref.put.exit %aref, %put [#nvws.async_op<none>, #nvws.async_op<tma_load>] {ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128x64xf16, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<1x64x128xf16, #shared, #smem, mutable>]>, !ttg.async.token
++      %a_src, %b_src, %get = nvws.aref.get.enter %aref {ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x128x64xf16, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<1x64x128xf16, #shared, #smem, mutable>]> -> !ttg.memdesc<128x64xf16, #tmem, #ttng.tensor_memory, mutable, 1x128x64>, !ttg.memdesc<64x128xf16, #shared, #smem, mutable, 1x64x128>, !ttg.async.token
++      %x, %load = ttng.tmem_load %a_src[] {ttg.partition = array<i32: 1>} : !ttg.memdesc<128x64xf16, #tmem, #ttng.tensor_memory, mutable, 1x128x64> -> tensor<128x64xf16, #reg>
++      %y = ttg.local_load %b_src {ttg.partition = array<i32: 1>} : !ttg.memdesc<64x128xf16, #shared, #smem, mutable, 1x64x128> -> tensor<64x128xf16, #blocked>
++      nvws.aref.get.exit %aref, %get [#nvws.async_op<none>] {ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x128x64xf16, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<1x64x128xf16, #shared, #smem, mutable>]>, !ttg.async.token
++      "use"(%x, %y) {ttg.partition = array<i32: 1>} : (tensor<128x64xf16, #reg>, tensor<64x128xf16, #blocked>) -> ()
++    } {tt.warp_specialize, tt.num_stages = 2 : i32, ttg.partition.stages = [0 : i32, 1 : i32], ttg.warp_specialize.tag = 0 : i32, ttg.partition = array<i32: 0, 1>}
++    tt.return
++  }
++}
++
++// -----
++
++#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
++#smem = #ttg.shared_memory
++#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 64, colStride = 1>
++#acc = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
++#reg = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>
++module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
++  // A token result must be preserved; only tokenless allocations can be resized.
++  // CHECK-LABEL: @token_result_mma_operand
++  tt.func @token_result_mma_operand(%value: tensor<128x64xf16, #reg>, %b: !ttg.memdesc<64x128xf16, #shared, #smem>, %tiles: i32) {
++    %c0 = arith.constant 0 : i32
++    %c1 = arith.constant 1 : i32
++    %false = arith.constant false
++    %true = arith.constant true
++    // CHECK: ttng.tmem_alloc : () -> (!ttg.memdesc<1x128x64xf16
++    %buffer, %alloc_token = ttng.tmem_alloc : () -> (!ttg.memdesc<1x128x64xf16, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
++    %aref = nvws.aref.create %buffer : <[!ttg.memdesc<1x128x64xf16, #tmem, #ttng.tensor_memory, mutable>]>
++    %out = ttng.tmem_alloc : () -> !ttg.memdesc<128x128xf32, #acc, #ttng.tensor_memory, mutable>
++    scf.for %k = %c0 to %tiles step %c1 : i32 {
++      %dst, %put_token = nvws.aref.put.enter %aref {ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128x64xf16, #tmem, #ttng.tensor_memory, mutable>]> -> !ttg.memdesc<128x64xf16, #tmem, #ttng.tensor_memory, mutable, 1x128x64>, !ttg.async.token
++      ttng.tmem_store %value, %dst[], %true {ttg.partition = array<i32: 0>} : tensor<128x64xf16, #reg> -> !ttg.memdesc<128x64xf16, #tmem, #ttng.tensor_memory, mutable, 1x128x64>
++      nvws.aref.put.exit %aref, %put_token [#nvws.async_op<none>] {ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128x64xf16, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token
++      %src, %get_token = nvws.aref.get.enter %aref {ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x128x64xf16, #tmem, #ttng.tensor_memory, mutable>]> -> !ttg.memdesc<128x64xf16, #tmem, #ttng.tensor_memory, mutable, 1x128x64>, !ttg.async.token
++      // CHECK: ttng.tc_gen5_mma
++      // CHECK-NOT: is_async
++      // CHECK: ttng.tc_gen5_commit
++      ttng.tc_gen5_mma %src, %b, %out[], %false, %true {ttg.partition = array<i32: 1>} : !ttg.memdesc<128x64xf16, #tmem, #ttng.tensor_memory, mutable, 1x128x64>, !ttg.memdesc<64x128xf16, #shared, #smem>, !ttg.memdesc<128x128xf32, #acc, #ttng.tensor_memory, mutable>
++      nvws.aref.get.exit %aref, %get_token [#nvws.async_op<tc5mma>] {ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x128x64xf16, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token
++    } {tt.warp_specialize, tt.num_stages = 2 : i32, ttg.partition.stages = [0 : i32, 1 : i32], ttg.warp_specialize.tag = 0 : i32, ttg.partition = array<i32: 0, 1>}
++    tt.return
++  }
++}
++
++// -----
++
++#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
++#smem = #ttg.shared_memory
++#acc = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
++#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
++module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
++  // CHECK-LABEL: @aligned_computed_operand
++  tt.func @aligned_computed_operand(%a: !ttg.memdesc<128x64xf16, #shared, #smem>, %value: tensor<64x128xf16, #blocked>, %tiles: i32) {
++    %c0 = arith.constant 0 : i32
++    %c1 = arith.constant 1 : i32
++    %false = arith.constant false
++    %true = arith.constant true
++    // CHECK: ttg.local_alloc {alignment = 1024 : i32} : () -> !ttg.memdesc<2x64x128xf16
++    %buffer = ttg.local_alloc {alignment = 1024 : i32} : () -> !ttg.memdesc<1x64x128xf16, #shared, #smem, mutable>
++    %aref = nvws.aref.create %buffer : <[!ttg.memdesc<1x64x128xf16, #shared, #smem, mutable>]>
++    %out = ttng.tmem_alloc : () -> !ttg.memdesc<128x128xf32, #acc, #ttng.tensor_memory, mutable>
++    scf.for %k = %c0 to %tiles step %c1 : i32 {
++      %dst, %put = nvws.aref.put.enter %aref {ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x64x128xf16, #shared, #smem, mutable>]> -> !ttg.memdesc<64x128xf16, #shared, #smem, mutable, 1x64x128>, !ttg.async.token
++      ttg.local_store %value, %dst {ttg.partition = array<i32: 0>} : tensor<64x128xf16, #blocked> -> !ttg.memdesc<64x128xf16, #shared, #smem, mutable, 1x64x128>
++      nvws.aref.put.exit %aref, %put [#nvws.async_op<none>] {ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x64x128xf16, #shared, #smem, mutable>]>, !ttg.async.token
++      %src, %get = nvws.aref.get.enter %aref {ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x64x128xf16, #shared, #smem, mutable>]> -> !ttg.memdesc<64x128xf16, #shared, #smem, mutable, 1x64x128>, !ttg.async.token
++      // CHECK: ttng.tc_gen5_mma
++      // CHECK-SAME: is_async
++      ttng.tc_gen5_mma %a, %src, %out[], %false, %true {ttg.partition = array<i32: 1>} : !ttg.memdesc<128x64xf16, #shared, #smem>, !ttg.memdesc<64x128xf16, #shared, #smem, mutable, 1x64x128>, !ttg.memdesc<128x128xf32, #acc, #ttng.tensor_memory, mutable>
++      nvws.aref.get.exit %aref, %get [#nvws.async_op<tc5mma>] {ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x64x128xf16, #shared, #smem, mutable>]>, !ttg.async.token
++    } {tt.warp_specialize, tt.num_stages = 2 : i32, ttg.partition.stages = [0 : i32, 1 : i32], ttg.warp_specialize.tag = 0 : i32, ttg.partition = array<i32: 0, 1>}
++    tt.return
++  }
++}
+diff --git a/test/TritonGPU/automatic-warp-specialization.mlir b/test/TritonGPU/automatic-warp-specialization.mlir
+index a3c96d461aed..411095c9b78e 100644
+--- a/test/TritonGPU/automatic-warp-specialization.mlir
++++ b/test/TritonGPU/automatic-warp-specialization.mlir
+@@ -467,3 +467,54 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
+     tt.return
+   }
+ }
++
++
++// -----
++
++#operand = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [2, 2], order = [1, 0]}>
++#accumulator = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
++#raw = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 8}>
++#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
++#smem = #ttg.shared_memory
++#lhs_tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 64, colStride = 1>
++#lhs_reg = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>
++#acc_tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
++module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
++  // CHECK-LABEL: @computed_mma_operands
++  // OPT-LABEL: @computed_mma_operands
++  tt.func @computed_mma_operands(%a: !tt.tensordesc<128x64xf8E4M3FN, #raw>, %b: !tt.tensordesc<64x128xf8E5M2, #raw>, %tiles: i32) {
++    %c0 = arith.constant 0 : i32
++    %c1 = arith.constant 1 : i32
++    %c64 = arith.constant 64 : i32
++    %false = arith.constant false
++    %true = arith.constant true
++    %acc, %token = ttng.tmem_alloc : () -> (!ttg.memdesc<128x128xf32, #acc_tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
++    // CHECK-DAG: ttng.tmem_alloc : () -> !ttg.memdesc<2x128x64xf16
++    // CHECK-DAG: ttg.local_alloc : () -> !ttg.memdesc<2x64x128xf16
++    // OPT-DAG: ttng.tmem_alloc : () -> !ttg.memdesc<2x128x64xf16
++    // OPT-DAG: ttg.local_alloc : () -> !ttg.memdesc<2x64x128xf16
++    %result:2 = scf.for %k = %c0 to %tiles step %c1 iter_args(%dep = %token, %use_acc = %false) -> (!ttg.async.token, i1) : i32 {
++      %offset = arith.muli %k, %c64 : i32
++      %a_raw = tt.descriptor_load %a[%c0, %offset] : !tt.tensordesc<128x64xf8E4M3FN, #raw> -> tensor<128x64xf8E4M3FN, #operand>
++      %b_raw = tt.descriptor_load %b[%offset, %c0] : !tt.tensordesc<64x128xf8E5M2, #raw> -> tensor<64x128xf8E5M2, #operand>
++      %a_value = tt.fp_to_fp %a_raw : tensor<128x64xf8E4M3FN, #operand> -> tensor<128x64xf16, #operand>
++      %b_value = tt.fp_to_fp %b_raw : tensor<64x128xf8E5M2, #operand> -> tensor<64x128xf16, #operand>
++      %a_layout = ttg.convert_layout %a_value : tensor<128x64xf16, #operand> -> tensor<128x64xf16, #lhs_reg>
++      %a_buffer = ttng.tmem_alloc %a_layout : (tensor<128x64xf16, #lhs_reg>) -> !ttg.memdesc<128x64xf16, #lhs_tmem, #ttng.tensor_memory>
++      %b_buffer = ttg.local_alloc %b_value : (tensor<64x128xf16, #operand>) -> !ttg.memdesc<64x128xf16, #shared, #smem>
++      // CHECK: ttng.tc_gen5_mma
++      // CHECK-SAME: is_async
++      // CHECK-NOT: wait_barrier
++      // CHECK: ttng.tc_gen5_commit
++      // OPT: ttng.tc_gen5_mma
++      // OPT-SAME: is_async
++      // OPT-NOT: wait_barrier
++      // OPT: ttng.tc_gen5_commit
++      %next = ttng.tc_gen5_mma %a_buffer, %b_buffer, %acc[%dep], %use_acc, %true : !ttg.memdesc<128x64xf16, #lhs_tmem, #ttng.tensor_memory>, !ttg.memdesc<64x128xf16, #shared, #smem>, !ttg.memdesc<128x128xf32, #acc_tmem, #ttng.tensor_memory, mutable>
++      scf.yield %next, %true : !ttg.async.token, i1
++    } {tt.warp_specialize, tt.num_stages = 2 : i32}
++    %value, %done = ttng.tmem_load %acc[%result#0] : !ttg.memdesc<128x128xf32, #acc_tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #accumulator>
++    "consume"(%value) : (tensor<128x128xf32, #accumulator>) -> ()
++    tt.return
++  }
++}
+diff --git a/test/TritonGPU/loop-pipeline-hopper.mlir b/test/TritonGPU/loop-pipeline-hopper.mlir
+index d648cef56de3..4bc81e040f6e 100644
+--- a/test/TritonGPU/loop-pipeline-hopper.mlir
++++ b/test/TritonGPU/loop-pipeline-hopper.mlir
+@@ -1,5 +1,5 @@
+-// RUN: triton-opt %s -split-input-file -tritongpu-assign-latencies -tritongpu-schedule-loops -tritongpu-pipeline -canonicalize | FileCheck --dump-input-context=50 %s
+-// RUN: triton-opt %s -split-input-file -tritongpu-assign-latencies -tritongpu-schedule-loops -tritongpu-pipeline | FileCheck %s --check-prefix=CHECK-NOCANON
++// RUN: triton-opt %s -split-input-file -tritongpu-assign-latencies -tritongpu-schedule-loops -tritongpu-pipeline -canonicalize | FileCheck --check-prefixes=CHECK,COMPUTED --dump-input-context=50 %s
++// RUN: triton-opt %s -split-input-file -tritongpu-assign-latencies -tritongpu-schedule-loops -tritongpu-pipeline | FileCheck %s --check-prefixes=CHECK-NOCANON,COMPUTED
+ 
+ // 4 warps
+ // matmul: 128x32 @ 32x128 -> 128x128
+@@ -665,7 +665,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+     %15 = tt.broadcast %13 : tensor<64x1xi32, #blocked> -> tensor<64x16xi32, #blocked>
+     %16 = tt.addptr %14, %15 : tensor<64x16x!tt.ptr<f16>, #blocked>, tensor<64x16xi32, #blocked>
+     // CHECK: %[[C0:.*]] = arith.constant 0 : i32
+-    // CHECK: scf.for %[[IND_VAR:.*]] = %[[C0]]
++    // CHECK: scf.for %[[IND_VAR:[^ ]+]] = %[[C0]]
+     // CHECK-NOT: load
+     // CHECK: %[[CND:.*]] = arith.cmpi slt, %[[IND_VAR]], %[[EXT]]
+     // CHECK: scf.if %[[CND]]
+@@ -739,7 +739,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+     %15 = tt.broadcast %13 : tensor<64x1xi32, #blocked> -> tensor<64x16xi32, #blocked>
+     %16 = tt.addptr %14, %15 : tensor<64x16x!tt.ptr<f16>, #blocked>, tensor<64x16xi32, #blocked>
+     // CHECK-NOCANON: %[[C0:.*]] = arith.constant 0 : i32
+-    // CHECK-NOCANON: scf.for %[[IND_VAR:.*]] = %[[C0]]
++    // CHECK-NOCANON: scf.for %[[IND_VAR:[^ ]+]] = %[[C0]]
+     // CHECK-NOCANON-NOT load
+     // CHECK-NOCANON: dot
+     // CHECK-NOCANON: %[[CND:.*]] = arith.cmpi slt, %[[IND_VAR]], %[[EXT]]
+@@ -1240,3 +1240,107 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
+     tt.return %0#1 : tensor<64x32xf32, #mma>
+   }
+ }
++
++// -----
++
++#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
++#mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 64, 16]}>
++#dot = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>
++#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
++#tma = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 32}>
++#smem = #ttg.shared_memory
++
++module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
++  // COMPUTED-LABEL: @computed_tma_rhs
++  tt.func @computed_tma_rhs(%a: tensor<64x32xf16, #dot>, %b: !tt.tensordesc<32x64xf32, #tma>, %iterations: i32) -> tensor<64x64xf32, #mma> {
++    %zero = arith.constant 0 : i32
++    %step = arith.constant 32 : i32
++    %init = arith.constant dense<0.0> : tensor<64x64xf32, #mma>
++    // COMPUTED-DAG: ttng.async_tma_copy_global_to_local
++    // COMPUTED-DAG: ttg.local_alloc {alignment = 512 : i32} : () -> !ttg.memdesc<2x32x64xf16
++    // COMPUTED: scf.for
++    %result = scf.for %i = %zero to %iterations step %step iter_args(%acc = %init) -> tensor<64x64xf32, #mma> : i32 {
++      %loaded = tt.descriptor_load %b[%i, %zero] : !tt.tensordesc<32x64xf32, #tma> -> tensor<32x64xf32, #blocked>
++      %converted = arith.truncf %loaded : tensor<32x64xf32, #blocked> to tensor<32x64xf16, #blocked>
++      %operand = ttg.local_alloc %converted {alignment = 512 : i32} : (tensor<32x64xf16, #blocked>) -> !ttg.memdesc<32x64xf16, #shared, #smem>
++      // COMPUTED: ttg.memdesc_index
++      // COMPUTED: ttg.local_store
++      // COMPUTED: ttng.warp_group_dot
++      // COMPUTED: ttng.warp_group_dot_wait {{.*}} {pendings = {{[1-9][0-9]*}} : i32}
++      %next = ttng.warp_group_dot %a, %operand, %acc : tensor<64x32xf16, #dot> * !ttg.memdesc<32x64xf16, #shared, #smem> -> tensor<64x64xf32, #mma>
++      // COMPUTED: scf.yield
++      scf.yield %next : tensor<64x64xf32, #mma>
++    }
++    // COMPUTED: ttng.warp_group_dot_wait {{.*}} {pendings = 0 : i32}
++    // COMPUTED: ttg.local_dealloc
++    tt.return %result : tensor<64x64xf32, #mma>
++  }
++
++  // COMPUTED-LABEL: @computed_tma_rhs_one_stage
++  tt.func @computed_tma_rhs_one_stage(%a: tensor<64x32xf16, #dot>, %b: !tt.tensordesc<32x64xf32, #tma>, %iterations: i32) -> tensor<64x64xf32, #mma> {
++    %zero = arith.constant 0 : i32
++    %step = arith.constant 32 : i32
++    %init = arith.constant dense<0.0> : tensor<64x64xf32, #mma>
++    // COMPUTED-NOT: !ttg.memdesc<2x32x64xf16
++    // COMPUTED: scf.for
++    %result = scf.for %i = %zero to %iterations step %step iter_args(%acc = %init) -> tensor<64x64xf32, #mma> : i32 {
++      %loaded = tt.descriptor_load %b[%i, %zero] : !tt.tensordesc<32x64xf32, #tma> -> tensor<32x64xf32, #blocked>
++      %converted = arith.truncf %loaded : tensor<32x64xf32, #blocked> to tensor<32x64xf16, #blocked>
++      %operand = ttg.local_alloc %converted {alignment = 512 : i32} : (tensor<32x64xf16, #blocked>) -> !ttg.memdesc<32x64xf16, #shared, #smem>
++      // COMPUTED: ttg.local_alloc
++      // COMPUTED: ttng.warp_group_dot
++      // COMPUTED: ttng.warp_group_dot_wait {{.*}} {pendings = 0 : i32}
++      %next = ttng.warp_group_dot %a, %operand, %acc : tensor<64x32xf16, #dot> * !ttg.memdesc<32x64xf16, #shared, #smem> -> tensor<64x64xf32, #mma>
++      scf.yield %next : tensor<64x64xf32, #mma>
++    } {tt.num_stages = 1 : i32}
++    tt.return %result : tensor<64x64xf32, #mma>
++  }
++
++  // COMPUTED-LABEL: @computed_tma_rhs_arithmetic_under_cast
++  tt.func @computed_tma_rhs_arithmetic_under_cast(%a: tensor<64x32xf16, #dot>, %b: !tt.tensordesc<32x64xf32, #tma>, %iterations: i32) -> tensor<64x64xf32, #mma> {
++    %zero = arith.constant 0 : i32
++    %step = arith.constant 32 : i32
++    %scale = arith.constant dense<2.0> : tensor<32x64xf32, #blocked>
++    %init = arith.constant dense<0.0> : tensor<64x64xf32, #mma>
++    // COMPUTED-NOT: !ttg.memdesc<2x32x64xf16
++    // COMPUTED: scf.for
++    %result = scf.for %i = %zero to %iterations step %step iter_args(%acc = %init) -> tensor<64x64xf32, #mma> : i32 {
++      %loaded = tt.descriptor_load %b[%i, %zero] : !tt.tensordesc<32x64xf32, #tma> -> tensor<32x64xf32, #blocked>
++      // COMPUTED: arith.mulf
++      %scaled = arith.mulf %loaded, %scale : tensor<32x64xf32, #blocked>
++      // COMPUTED: arith.truncf
++      %converted = arith.truncf %scaled : tensor<32x64xf32, #blocked> to tensor<32x64xf16, #blocked>
++      // COMPUTED: ttg.local_alloc
++      %operand = ttg.local_alloc %converted : (tensor<32x64xf16, #blocked>) -> !ttg.memdesc<32x64xf16, #shared, #smem>
++      // COMPUTED: ttng.warp_group_dot
++      // COMPUTED-NEXT: ttng.warp_group_dot_wait {{.*}} {pendings = 0 : i32}
++      %next = ttng.warp_group_dot %a, %operand, %acc : tensor<64x32xf16, #dot> * !ttg.memdesc<32x64xf16, #shared, #smem> -> tensor<64x64xf32, #mma>
++      scf.yield %next : tensor<64x64xf32, #mma>
++    }
++    tt.return %result : tensor<64x64xf32, #mma>
++  }
++
++  // COMPUTED-LABEL: @computed_rhs_ordinary_load
++  tt.func @computed_rhs_ordinary_load(%a: tensor<64x32xf16, #dot>, %b: tensor<32x64x!tt.ptr<f32>, #blocked>, %iterations: i32) -> tensor<64x64xf32, #mma> {
++    %zero = arith.constant 0 : i32
++    %one = arith.constant 1 : i32
++    %init = arith.constant dense<0.0> : tensor<64x64xf32, #mma>
++    // COMPUTED-NOT: !ttg.memdesc<2x32x64xf16
++    // COMPUTED: scf.for
++    %result = scf.for %i = %zero to %iterations step %one iter_args(%acc = %init) -> tensor<64x64xf32, #mma> : i32 {
++      %offsets = tt.splat %i : i32 -> tensor<32x64xi32, #blocked>
++      %ptrs = tt.addptr %b, %offsets : tensor<32x64x!tt.ptr<f32>, #blocked>, tensor<32x64xi32, #blocked>
++      %loaded = tt.load %ptrs : tensor<32x64x!tt.ptr<f32>, #blocked>
++      %converted = arith.truncf %loaded : tensor<32x64xf32, #blocked> to tensor<32x64xf16, #blocked>
++      // COMPUTED: ttg.local_alloc
++      %operand = ttg.local_alloc %converted : (tensor<32x64xf16, #blocked>) -> !ttg.memdesc<32x64xf16, #shared, #smem>
++      // COMPUTED: ttng.warp_group_dot {{.*}} : tensor<64x32xf16
++      // COMPUTED-NEXT: ttng.warp_group_dot_wait {{.*}} {pendings = 0 : i32}
++      %next = ttng.warp_group_dot %a, %operand, %acc : tensor<64x32xf16, #dot> * !ttg.memdesc<32x64xf16, #shared, #smem> -> tensor<64x64xf32, #mma>
++      // COMPUTED-NOT: ttng.warp_group_dot
++      // COMPUTED: scf.yield
++      scf.yield %next : tensor<64x64xf32, #mma>
++    }
++    tt.return %result : tensor<64x64xf32, #mma>
++  }
++}
+diff --git a/third_party/nvidia/lib/Dialect/NVWS/Transforms/LowerAref.cpp b/third_party/nvidia/lib/Dialect/NVWS/Transforms/LowerAref.cpp
+index 0c14a4eb39b8..82a29df76cbd 100644
+--- a/third_party/nvidia/lib/Dialect/NVWS/Transforms/LowerAref.cpp
++++ b/third_party/nvidia/lib/Dialect/NVWS/Transforms/LowerAref.cpp
+@@ -30,6 +30,7 @@
+ #include "mlir/IR/Dominance.h"
+ #include "mlir/IR/ImplicitLocOpBuilder.h"
+ #include "mlir/IR/Location.h"
++#include "mlir/IR/Matchers.h"
+ #include "mlir/IR/PatternMatch.h"
+ #include "mlir/IR/Value.h"
+ #include "mlir/Support/LLVM.h"
+@@ -703,7 +704,133 @@ bool isProducerLoad(ArefCreateOp arefOp) {
+   return false;
+ }
+ 
+-void multiBufferAref(const SmallVector<ArefCreateOp> &arefOps, int numStages) {
++ArefCreateOp getAref(Value value) {
++  while (Operation *op = value.getDefiningOp()) {
++    if (op->hasTrait<OpTrait::MemDescViewTrait>()) {
++      value = op->getOperand(0);
++      continue;
++    }
++    if (auto get = dyn_cast<ArefGetEnterOp>(op))
++      return get.getAref().getDefiningOp<ArefCreateOp>();
++    if (auto put = dyn_cast<ArefPutEnterOp>(op))
++      return put.getAref().getDefiningOp<ArefCreateOp>();
++    if (auto buffer = dyn_cast<ArefBufferOp>(op))
++      return buffer.getAref().getDefiningOp<ArefCreateOp>();
++    break;
++  }
++  return {};
++}
++
++bool isPerIterationStoreAref(ArefCreateOp aref, scf::ForOp loop) {
++  for (auto [index, buffer] : llvm::enumerate(aref.getBuffers())) {
++    auto type = cast<MemDescType>(buffer.getType());
++    auto *alloc = buffer.getDefiningOp();
++    if (!isa_and_nonnull<LocalAllocOp, TMEMAllocOp>(alloc) ||
++        alloc->getNumResults() != 1 ||
++        isa<TensorMemoryScalesEncodingAttr>(type.getEncoding()) ||
++        getArefDepth(type) != 1)
++      return false;
++    // Resizing an allocation must not change another aref's storage.
++    for (OpOperand &use : buffer.getUses()) {
++      if (!isa<LocalDeallocOp>(use.getOwner()) &&
++          (use.getOwner() != aref.getOperation() ||
++           use.getOperandNumber() != index))
++        return false;
++    }
++  }
++
++  ArefPutEnterOp put;
++  for (Operation *user : aref->getUsers()) {
++    if (auto enter = dyn_cast<ArefPutEnterOp>(user)) {
++      if (put || enter->getBlock() != loop.getBody())
++        return false;
++      put = enter;
++    }
++  }
++  if (!put)
++    return false;
++
++  SmallVector<unsigned> stores(put.getBuffers().size(), 0);
++  auto recordStores = [&](ValueRange buffers) {
++    for (auto [index, buffer] : llvm::enumerate(buffers)) {
++      for (Operation *user : buffer.getUsers()) {
++        if (user->getBlock() != loop.getBody())
++          return false;
++        if (auto store = dyn_cast<TMEMStoreOp>(user)) {
++          if (!matchPattern(store.getPred(), m_One()))
++            return false;
++        } else if (!isa<LocalStoreOp>(user)) {
++          return false;
++        }
++        ++stores[index];
++      }
++    }
++    return true;
++  };
++  if (!recordStores(put.getBuffers()))
++    return false;
++  unsigned exits = 0;
++  for (Operation *user : put.getToken().getUsers()) {
++    if (auto buffer = dyn_cast<ArefBufferOp>(user)) {
++      if (buffer.getAref() != aref.getResult() ||
++          !recordStores(buffer.getBuffers()))
++        return false;
++    } else if (auto exit = dyn_cast<ArefPutExitOp>(user)) {
++      if (exit->getBlock() != loop.getBody() ||
++          exit.getAref() != aref.getResult() ||
++          llvm::any_of(castAsyncOpAttrs(exit.getAsyncOps()),
++                       [](AsyncOp op) { return op != AsyncOp::NONE; }))
++        return false;
++      ++exits;
++    } else {
++      return false;
++    }
++  }
++  return exits == 1 && llvm::all_of(stores, [](unsigned n) { return n == 1; });
++}
++
++SmallVector<ArefCreateOp> pipelineComputedMMAOperands(ModuleOp module,
++                                                      unsigned numStages) {
++  SetVector<ArefCreateOp> operands;
++  DenseSet<ArefCreateOp> accumulators;
++  module.walk([&](MMAv5OpInterface mma) {
++    if (auto aref = getAref(mma.getAccumulator()))
++      accumulators.insert(aref);
++  });
++  module.walk([&](MMAv5OpInterface mma) {
++    if (!hasPartition(mma) || getPartitionIds(mma).front() == 0)
++      return;
++    auto loop = mma->getParentOfType<scf::ForOp>();
++    if (!loop || getNumStagesOrDefault(loop, numStages) <= 1)
++      return;
++    auto dot = cast<DotOpInterface>(mma.getOperation());
++    if (!isOperandPipelineable(dot.getA(), loop) ||
++        !isOperandPipelineable(dot.getB(), loop))
++      return;
++
++    SmallVector<ArefCreateOp> computed;
++    for (Value operand : {dot.getA(), dot.getB()}) {
++      auto aref = getAref(operand);
++      if (aref && !isProducerLoad(aref)) {
++        if (accumulators.contains(aref) || !isPerIterationStoreAref(aref, loop))
++          return;
++        computed.push_back(aref);
++      }
++    }
++    if (computed.empty())
++      return;
++
++    // Each input slot is released by the consumer's tcgen05 commit, so the
++    // producer can fill the other slot while the current MMA remains in flight.
++    setIsAsync(mma, numStages);
++    if (mma.isAsync())
++      operands.insert(computed.begin(), computed.end());
++  });
++  return SmallVector<ArefCreateOp>(operands.begin(), operands.end());
++}
++
++void multiBufferAref(const SmallVector<ArefCreateOp> &arefOps, int numStages,
++                     bool allowTmem = false) {
+   SmallVector<Operation *> allocsToErase;
+   for (auto arefOp : arefOps) {
+     SmallVector<Value> allocOps;
+@@ -711,7 +838,8 @@ void multiBufferAref(const SmallVector<ArefCreateOp> &arefOps, int numStages) {
+ 
+     bool eligible = true;
+     for (auto opnd : arefOp.getOperands()) {
+-      if (!opnd.getDefiningOp() || isa<TMEMAllocOp>(opnd.getDefiningOp())) {
++      if (!opnd.getDefiningOp() ||
++          (!allowTmem && isa<TMEMAllocOp>(opnd.getDefiningOp()))) {
+         eligible = false;
+       }
+     }
+@@ -726,8 +854,10 @@ void multiBufferAref(const SmallVector<ArefCreateOp> &arefOps, int numStages) {
+       auto arefBufType = cast<MemDescType>(opnd.getType());
+       arefBufType =
+           getMultiBufferedType(getBufferViewType(arefBufType, true), numStages);
++      auto localAlloc = dyn_cast<LocalAllocOp>(oldAlloc);
++      auto alignment = localAlloc ? localAlloc.getAlignment() : std::nullopt;
+       Operation *newAlloc = triton::nvws::createAlloc(
+-          builder, oldAlloc->getLoc(), arefBufType, Value());
++          builder, oldAlloc->getLoc(), arefBufType, Value(), alignment);
+       allocOps.push_back(newAlloc->getResult(0));
+       arefTypes.push_back(arefBufType);
+       oldAlloc->replaceAllUsesWith(newAlloc);
+@@ -958,6 +1088,9 @@ class NVWSLowerAref : public impl::NVWSLowerArefBase<NVWSLowerAref> {
+       combineArefs(loop);
+     }
+ 
++    auto computedOperands = pipelineComputedMMAOperands(m, numStages);
++    multiBufferAref(computedOperands, 2, /*allowTmem=*/true);
++
+     SmallVector<ArefCreateOp> arefOps;
+     m.walk([&](ArefCreateOp arefOp) {
+       // Only handles arefs whose producer (a partition with PutEnter / Exit)

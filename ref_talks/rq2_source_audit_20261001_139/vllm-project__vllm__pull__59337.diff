@@ -1,0 +1,388 @@
+diff --git a/tests/kernels/moe/parallel_utils.py b/tests/kernels/moe/parallel_utils.py
+index 972ebe6512eb..b955b4ff940d 100644
+--- a/tests/kernels/moe/parallel_utils.py
++++ b/tests/kernels/moe/parallel_utils.py
+@@ -231,7 +231,6 @@ def make_deepep_v2_a2a(
+     pgi: ProcessGroupInfo,
+     dp_size: int,
+     v2_args: DeepEPV2Args,
+-    use_cudagraph: bool = False,
+ ):
+     import deep_ep
+ 
+@@ -264,5 +263,4 @@ def make_deepep_v2_a2a(
+         num_experts=v2_args.num_experts,
+         num_topk=v2_args.num_topk,
+         use_fp8_dispatch=v2_args.use_fp8_dispatch,
+-        use_cudagraph=use_cudagraph,
+     )
+diff --git a/tests/kernels/moe/test_deepep_v2_async_finalize.py b/tests/kernels/moe/test_deepep_v2_async_finalize.py
+index 193d8906f37c..45179f91ff2e 100644
+--- a/tests/kernels/moe/test_deepep_v2_async_finalize.py
++++ b/tests/kernels/moe/test_deepep_v2_async_finalize.py
+@@ -1,6 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""Contract tests for DeepEPV2PrepareAndFinalize.finalize_async.
++"""Contract tests for DeepEPV2PrepareAndFinalize.
+ 
+ Hermetic: fake buffer/event, single process, no GPU collectives — only
+ requires deep_ep to be importable.
+@@ -14,9 +14,13 @@
+                         copied immediately.
+ """
+ 
++from types import SimpleNamespace
++
+ import pytest
+ import torch
+ 
++from vllm.config import CUDAGraphMode
++from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+ from vllm.utils.import_utils import has_deep_ep_v2
+ 
+ requires_deep_ep_v2 = pytest.mark.skipif(
+@@ -50,6 +54,18 @@ def __init__(self, out: torch.Tensor):
+         self.calls: list[dict] = []
+         self.last_event: _FakeEvent | None = None
+ 
++    def dispatch(self, **kwargs):
++        self.calls.append(kwargs)
++        expanded = kwargs["do_expand"]
++        num_tokens = self.out.size(0)
++        handle = SimpleNamespace(
++            num_recv_tokens_per_expert_list=[num_tokens] + [0] * 7 if expanded else [],
++            psum_num_recv_tokens_per_scaleup_rank=torch.tensor([num_tokens]),
++        )
++        ids = None if expanded else torch.zeros(num_tokens, 2, dtype=torch.int64)
++        weights = torch.ones(num_tokens) if expanded else torch.ones(num_tokens, 2)
++        return self.out, ids, weights, handle, _FakeEvent(has_event=False)
++
+     def combine(
+         self,
+         x,
+@@ -85,6 +101,58 @@ def _run(pf, output: torch.Tensor, do_async: bool):
+     return fn(output, empty, weights, ids, False, TopKWeightAndReduceContiguous())
+ 
+ 
++@requires_deep_ep_v2
++def test_prepare_switches_layout_and_preserves_deferred_receiver_mode(monkeypatch):
++    """One instance must follow each forward and retain its dispatch metadata."""
++    context = None
++    monkeypatch.setattr(
++        _dv2, "is_forward_context_available", lambda: context is not None
++    )
++    monkeypatch.setattr(_dv2, "get_forward_context", lambda: context)
++    monkeypatch.setattr(_dv2, "_globalize_recv_topk_idx", lambda ids, *args: ids)
++    tokens = torch.ones(3, 8, dtype=torch.bfloat16)
++    pf = _make_pf(tokens)
++    for mode in (
++        None,
++        CUDAGraphMode.NONE,
++        CUDAGraphMode.FULL,
++        CUDAGraphMode.PIECEWISE,
++        CUDAGraphMode.NONE,
++    ):
++        context = (
++            None
++            if mode is None
++            else SimpleNamespace(cudagraph_runtime_mode=mode, dp_metadata=None)
++        )
++        recv = pf.prepare_async(
++            tokens,
++            torch.ones(3, 2),
++            torch.zeros(3, 2, dtype=torch.int64),
++            8,
++            None,
++            False,
++            FusedMoEQuantConfig.make(None),
++            defer_input_quant=True,
++        )
++        expanded = mode in (None, CUDAGraphMode.NONE)
++        call = pf.buffer.calls[-1]
++        assert call["do_expand"] is expanded
++        assert call["do_cpu_sync"] is expanded
++        assert call["num_max_tokens_per_rank"] == (None if expanded else 4)
++
++        # The receiver may run after the forward context has changed.
++        context = SimpleNamespace(
++            cudagraph_runtime_mode=CUDAGraphMode.FULL
++            if expanded
++            else CUDAGraphMode.NONE
++        )
++        _, _, meta, ids, _ = recv()
++        assert meta is not None
++        assert ids.shape == (3, 1 if expanded else 2)
++        assert (meta.expert_num_tokens is not None) is expanded
++        assert (meta.psum_recv_per_rank is None) is expanded
++
++
+ @requires_deep_ep_v2
+ def test_finalize_async_defers_join_to_receiver():
+     out_src = torch.full((4, 8), 7.0, dtype=torch.bfloat16)
+diff --git a/tests/kernels/moe/test_deepep_v2_moe.py b/tests/kernels/moe/test_deepep_v2_moe.py
+index 2fbde2f86e06..4d7239e4b6e8 100644
+--- a/tests/kernels/moe/test_deepep_v2_moe.py
++++ b/tests/kernels/moe/test_deepep_v2_moe.py
+@@ -13,7 +13,7 @@
+ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+ from tests.kernels.moe.utils import make_dummy_moe_config, make_test_weights
+ from tests.kernels.utils import torch_experts
+-from vllm.config import VllmConfig, set_current_vllm_config
++from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
+ from vllm.forward_context import set_forward_context
+ from vllm.model_executor.layers.fused_moe import TritonExperts
+ from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+@@ -110,7 +110,6 @@ def make_modular_kernel(
+     q_dtype: torch.dtype | None,
+     use_fp8_dispatch: bool,
+     quant_config: FusedMoEQuantConfig,
+-    use_cudagraph: bool = False,
+ ) -> FusedMoEKernel:
+     v2_args = DeepEPV2Args(
+         num_local_experts=num_local_experts,
+@@ -126,7 +125,6 @@ def make_modular_kernel(
+         pgi=pgi,
+         dp_size=dp_size,
+         v2_args=v2_args,
+-        use_cudagraph=use_cudagraph,
+     )
+ 
+     moe_config = make_dummy_moe_config(
+@@ -482,7 +480,6 @@ def _deep_ep_v2_moe_backends(
+     pgi: ProcessGroupInfo,
+     dp_size: int,
+     config: TestConfig,
+-    use_cudagraph: bool,
+     experts_backend: str,
+ ):
+     import tempfile
+@@ -585,28 +582,42 @@ def _deep_ep_v2_moe_backends(
+             pgi=pgi,
+             dp_size=dp_size,
+             v2_args=v2_args,
+-            use_cudagraph=use_cudagraph,
+         )
+         mk_kernel = FusedMoEKernel(
+             prepare_finalize=a2a,
+             fused_experts=fused_experts,
+         )
+ 
+-        with set_forward_context(None, vllm_cfg):
+-            for _ in range(3):
+-                out = mk_kernel.apply(
+-                    hidden_states=test_tensors.rank_tokens,
+-                    w1=w1_ep,
+-                    w2=w2_ep,
+-                    topk_weights=test_tensors.topk_weights,
+-                    topk_ids=test_tensors.topk,
+-                    activation=MoEActivation.SILU,
+-                    global_num_experts=config.num_experts,
+-                    expert_map=None,
+-                    apply_router_weight_on_input=False,
+-                )
+-
+-    torch.testing.assert_close(torch_combined, out, atol=atol, rtol=rtol)
++        def apply():
++            return mk_kernel.apply(
++                hidden_states=test_tensors.rank_tokens,
++                w1=w1_ep,
++                w2=w2_ep,
++                topk_weights=test_tensors.topk_weights,
++                topk_ids=test_tensors.topk,
++                activation=MoEActivation.SILU,
++                global_num_experts=config.num_experts,
++                expert_map=None,
++                apply_router_weight_on_input=False,
++            )
++
++        for mode in (
++            CUDAGraphMode.NONE,
++            CUDAGraphMode.FULL,
++            CUDAGraphMode.PIECEWISE,
++            CUDAGraphMode.NONE,
++        ):
++            with set_forward_context(None, vllm_cfg, cudagraph_runtime_mode=mode):
++                out = apply()
++                if mode == CUDAGraphMode.FULL:
++                    torch.accelerator.synchronize()
++                    torch.distributed.barrier(group=pg)
++                    graph = torch.cuda.CUDAGraph()
++                    with torch.cuda.graph(graph):
++                        out = apply()
++                    graph.replay()
++
++            torch.testing.assert_close(torch_combined, out, atol=atol, rtol=rtol)
+ 
+ 
+ @pytest.mark.parametrize("m,n,k", [(32, 256, 1024)])
+@@ -614,7 +625,6 @@ def _deep_ep_v2_moe_backends(
+ @pytest.mark.parametrize("topk", [6])
+ @pytest.mark.parametrize("world_dp_size", [(2, 1)])
+ @pytest.mark.parametrize("experts_backend", EXPERTS_BACKENDS)
+-@pytest.mark.parametrize("use_cudagraph", [True, False])
+ @multi_gpu_test(num_gpus=2)
+ @requires_deep_ep_v2
+ @pytest.mark.skipif(
+@@ -629,7 +639,6 @@ def test_deep_ep_v2_moe_backends(
+     topk: int,
+     world_dp_size: tuple[int, int],
+     experts_backend: str,
+-    use_cudagraph: bool,
+     workspace_init,
+ ):
+     set_random_seed(7)
+@@ -650,6 +659,5 @@ def test_deep_ep_v2_moe_backends(
+         _deep_ep_v2_moe_backends,
+         dp_size,
+         config,
+-        use_cudagraph,
+         experts_backend,
+     )
+diff --git a/vllm/model_executor/layers/fused_moe/all2all_utils.py b/vllm/model_executor/layers/fused_moe/all2all_utils.py
+index 3186b5d3c4e2..9b0f32bb84e9 100644
+--- a/vllm/model_executor/layers/fused_moe/all2all_utils.py
++++ b/vllm/model_executor/layers/fused_moe/all2all_utils.py
+@@ -282,9 +282,6 @@ def maybe_make_prepare_finalize(
+             use_fp8_dispatch=use_fp8_dispatch,
+         )
+         handle = all2all_manager.get_handle(all_to_all_args)
+-        vllm_config = get_current_vllm_config()
+-        use_cudagraph = not vllm_config.model_config.enforce_eager
+-
+         prepare_finalize = DeepEPV2PrepareAndFinalize(
+             buffer=handle,
+             num_dispatchers=all2all_manager.world_size,
+@@ -293,7 +290,6 @@ def maybe_make_prepare_finalize(
+             num_experts=moe.num_experts,
+             num_topk=moe.experts_per_token,
+             use_fp8_dispatch=use_fp8_dispatch,
+-            use_cudagraph=use_cudagraph,
+             sp_size=moe.moe_parallel_config.sp_size,
+         )
+ 
+diff --git a/vllm/model_executor/layers/fused_moe/prepare_finalize/deepep_v2.py b/vllm/model_executor/layers/fused_moe/prepare_finalize/deepep_v2.py
+index a584ab5f52ff..53373e9ae960 100644
+--- a/vllm/model_executor/layers/fused_moe/prepare_finalize/deepep_v2.py
++++ b/vllm/model_executor/layers/fused_moe/prepare_finalize/deepep_v2.py
+@@ -6,7 +6,8 @@
+ import torch
+ 
+ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+-from vllm.forward_context import get_forward_context
++from vllm.config import CUDAGraphMode
++from vllm.forward_context import get_forward_context, is_forward_context_available
+ from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
+     TopKWeightAndReduceContiguous,
+@@ -70,9 +71,9 @@ def _unpack_mxfp8_scale(
+ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
+     """Prepare/Finalize using DeepEP v2 ElasticBuffer (unified API).
+ 
+-    Supports two modes controlled by the `use_cudagraph` constructor arg:
++    Selects the dispatch layout from the current forward's CUDA graph mode.
+ 
+-    **Decode mode (use_cudagraph=True):**
++    **Graph mode (FULL or PIECEWISE):**
+       - do_expand=False, do_cpu_sync=False
+       - Tokens returned in original order with recv_topk_idx (global IDs)
+       - Worst-case tensor allocation; padding rows zeroed via
+@@ -80,12 +81,11 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
+       - Fully cudagraph-capturable
+       - Expert kernel sorts internally (expert_tokens_meta carries no counts)
+ 
+-    **Prefill mode (use_cudagraph=False):**
++    **Eager mode (NONE, or no forward context):**
+       - do_expand=True, do_cpu_sync=True
+       - Per-expert-contiguous layout; exact memory allocation
+       - Saves GPU memory (no worst-case allocation)
+-      - Not cudagraph-capturable (CPU polling), but prefill doesn't
+-        use cudagraphs anyway
++      - Not cudagraph-capturable (CPU polling)
+       - Provides expert_tokens_meta for efficient batched expert kernels
+ 
+     Dispatch always uses async_with_compute_stream=False. finalize_async
+@@ -113,7 +113,6 @@ def __init__(
+         num_experts: int,
+         num_topk: int,
+         use_fp8_dispatch: bool = False,
+-        use_cudagraph: bool = False,
+         sp_size: int = 1,
+     ):
+         super().__init__()
+@@ -124,7 +123,6 @@ def __init__(
+         self.num_experts = num_experts
+         self.num_topk = num_topk
+         self.use_fp8_dispatch = use_fp8_dispatch
+-        self.use_cudagraph = use_cudagraph
+         self.sp_size = sp_size
+ 
+         # DBO microbatching: one handle slot per micro-batch.
+@@ -177,10 +175,11 @@ def _do_dispatch(
+         if has_scales:
+             token_data = (tokens, token_scales)
+ 
+-        # Decode: do_expand=False + do_cpu_sync=False (cudagraph-safe)
+-        # Prefill: do_expand=True + do_cpu_sync=True (memory-efficient)
+-        do_expand = not self.use_cudagraph
+-        do_cpu_sync = not self.use_cudagraph
++        do_expand = (
++            not is_forward_context_available()
++            or get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.NONE
++        )
++        do_cpu_sync = do_expand
+ 
+         # In do_expand=False mode, the recv buffer is the worst case
+         # R * num_max_tokens_per_rank. Defaulting to the buffer's init value
+@@ -238,6 +237,7 @@ def _do_dispatch(
+             a1_scale,
+             quant_config,
+             defer_input_quant=defer_input_quant,
++            do_expand=do_expand,
+         )
+ 
+     def _receiver(
+@@ -253,6 +253,7 @@ def _receiver(
+         a1_scale: torch.Tensor | None,
+         quant_config: FusedMoEQuantConfig,
+         defer_input_quant: bool,
++        do_expand: bool,
+     ) -> mk.PrepareResultType:
+         if event.event is not None:
+             event.current_stream_wait()
+@@ -268,15 +269,11 @@ def _receiver(
+                 device=expert_x.device,
+             )
+         else:
+-            # Decode/cudagraph path (do_cpu_sync=False) skips the CPU sync and
+-            # leaves recv_expert_num_tokens empty. A present-but-empty
+-            # ExpertTokensMetadata violates the decode-mode contract above
+-            # (expert_tokens_meta must be None) and crashes DeepEP combine
+-            # during profile_run when CUDA graphs are enabled.
++            # Graph dispatch skips the CPU sync and provides no expert counts.
+             expert_tokens_meta = None
+ 
+         if recv_topk_idx is None:
+-            # do_expand=True (prefill mode): build topk_ids from
++            # do_expand=True (eager mode): build topk_ids from
+             # per-expert token counts.
+             assert expert_tokens_meta is not None
+             total_tokens = sum(recv_expert_num_tokens)
+@@ -296,7 +293,7 @@ def _receiver(
+                 )
+             recv_topk_idx = recv_topk_idx.unsqueeze(1)
+         else:
+-            # do_expand=False (decode/cudagraph mode): the dispatch only writes
++            # do_expand=False (graph mode): the dispatch only writes
+             # rows [0, num_recv_tokens); the rest of the worst-case-allocated
+             # buffer is left UNINITIALIZED. For valid rows, recv_topk_idx holds
+             # LOCAL expert IDs (-1 for non-local slots). Convert valid local IDs
+@@ -318,7 +315,7 @@ def _receiver(
+         if recv_topk_weights is not None and recv_topk_weights.ndim == 1:
+             recv_topk_weights = recv_topk_weights.unsqueeze(1)
+ 
+-        if self.use_cudagraph:
++        if not do_expand:
+             # Carry the per-rank prefix sum so SiTU can skip padding rows.
+             # expert_num_tokens stays None: count-based consumers (DeepGEMM,
+             # Triton) must treat a None field as "no counts" and derive their

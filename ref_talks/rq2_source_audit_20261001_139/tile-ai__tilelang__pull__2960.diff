@@ -1,0 +1,4564 @@
+diff --git a/.agents/skills/tilelang-layout/SKILL.md b/.agents/skills/tilelang-layout/SKILL.md
+new file mode 100644
+index 0000000000..a406be6963
+--- /dev/null
++++ b/.agents/skills/tilelang-layout/SKILL.md
+@@ -0,0 +1,157 @@
++---
++name: tilelang-layout
++description: Use when working with TileLang layouts — the Layout/Fragment classes, layout inference and its cost model, the CuTe layout algebra and TileLang-to-CuTe conversion, swizzles, or when debugging layout-related passes and their annotations.
++---
++
++# TileLang Layout System
++
++## Core types (`src/layout/layout.h`, Python `tilelang/layout/`)
++
++**`tl::Layout`** maps logical coordinates to physical coordinates:
++`input_size_` (logical shape) + `forward_index_` (one PrimExpr per output
++axis). Expressions are written in process-wide placeholder Vars
++`InputPlaceholder(i)` (printed `_i`, `_j`, ...). Key APIs:
++`InputShape/OutputShape/GetForwardIndex/Forward(vars)/Inverse/
++InverseWithLevel/Reshape/DetectInjective/DebugOutput`. `OutputShape()` is
++DERIVED from the expressions' ranges by the Analyzer, not stored.
++
++**`tl::Fragment : Layout`** adds a thread dimension for register buffers:
++`forward_thread_` (PrimExpr, may reference `ReplicationPlaceholder()`,
++printed `_rep`) and `replicate_size_`. `ThreadExtent()` =
++`max(forward_thread)+1` under bound domains — also derived, not stored.
++`thread_range_` (via `BindThreadRange`) offsets the thread space for warp
++specialization; the forward map itself stays in normalized `[0, T)`.
++Replication semantics: each logical point is held by `replicate_size`
++threads; `Replicate/DeReplicate/CondenseReplicateVar` manipulate the rep
++axis.
++
++**Gotchas (verified, easy to trip on):**
++
++- `FragmentNode::GetForwardVars()` PREPENDS `ReplicationPlaceholder()`
++  when `replicate_size > 1` (`src/layout/layout.cc:1103`). The input
++  placeholders are always the TRAILING `InputDim()` entries. Python code
++  that zips `get_forward_vars()` against the shape positionally is wrong
++  for replicated fragments.
++- The canonical (thread, slot, rep) packing lives in
++  `FragmentNode::InverseWithLevel` (`src/layout/layout.cc:1133`): rep
++  becomes a trailing ORDINARY input dim of extent `ReplicateExtent()`
++  (substituting the placeholder), thread a trailing output. The inverse
++  then maps `(slot..., thread) -> (coords..., rep)` with rep last;
++  `loop_partition.cc` consumes exactly this ordering and guards
++  replica-zero for stores. Mirror this packing when you need a fragment
++  as a plain multi-output layout.
++- Layouts print via `DebugOutput()` / Python `repr`:
++  `Fragment((2,) -> (2,), replicate: 256, thread: _rep, index: (_i,),
++  thread_range: I.Range(0, 256))`. Structured fields are directly
++  accessible from Python: `replicate_size`, `get_thread_size()`,
++  `forward_thread`, `forward_index`, `thread_range`, `get_input_shape()`.
++
++**Swizzles** (`tilelang/layout/swizzle.py`, `src/layout/swizzle_mode.*`)
++are XOR-based shared-memory layouts. They are NOT expressible as strided
++layouts; the CuTe side models them as a separate `Swizzle` functor
++(`ComposedLayout`), never as (shape, stride) modes.
++
++## CuTe layout algebra (`src/layout/cute_layout.{h,cc}`, `tilelang/layout/cute.py`)
++
++A full CuTe implementation maintained for the MMA/TMA backends, exposed to
++C++ (`namespace tvm::tl::cute`) and Python (`tilelang.layout.cute`):
++
++- Layouts are `(shape, stride)` IntTuple trees, **COLUMN-major (first mode
++  fastest)** — opposite of TileLang's row-major intuition. Multi-output
++  codomains use `ScaledBasis` strides (`v@axis`, `E<i>`).
++- Algebra: `Coalesce`, `RightInverse`, `LeftInverse`, `Composition`,
++  `Complement`, `Cosize`, `LogicalDivide`, `Filter`, `Restrict`,
++  `Layout::WithShape`, `Parse`/`Print` (exact CuTe spelling).
++- Converters: `LayoutFromTileLang` (single flat output; multi-output
++  tl::Layouts are serialized ROW-major, so outputs `[thread, slot]` yield
++  `thread * slots + slot`), `LayoutFromTileLangHierarchical` (per-axis
++  recovery onto basis axes), `ComposedLayoutFromTileLang` (swizzle
++  recovery). All use probe-then-prove: numerically probe strides at
++  one-hot points, then symbolically PROVE equivalence — a wrong recovery
++  cannot slip through; failure returns `None`/nullopt.
++
++**Failure conventions (must respect):** only the three `*FromTileLang`
++converters return Optional. Every other algebra op ICHECK-crashes on its
++preconditions (composition divisibility, non-constant extents in the
++probe, complement non-injectivity, restrict rank...). Wrap calls when the
++input is untrusted. `RightInverse` is PARTIAL: it silently drops stride-0
++and non-const-stride modes and inverts only the maximal contiguous chain —
++check bijectivity via `size(right_inverse(F)) == size(F)`.
++
++**Conversion caveats:** the converters read only `GetForwardIndex()`; a
++Fragment's `forward_thread` and replication are silently ignored unless
++you pack them into a plain multi-output Layout first (see the canonical
++packing above; substitute `ReplicationPlaceholder` with a trailing input
++var — if it leaks into the probe, conversion gracefully returns None).
++
++## Layout inference (`src/transform/layout_inference/`)
++
++`tl.LayoutInference` assigns a layout to every fragment buffer and
++parallel loop nest. Three levels: **strict** (annotations, MMA-imposed) →
++**common** (BFS propagation through shared buffers) → **free** (per
++connected component, try every member as inference root, keep the
++cheapest attempt). Results are stored as IR annotations: `layout_map`
++(Buffer -> Layout, on the SBlock) and `parallel_loop_layout` (Fragment,
++on the outermost parallel For); `ParallelLoopLayoutValidator` enforces the
++annotation contract.
++
++"Cheapest" is a pluggable policy (`layout_cost_model.{h,cc}`):
++
++- `tl.layout_cost_model="io-aware"` (default): every
++  fragment<->global copy and global-touching parallel loop is charged
++  `max(bandwidth bytes, issue bytes)` under the attempt's layouts, scored
++  symbolically on the CuTe algebra (pack -> `LayoutFromTileLang` ->
++  `RightInverse` -> `Composition`; vector width read off coalesced modes;
++  segments counted at warp/step granularity). Registers are the tiebreak.
++  Statements outside the model are charged a conservative worst case — an
++  attempt must never profit from opacity.
++- `tl.layout_cost_model="register-count"`: legacy register-slots-only
++  ordering.
++- The scoring formulas are guarded by the Python parity check
++  `maint/layout_inference/run.py --cute` (symbolic scorer vs an
++  independent NumPy enumeration oracle); keep `cute_model.py` in lockstep
++  when changing `layout_cost_model.cc`.
++
++Hardware geometry is parameterized: lane width via `MaxVectorLoadBits`
++(`src/transform/loop_vectorize.h`, SHARED with the vectorizer so the
++model's width beliefs match codegen), warp size from the target's
++`thread_warp_size`, segment granularity 128B (see `BindMemoryGeometry`).
++
++## Downstream consumers
++
++- `loop_partition.cc`: partitions parallel loops per-thread via the
++  fragment inverse; emits replica-zero guards for replicated stores.
++- `loop_vectorize.cc`: plans vector widths (`GetVectorizeSize`,
++  `IndicesCanVectorize`); the cost model mirrors its judgment.
++- TMA/MMA lowering: `src/cuda/op/tma_layout.cc` and
++  `producer_consumer_ws.cc` recover shared-buffer swizzles via
++  `ComposedLayoutFromTileLang`; tcgen05/wgmma macro generators
++  (`tilelang/cuda/intrinsics/macro/`) round-trip TMEM layouts through
++  `to_tilelang`/`from_tilelang_hierarchical`.
++
++## Tools
++
++- **`maint/layout_inference/`** — the layout verification harness (see its
++  README): golden layout snapshots per constructed case (`run.py`),
++  lowered vector-width anchors (`--anchor`), and symbolic-vs-oracle parity
++  (`--cute`, backed by `cute_model.py` + the numpy `oracle.py`). Extend it
++  with a new case whenever you change inference, the cost model, or the
++  converters; goldens are recorded then human-reviewed (`--record`).
++- **Diagnostics**: the inference and cost-model passes log decisions via
++  DLOG (debug builds); `tl.layout_visualization_enable` renders layouts.
++- **Python inspection**: run `tl.transform.LayoutInference()` on a module
++  and read the annotations (see `maint/layout_inference/common.py` for
++  the extraction idiom), or `cute.Layout.from_tilelang(...)` to see a
++  layout's (shape, stride) normal form.
++
++## File map
++
++| area | files |
++|---|---|
++| core types | `src/layout/layout.{h,cc}`, `tilelang/layout/{layout,fragment}.py` |
++| swizzle | `src/layout/swizzle_mode.*`, `tilelang/layout/swizzle*.py` |
++| CuTe algebra | `src/layout/cute_layout.{h,cc}`, `tilelang/layout/cute.py` |
++| inference | `src/transform/layout_inference/layout_inference.cc` |
++| cost model | `src/transform/layout_inference/layout_cost_model.{h,cc}` |
++| MMA layouts | `src/layout/gemm_layouts.cc`, `src/layout/tcgen05_layout.*` |
++| verification | `maint/layout_inference/` |
+diff --git a/.agents/skills/tilelang-layout/agents/openai.yaml b/.agents/skills/tilelang-layout/agents/openai.yaml
+new file mode 100644
+index 0000000000..69c681fddc
+--- /dev/null
++++ b/.agents/skills/tilelang-layout/agents/openai.yaml
+@@ -0,0 +1,4 @@
++interface:
++  display_name: "TileLang Layout System"
++  short_description: "Layout/Fragment types, inference, cost model, CuTe algebra"
++  default_prompt: "Use $tilelang-layout when reading or changing TileLang layouts, layout inference, the layout cost model, or TileLang-to-CuTe layout conversions."
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 7e782afe6e..10ea064baa 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -367,6 +367,7 @@ file(GLOB TILE_LANG_SRCS
+   src/layout/*.cc
+   src/transform/*.cc
+   src/transform/common/*.cc
++  src/transform/layout_inference/*.cc
+   src/transform/pipeline/*.cc
+   src/op/*.cc
+   src/backend/common/target_utils.cc
+diff --git a/maint/layout_inference/README.md b/maint/layout_inference/README.md
+new file mode 100644
+index 0000000000..24e137389b
+--- /dev/null
++++ b/maint/layout_inference/README.md
+@@ -0,0 +1,113 @@
++# Layout inference verification harness
++
++Constructed IR cases with reviewed expected layouts, for validating the
++free-mode layout search — in particular the selection policy behind
++`tl.layout_cost_model` ("register-count" = the legacy ordering,
++"io-aware" = the default model in
++`src/transform/layout_inference/layout_cost_model.cc`).
++
++Why this exists:
++
++- The cost model's score decides which layout attempt wins; any change to
++  the model (or a future fast-path/slow-path split inside it) can silently
++  flip the winner. Golden layouts pin the current answers so a flip shows
++  up as a reviewable diff, not a runtime perf mystery.
++- Cases where the two policies **disagree** are the calibration corpus:
++  each disagreement is a concrete claim ("the io-aware pick is faster on
++  hardware") that can be benchmarked.
++
++## Usage
++
++```bash
++python run.py                # verify all cases against expected/
++python run.py --case NAME    # substring filter
++python run.py --show         # also print the inferred layouts
++python run.py --record       # rewrite goldens from current behavior
++python run.py --anchor       # lower fully; check per-buffer vector widths
++                             # in device TIR against VECTOR_ANCHOR
++python run.py --cute         # compare symbolic scores with the exact oracle
++```
++
++`--anchor` closes the loop between the model and the real vectorizer: the
++cost model scores a layout assuming a vector width, and the anchor reads
++back what the vectorizer actually emitted for the winning layout under the
++default config. Each case declares `VECTOR_ANCHOR = {variant: {buffer:
++lanes}}`; variants without one print observed widths for review. A
++mismatch means the model's width belief and codegen diverged — exactly the
++drift the shared MaxVectorLoadBits policy is supposed to prevent.
++
++## CuTe parity checking (`--cute`)
++
++`python run.py --cute` validates the symbolic formulation used by the
++io-aware scorer on the in-tree CuTe layout algebra
++(`tilelang/layout/cute.py`, `src/layout/cute_layout.cc`):
++
++- `cute_model.py` packs each fragment as
++  `(coords..., rep) -> [thread, slot]` (the canonical packing of
++  `FragmentNode::InverseWithLevel`), converts it with
++  `cute.Layout.from_tilelang` into ONE plain strided layout computing the
++  enumerator's cell index, then derives the byte-address layout with
++  `right_inverse` + `composition` and reads the vector width off the
++  coalesced slot modes. Segment counts evaluate the derived layout at
++  warp/step granularity, once per issued vector lane rather than once per
++  logical point and replica.
++- `oracle.py` is the independent arbiter: a numpy implementation of the
++  retired exact-enumeration formulas, with whole-grid evaluation of the
++  fragment's own forward expressions.
++- Every fragment golden layout is scored by both paths, as a load and as a
++  store (replication gating included), and (V, issue, bw, segments) must match
++  exactly. `CUTE_STATEMENTS` in a case supplies real enclosing-buffer
++  shapes where they differ from the fragment shape (offset_region_copy).
++
++Current status: 88/88 statements match with a 100% conversion hit rate.
++The production scorer in `layout_cost_model.cc` uses this formulation; its
++mode arithmetic was additionally audited once, in-tree, against a full
++exact-enumeration oracle across the layout-relevant test corpus (~264
++tests + this harness, zero disagreements, zero over-cap skips) before that
++oracle was removed. This `--cute` check is now the standing guard: any
++change to the scoring formulas must keep it green (update `cute_model.py`
++in lockstep with `layout_cost_model.cc`).
++
++Recording is not approval: after `--record`, read the diff under
++`expected/` and convince yourself every changed layout is intended before
++committing. Structural invariants (each case's optional `check`) are
++enforced even in record mode, so a recording can never bless a layout that
++violates a case's documented contract.
++
++## Layout of a case
++
++Each `cases/*.py` defines:
++
++- `VARIANTS: dict[name -> callable]` — each callable returns a fresh
++  `PrimFunc` (lazy so construction happens under the driver's target).
++- optional `check(variant, model, result)` — assertions that must hold
++  regardless of the golden, e.g. "this fragment must be fully replicated
++  under the io-aware model".
++
++`result` is `{"buffers": {name: layout}, "loops": {nest_key: layout}}`
++where each layout is a STRUCTURED dict (`common.layout_to_dict`):
++
++```json
++{"kind": "Fragment", "input_shape": [2], "output_shape": [2],
++ "forward_index": ["_i"], "replicate": 256, "threads": 256,
++ "forward_thread": "_rep", "thread_range": [0, 256]}
++```
++
++Golden diffs therefore point at the exact field that moved
++(`replicate: expected 1, got 128`), and checks assert on fields
++(`frag["replicate"] == 1`) instead of substring-matching a print format.
++The driver snapshots the `layout_map` block annotation plus each parallel
++nest's `parallel_loop_layout` annotation (see `common.py`).
++
++## Current cases
++
++| case | what it pins |
++|---|---|
++| `elementwise_copy` | Baseline: both models must agree on the coalesced, vectorized roundtrip layout. Primary equal-score anchor. |
++| `fp8_copy` | 1-byte dtype: the 16-element vector width at the wide end of the shared width policy. |
++| `broadcast_read` | Issue #1729. The models disagree **by design**: register-count keeps the thread-collapsed legacy pathology (golden documents it); io-aware must pick full replication + a non-replicated coalesced loop (enforced by `check`). |
++| `transposed_store` | Load and store pull the layout in opposite directions; goldens record each model's trade-off. fp32 variant: the models pick different layouts — benchmark-worthy. |
++| `mixed_dtype_chain` | fp16/fp32 fragment pair in one component; vectorization is sized by conflicting dtypes. The models pick different vector splits — benchmark-worthy. |
++| `reduce_broadcast` | Softmax-shaped row-reduce + broadcast consume: the most common real-kernel component. Both models agree, including the reduced fragment's canonical partial replication. |
++| `offset_region_copy` | Multi-block tiled copies whose region mins carry block indices (the model's "foreign vars"): offset regions must rank exactly like zero-offset ones. |
++| `shared_staging` | global→shared→fragment→global chain: the shared-side copy is outside the io model, so the fragment is decided by the copy-out alone; goldens would surface any change to that boundary. |
+diff --git a/maint/layout_inference/cases/broadcast_read.py b/maint/layout_inference/cases/broadcast_read.py
+new file mode 100644
+index 0000000000..b5e27626b6
+--- /dev/null
++++ b/maint/layout_inference/cases/broadcast_read.py
+@@ -0,0 +1,60 @@
++"""Broadcast read of a tiny fragment inside a wide parallel loop (#1729).
++
++``s_frag`` has fewer elements than there are threads, and every thread
++reads it while streaming ``Out``.  This is THE case the two cost models
++disagree on, and the disagreement is the point:
++
++  - register-count picks a 1-slot partially-replicated ``s_frag`` (fewer
++    registers) whose induced loop layout collapses the j axis onto each
++    thread — every thread serially walks all of j, with the whole loop
++    redundantly replicated across threads.  That is the issue #1729
++    pathology, preserved in the golden as the documented legacy baseline.
++  - io-aware must reject it via the issue term: ``s_frag`` fully
++    replicated (replicate == thread count) and a non-replicated,
++    coalesced loop layout over ``Out``.  Enforced by ``check`` below.
++"""
++
++import tilelang.language as T
++
++
++def _broadcast(rows, cols, threads):
++    @T.prim_func
++    def main(S: T.Tensor((rows,), T.float32), Out: T.Tensor((rows, cols), T.float32)):
++        with T.Kernel(1, threads=threads):
++            s_frag = T.alloc_fragment((rows,), T.float32)
++            T.copy(S, s_frag)
++            for i, j in T.Parallel(rows, cols):
++                Out[i, j] = s_frag[i] * 2.0
++
++    return main
++
++
++VARIANTS = {
++    # The shape from issue #1729: (2,) fragment under T.Parallel(2, 2560).
++    "issue1729_2x2560_t256": lambda: _broadcast(2, 2560, 256),
++    "rows4_cols1024_t128": lambda: _broadcast(4, 1024, 128),
++}
++
++_THREADS = {
++    "issue1729_2x2560_t256": 256,
++    "rows4_cols1024_t128": 128,
++}
++
++
++def check(variant, model, result):
++    if model != "io-aware":
++        return  # legacy model keeps the #1729 pathology; golden documents it
++    frag = result["buffers"]["s_frag"]
++    threads = _THREADS[variant]
++    assert frag["replicate"] == threads, f"broadcast-read fragment must be fully replicated over {threads} threads, got: {frag}"
++    (loop,) = result["loops"].values()
++    assert loop["replicate"] == 1, f"loop layout must not replicate execution, got: {loop}"
++
++
++# Under the default (io-aware) config: S loads via the fully replicated
++# fragment (vector = its slot count), Out streams 4-wide and coalesced —
++# the whole point of rejecting the #1729 thread-collapsed candidate.
++VECTOR_ANCHOR = {
++    "issue1729_2x2560_t256": {"S": 2, "Out": 4},
++    "rows4_cols1024_t128": {"S": 4, "Out": 4},
++}
+diff --git a/maint/layout_inference/cases/elementwise_copy.py b/maint/layout_inference/cases/elementwise_copy.py
+new file mode 100644
+index 0000000000..a6b42ec6f9
+--- /dev/null
++++ b/maint/layout_inference/cases/elementwise_copy.py
+@@ -0,0 +1,42 @@
++"""Global -> fragment -> global roundtrip: the baseline sanity case.
++
++Both directions of the roundtrip want the same thing — the fragment's
++last logical axis split into (vector run per thread, coalesced lanes) —
++so both cost models must land on the same coalesced, vectorized layout.
++This case anchors the invariant that turning the io-aware model ON does
++not perturb layouts the register-count model already gets right, and it
++is the primary equal-score anchor for any future fast-path/slow-path
++split inside the cost model.
++"""
++
++import tilelang.language as T
++
++
++def _roundtrip(M, N, dtype, threads):
++    @T.prim_func
++    def main(A: T.Tensor((M, N), dtype), B: T.Tensor((M, N), dtype)):
++        with T.Kernel(1, threads=threads):
++            frag = T.alloc_fragment((M, N), dtype)
++            T.copy(A, frag)
++            T.copy(frag, B)
++
++    return main
++
++
++VARIANTS = {
++    "fp16_128x128_t128": lambda: _roundtrip(128, 128, T.float16, 128),
++    "fp32_64x256_t256": lambda: _roundtrip(64, 256, T.float32, 256),
++}
++
++
++def check(variant, model, result):
++    frag = result["buffers"]["frag"]
++    assert frag["replicate"] == 1, f"roundtrip copy needs no replication, got: {frag}"
++
++
++# Widest per-buffer vector access the lowered kernel must exhibit under the
++# default (io-aware) config — the width the winning layout was scored at.
++VECTOR_ANCHOR = {
++    "fp16_128x128_t128": {"A": 8, "B": 8},
++    "fp32_64x256_t256": {"A": 4, "B": 4},
++}
+diff --git a/maint/layout_inference/cases/fp8_copy.py b/maint/layout_inference/cases/fp8_copy.py
+new file mode 100644
+index 0000000000..3e51eabf91
+--- /dev/null
++++ b/maint/layout_inference/cases/fp8_copy.py
+@@ -0,0 +1,38 @@
++"""fp8 (1-byte dtype) roundtrip: the widest vectorization the model knows.
++
++With 1-byte elements the 128-bit lane cap allows 16-element vectors, the
++widest candidate the shared width policy admits. Anchors that both models
++keep the fragment unreplicated and that the io-aware model's width
++handling doesn't regress at the extreme end of the dtype range.
++"""
++
++import tilelang.language as T
++
++
++def _roundtrip(M, N, threads):
++    @T.prim_func
++    def main(A: T.Tensor((M, N), T.float8_e4m3), B: T.Tensor((M, N), T.float8_e4m3)):
++        with T.Kernel(1, threads=threads):
++            frag = T.alloc_fragment((M, N), T.float8_e4m3)
++            T.copy(A, frag)
++            T.copy(frag, B)
++
++    return main
++
++
++VARIANTS = {
++    "128x256_t128": lambda: _roundtrip(128, 256, 128),
++    "64x128_t64": lambda: _roundtrip(64, 128, 64),
++}
++
++
++def check(variant, model, result):
++    frag = result["buffers"]["frag"]
++    assert frag["replicate"] == 1, f"roundtrip copy needs no replication, got: {frag}"
++
++
++# 1-byte dtype reaches the 128-bit lane cap: 16 elements per access.
++VECTOR_ANCHOR = {
++    "128x256_t128": {"A": 16, "B": 16},
++    "64x128_t64": {"A": 16, "B": 16},
++}
+diff --git a/maint/layout_inference/cases/mixed_dtype_chain.py b/maint/layout_inference/cases/mixed_dtype_chain.py
+new file mode 100644
+index 0000000000..7aac2c4ea6
+--- /dev/null
++++ b/maint/layout_inference/cases/mixed_dtype_chain.py
+@@ -0,0 +1,43 @@
++"""fp16 load -> fp32 compute -> fp32 store chain.
++
++One connected component with two fragments of different element widths.
++The free-mode search must keep the pair consistent (same logical point on
++the same thread) while the copy at each end wants vectorization sized by
++its own dtype (8 x fp16 = 4 x fp32 = 16B).  Anchors that the chain stays
++coalesced end-to-end and that neither fragment picks up replication.
++"""
++
++import tilelang.language as T
++
++
++def _chain(M, N, threads):
++    @T.prim_func
++    def main(A: T.Tensor((M, N), T.float16), B: T.Tensor((M, N), T.float32)):
++        with T.Kernel(1, threads=threads):
++            x16 = T.alloc_fragment((M, N), T.float16)
++            x32 = T.alloc_fragment((M, N), T.float32)
++            T.copy(A, x16)
++            for i, j in T.Parallel(M, N):
++                x32[i, j] = x16[i, j].astype(T.float32) * 2.0
++            T.copy(x32, B)
++
++    return main
++
++
++VARIANTS = {
++    "128x128_t128": lambda: _chain(128, 128, 128),
++    "64x512_t256": lambda: _chain(64, 512, 256),
++}
++
++
++def check(variant, model, result):
++    for name in ("x16", "x32"):
++        frag = result["buffers"][name]
++        assert frag["replicate"] == 1, f"{name} needs no replication in a pure elementwise chain, got: {frag}"
++
++
++# The io-aware pick splits 4-wide (16B for fp32, 8B for fp16) on both ends.
++VECTOR_ANCHOR = {
++    "128x128_t128": {"A": 4, "B": 4},
++    "64x512_t256": {"A": 4, "B": 4},
++}
+diff --git a/maint/layout_inference/cases/offset_region_copy.py b/maint/layout_inference/cases/offset_region_copy.py
+new file mode 100644
+index 0000000000..521a568dcb
+--- /dev/null
++++ b/maint/layout_inference/cases/offset_region_copy.py
+@@ -0,0 +1,47 @@
++"""Tiled copies with block-index region offsets: the multi-block shape.
++
++Every real kernel copies ``A[by*BM, bx*BN]``-style sub-regions, so the
++global-side region mins carry block indices — the "foreign vars" the cost
++model's address evaluation treats as a uniform shift. Anchors that offset
++regions score and rank exactly like their zero-offset counterparts (the
++layout must match elementwise_copy's shape family, coalesced and
++unreplicated).
++"""
++
++import tilelang.language as T
++
++
++def _tiled(M, N, BM, BN, dtype, threads):
++    @T.prim_func
++    def main(A: T.Tensor((M, N), dtype), B: T.Tensor((M, N), dtype)):
++        with T.Kernel(T.ceildiv(N, BN), T.ceildiv(M, BM), threads=threads) as (bx, by):
++            frag = T.alloc_fragment((BM, BN), dtype)
++            T.copy(A[by * BM, bx * BN], frag)
++            T.copy(frag, B[by * BM, bx * BN])
++
++    return main
++
++
++VARIANTS = {
++    "fp16_tile64x64_t128": lambda: _tiled(256, 256, 64, 64, T.float16, 128),
++    "fp32_tile32x128_t128": lambda: _tiled(128, 512, 32, 128, T.float32, 128),
++}
++
++
++def check(variant, model, result):
++    frag = result["buffers"]["frag"]
++    assert frag["replicate"] == 1, f"tiled roundtrip copy needs no replication, got: {frag}"
++
++
++# Offset regions must vectorize exactly like their zero-offset kin.
++VECTOR_ANCHOR = {
++    "fp16_tile64x64_t128": {"A": 8, "B": 8},
++    "fp32_tile32x128_t128": {"A": 4, "B": 4},
++}
++
++# The one case whose copies address an ENCLOSING global buffer: the CuTe
++# experiment must use the real row-major strides, not the fragment shape.
++CUTE_STATEMENTS = {
++    "fp16_tile64x64_t128": {"frag": (256, 256)},
++    "fp32_tile32x128_t128": {"frag": (128, 512)},
++}
+diff --git a/maint/layout_inference/cases/reduce_broadcast.py b/maint/layout_inference/cases/reduce_broadcast.py
+new file mode 100644
+index 0000000000..0e7fac7d9b
+--- /dev/null
++++ b/maint/layout_inference/cases/reduce_broadcast.py
+@@ -0,0 +1,45 @@
++"""Row reduction feeding a broadcast subtract: the softmax-shaped pattern.
++
++One component holding a copy-in, a T.reduce_max, a broadcast-consuming
++parallel loop, and a copy-out. The reduced fragment ``row_max`` has one
++element per row while every column lane needs it, so its replication is
++the interesting degree of freedom; the elementwise fragments must stay
++unreplicated. This is the most common real-kernel shape (softmax /
++layernorm epilogues) the free-mode search faces.
++"""
++
++import tilelang.language as T
++
++
++def _softmaxish(M, N, threads):
++    @T.prim_func
++    def main(A: T.Tensor((M, N), T.float32), B: T.Tensor((M, N), T.float32)):
++        with T.Kernel(1, threads=threads):
++            x = T.alloc_fragment((M, N), T.float32)
++            row_max = T.alloc_fragment((M,), T.float32)
++            y = T.alloc_fragment((M, N), T.float32)
++            T.copy(A, x)
++            T.reduce_max(x, row_max, dim=1)
++            for i, j in T.Parallel(M, N):
++                y[i, j] = x[i, j] - row_max[i]
++            T.copy(y, B)
++
++    return main
++
++
++VARIANTS = {
++    "64x128_t128": lambda: _softmaxish(64, 128, 128),
++    "128x256_t256": lambda: _softmaxish(128, 256, 256),
++}
++
++
++def check(variant, model, result):
++    for name in ("x", "y"):
++        frag = result["buffers"][name]
++        assert frag["replicate"] == 1, f"elementwise fragment {name} needs no replication, got: {frag}"
++
++
++VECTOR_ANCHOR = {
++    "64x128_t128": {"A": 4, "B": 4},
++    "128x256_t256": {"A": 4, "B": 4},
++}
+diff --git a/maint/layout_inference/cases/shared_staging.py b/maint/layout_inference/cases/shared_staging.py
+new file mode 100644
+index 0000000000..4963358559
+--- /dev/null
++++ b/maint/layout_inference/cases/shared_staging.py
+@@ -0,0 +1,41 @@
++"""Global -> shared -> fragment -> global staging chain.
++
++The shared buffer picks up a (possibly swizzled) layout and the
++shared->fragment copy is deliberately OUTSIDE the io model (only
++fragment<->global statements are charged), so the fragment's layout is
++decided by the final copy-out alone. Goldens document both the shared
++layout and the fragment pick; a model change that suddenly starts charging
++shared traffic would surface here first.
++"""
++
++import tilelang.language as T
++
++
++def _staged(M, N, dtype, threads):
++    @T.prim_func
++    def main(A: T.Tensor((M, N), dtype), B: T.Tensor((M, N), dtype)):
++        with T.Kernel(1, threads=threads):
++            smem = T.alloc_shared((M, N), dtype)
++            frag = T.alloc_fragment((M, N), dtype)
++            T.copy(A, smem)
++            T.copy(smem, frag)
++            T.copy(frag, B)
++
++    return main
++
++
++VARIANTS = {
++    "fp16_64x64_t128": lambda: _staged(64, 64, T.float16, 128),
++    "fp32_128x128_t128": lambda: _staged(128, 128, T.float32, 128),
++}
++
++
++def check(variant, model, result):
++    frag = result["buffers"]["frag"]
++    assert frag["replicate"] == 1, f"staged roundtrip needs no replication, got: {frag}"
++
++
++VECTOR_ANCHOR = {
++    "fp16_64x64_t128": {"A": 8, "B": 8},
++    "fp32_128x128_t128": {"A": 4, "B": 4},
++}
+diff --git a/maint/layout_inference/cases/transposed_store.py b/maint/layout_inference/cases/transposed_store.py
+new file mode 100644
+index 0000000000..0960eff18b
+--- /dev/null
++++ b/maint/layout_inference/cases/transposed_store.py
+@@ -0,0 +1,42 @@
++"""Coalesced load vs transposed store: the two sides pull apart.
++
++The copy ``A -> frag`` wants the fragment coalesced along j (A's last
++axis); the loop stores ``B[j, i]``, which is coalesced along i instead.
++No layout satisfies both, so this is where the two selection policies
++can legitimately disagree: register count cannot see the difference
++(every non-replicated candidate holds the same slot count), while the
++io-aware model weighs the actual transaction counts of both statements.
++
++There is no hand-written invariant — the goldens ARE the expectation,
++and a diff between the two models' goldens is the interesting signal.
++"""
++
++import tilelang.language as T
++
++
++def _transposed(M, N, dtype, threads):
++    @T.prim_func
++    def main(A: T.Tensor((M, N), dtype), B: T.Tensor((N, M), dtype)):
++        with T.Kernel(1, threads=threads):
++            frag = T.alloc_fragment((M, N), dtype)
++            T.copy(A, frag)
++            for i, j in T.Parallel(M, N):
++                B[j, i] = frag[i, j]
++
++    return main
++
++
++VARIANTS = {
++    "fp32_128x128_t128": lambda: _transposed(128, 128, T.float32, 128),
++    "fp16_64x256_t128": lambda: _transposed(64, 256, T.float16, 128),
++}
++
++
++# The trade-off the io-aware model made, visible in real codegen: the fp32
++# pick sacrifices the load (A scalar) for vectorized stores (B 4-wide); the
++# fp16 variant trades the opposite way (A 8-wide, B scalar). If either side
++# of the asymmetry drifts, the model's belief and the vectorizer diverged.
++VECTOR_ANCHOR = {
++    "fp32_128x128_t128": {"A": 1, "B": 4},
++    "fp16_64x256_t128": {"A": 8, "B": 1},
++}
+diff --git a/maint/layout_inference/common.py b/maint/layout_inference/common.py
+new file mode 100644
+index 0000000000..d2f03108a0
+--- /dev/null
++++ b/maint/layout_inference/common.py
+@@ -0,0 +1,159 @@
++"""Shared helpers for the layout-inference verification harness.
++
++Runs a PrimFunc through the exact pass prefix LayoutInference sees in the
++real pipeline (BindTarget -> MaterializeKernelLaunch -> LayoutInference)
++and extracts the search result from the IR annotations the pass leaves
++behind:
++
++  - SBlock annotation ``layout_map``:  Buffer -> Layout/Fragment
++  - For annotation ``parallel_loop_layout``: the loop nest's Fragment
++
++Layouts are snapshotted as STRUCTURED dicts (shapes, replicate extent,
++thread extent, forward maps as expression strings), not repr strings:
++golden diffs then point at the exact field that moved, and case checks
++assert on fields instead of substring-matching a print format.
++"""
++
++from __future__ import annotations
++
++import tilelang as tl
++import tilelang.language as T  # noqa: F401  (cases import via common)
++from tilelang import tvm
++from tilelang.backend.target import determine_target
++from tilelang.layout import Fragment
++from tvm.tirx.stmt_functor import post_order_visit
++
++# The two selection policies behind `tl.layout_cost_model`, by name.
++COST_MODELS = ("register-count", "io-aware")
++
++
++def _run_passes(prim_func, cost_model: str, target=None):
++    """The exact pass prefix LayoutInference sees in the real pipeline."""
++    if target is None:
++        target = tvm.target.Target(determine_target("auto"))
++    mod = tvm.IRModule({"main": prim_func})
++    with tvm.target.Target(target):
++        mod = tvm.tirx.transform.BindTarget(target)(mod)
++        mod = tl.transform.MaterializeKernelLaunch()(mod)
++        with tvm.transform.PassContext(config={"tl.layout_cost_model": cost_model}):
++            mod = tl.transform.LayoutInference()(mod)
++    return mod["main"]
++
++
++def run_layout_inference(prim_func, cost_model: str, target=None):
++    """Run LayoutInference on `prim_func` and return the inferred layouts.
++
++    Returns ``{"buffers": {name: layout_dict}, "loops": {key: layout_dict}}``
++    where a loop key names the parallel nest by its loop vars and extents,
++    e.g. ``"i,j[128x128]"``, and layout_dict is `layout_to_dict` output.
++    """
++    return extract_layouts(_run_passes(prim_func, cost_model, target))
++
++
++def run_layout_inference_objects(prim_func, cost_model: str, target=None):
++    """Like run_layout_inference, but returns the LIVE objects:
++    ``{"buffers": {name: (Buffer, Layout)}}`` — for consumers that need the
++    layout expressions themselves (e.g. the CuTe experiment), not the
++    structured snapshot."""
++    func = _run_passes(prim_func, cost_model, target)
++    buffers: dict[str, tuple] = {}
++
++    def visit(node):
++        if isinstance(node, tvm.tirx.SBlock) and "layout_map" in node.annotations:
++            for buf, layout in node.annotations["layout_map"].items():
++                buffers[buf.name] = (buf, layout)
++
++    post_order_visit(func.body, visit)
++    return {"buffers": buffers}
++
++
++def lower_and_extract_vector_widths(prim_func, target=None) -> dict[str, int]:
++    """Fully lower under the DEFAULT pass config and report, per global
++    buffer, the widest vectorized access (in lanes) the final device TIR
++    performs.
++
++    This is the ground truth that anchors the cost model's vector-width
++    beliefs: the model scores a layout assuming the vectorizer will emit a
++    given width, and this function reads back what the vectorizer actually
++    emitted for the layout that won.
++    """
++    if target is None:
++        target = tvm.target.Target(determine_target("auto"))
++    with tvm.target.Target(target):
++        artifact = tl.lower(prim_func, target=target, enable_device_compile=False)
++    widths: dict[str, int] = {}
++
++    def visit(node):
++        buf, lanes = None, 0
++        if isinstance(node, tvm.tirx.BufferLoad):
++            buf, lanes = node.buffer, node.dtype.lanes
++        elif isinstance(node, tvm.tirx.BufferStore):
++            buf, lanes = node.buffer, node.value.dtype.lanes
++        if buf is not None and buf.scope() == "global":
++            widths[buf.name] = max(widths.get(buf.name, 1), lanes)
++
++    for _, func in artifact.device_mod.functions.items():
++        post_order_visit(func.body, visit)
++    return widths
++
++
++def _shape_list(arr) -> list:
++    """Shape as ints where constant, strings where symbolic."""
++    out = []
++    for x in arr:
++        try:
++            out.append(int(x))
++        except (TypeError, ValueError):
++            out.append(str(x))
++    return out
++
++
++def layout_to_dict(layout) -> dict:
++    """Structured, field-comparable snapshot of a Layout or Fragment."""
++    info = {
++        "kind": type(layout).__name__,
++        "input_shape": _shape_list(layout.get_input_shape()),
++        "output_shape": _shape_list(layout.get_output_shape()),
++        "forward_index": [str(e) for e in layout.get_forward_index()],
++    }
++    if isinstance(layout, Fragment):
++        info["replicate"] = int(layout.replicate_size)
++        info["threads"] = int(layout.get_thread_size())
++        info["forward_thread"] = str(layout.forward_thread)
++        thread_range = layout.thread_range
++        if thread_range is not None:
++            info["thread_range"] = [int(thread_range.min), int(thread_range.extent)]
++    return info
++
++
++def _loop_key(for_node) -> str:
++    """Name a parallel nest by its loop vars and extents: ``i,j[128x128]``."""
++    names, extents = [], []
++    cur = for_node
++    while cur is not None and cur.kind == tvm.tirx.ForKind.PARALLEL:
++        names.append(cur.loop_var.name)
++        extents.append(str(cur.extent))
++        cur = cur.body if isinstance(cur.body, tvm.tirx.For) else None
++    return f"{','.join(names)}[{'x'.join(extents)}]"
++
++
++def extract_layouts(func) -> dict:
++    buffers: dict[str, dict] = {}
++    loops: dict[str, dict] = {}
++
++    def visit(node):
++        if isinstance(node, tvm.tirx.SBlock) and "layout_map" in node.annotations:
++            for buf, layout in node.annotations["layout_map"].items():
++                buffers[buf.name] = layout_to_dict(layout)
++        elif isinstance(node, tvm.tirx.For) and "parallel_loop_layout" in node.annotations:
++            key = _loop_key(node)
++            # Disambiguate identical nests (post-order visit is deterministic).
++            if key in loops:
++                suffix = 2
++                while f"{key}#{suffix}" in loops:
++                    suffix += 1
++                key = f"{key}#{suffix}"
++            loops[key] = layout_to_dict(node.annotations["parallel_loop_layout"])
++
++    post_order_visit(func.body, visit)
++    return {"buffers": buffers, "loops": loops}
+diff --git a/maint/layout_inference/cute_model.py b/maint/layout_inference/cute_model.py
+new file mode 100644
+index 0000000000..fd1b573119
+--- /dev/null
++++ b/maint/layout_inference/cute_model.py
+@@ -0,0 +1,179 @@
++"""Symbolic statement scoring on the CuTe layout algebra (experiment).
++
++The pipeline (validated by design against the exact oracle in oracle.py):
++
++1. PACK the fragment exactly as FragmentNode::InverseWithLevel does
++   (src/layout/layout.cc:1133-1141): replication becomes a trailing input
++   dim, and the outputs are ordered [thread, slot] so the multi-output
++   probe's row-major serialization yields ONE plain strided layout
++   computing `thread * slots + slot` — the enumerator's cell index.
++2. CONVERT via cute.Layout.from_tilelang (probe-then-prove; None on
++   swizzle/non-affine).
++3. INVERT via cute.right_inverse; bijectivity check by size (the partial
++   inverse of a non-injective candidate is smaller).
++4. COMPOSE with the global row-major byte-stride layout, then split into
++   (slot, thread) axes with with_shape.
++5. VECTOR WIDTH is read off the coalesced slot axis: the innermost mode
++   with stride == elem_bytes gives the contiguous run; alignment is
++   checked on the remaining mode strides. Pure mode arithmetic.
++6. SEGMENTS are counted by evaluating the ALGEBRA-DERIVED composed layout
++   once per issued vector lane at warp/step granularity, instead of once
++   per logical point and replica. Store gating projects the replica index
++   through the inverse. A fully closed-form segment count from mode
++   arithmetic remains a possible refinement; this bounded evaluation
++   already exercises conversion, inversion, and composition end to end.
++
++Every algebra call is wrapped: cute ops raise tvm InternalError on their
++ICHECKs, and conversion returns None — both map to Unconvertible(reason),
++the analog of the C++ model's conservative worst case.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++
++import tvm.error
++from tilelang import tvm
++from tilelang.layout import Layout as TLLayout
++from tilelang.layout import cute
++from tvm.tirx.stmt_functor import substitute
++
++from oracle import placeholder_vars
++
++
++@dataclass
++class CuteScore:
++    vector: int
++    issue: int
++    bw: int
++    segments: int
++    notes: list[str] = field(default_factory=list)  # human-readable derivation
++
++
++@dataclass
++class Unconvertible:
++    reason: str
++
++
++def _flat_modes(layout) -> list[tuple[int, int]]:
++    """Coalesced (extent, stride) pairs, innermost first."""
++    lay = cute.coalesce(layout)
++    shape = cute.flatten_to_tuple(lay.shape)
++    stride = cute.flatten_to_tuple(lay.stride)
++    return list(zip([int(s) for s in shape], [int(t) for t in stride]))
++
++
++def pack_fragment(frag) -> TLLayout:
++    """(coords..., rep) -> [thread, slot] as a plain multi-output Layout."""
++    shape = [int(x) for x in frag.get_input_shape()]
++    R = int(frag.replicate_size)
++    inputs, rep_var = placeholder_vars(frag)
++    thread_expr = frag.forward_thread
++    slot_expr = frag.get_forward_index()[0]
++
++    def forward(*coords):
++        vmap = {inputs[i]: coords[i] for i in range(len(shape))}
++        if rep_var is not None:
++            vmap[rep_var] = coords[len(shape)]
++        return [substitute(thread_expr, vmap), substitute(slot_expr, vmap)]
++
++    return TLLayout(shape + [R], forward)
++
++
++def score_statement_cute(
++    frag, global_shape, elem_bytes: int, is_store: bool, vector_bits: int = 128, warp_size: int = 32, segment_bytes: int = 128
++):
++    """Score one fragment<->global copy statement via the CuTe algebra.
++
++    Returns CuteScore or Unconvertible.
++    """
++    shape = [int(x) for x in frag.get_input_shape()]
++    if len(global_shape) != len(shape):
++        return Unconvertible("global rank mismatch")
++    R = int(frag.replicate_size)
++    S = int(frag.get_output_shape()[0])
++    T = int(frag.get_thread_size())
++    notes = []
++
++    try:
++        flat = cute.Layout.from_tilelang(pack_fragment(frag))
++    except tvm.error.InternalError as exc:
++        return Unconvertible(f"conversion crashed: {exc}")
++    if flat is None:
++        return Unconvertible("from_tilelang returned None (non-affine/swizzle)")
++    notes.append(f"F_flat = {flat}")
++
++    try:
++        inv = cute.right_inverse(flat)
++    except tvm.error.InternalError as exc:
++        return Unconvertible(f"right_inverse crashed: {exc}")
++    if int(cute.size(inv)) != int(cute.size(flat)):
++        return Unconvertible(f"non-bijective: size(inv)={cute.size(inv)} != {cute.size(flat)}")
++    notes.append(f"Finv = {inv}")
++
++    # Global row-major BYTE strides over (coords..., rep) with rep-stride 0.
++    gstrides = [0] * len(shape)
++    acc = elem_bytes
++    for d in range(len(shape) - 1, -1, -1):
++        gstrides[d] = acc
++        acc *= int(global_shape[d])
++    g_text = "(" + ",".join(str(s) for s in shape + [R]) + "):(" + ",".join(str(st) for st in gstrides + [0]) + ")"
++    try:
++        G = cute.Layout.parse(g_text)
++        A = cute.composition(G, inv)  # cell -> byte address
++        A2 = A.with_shape((S, T))  # (slot, thread) split
++    except tvm.error.InternalError as exc:
++        return Unconvertible(f"composition failed: {exc}")
++    notes.append(f"A2 = {A2}")
++
++    # --- Vector width from the slot axis, pure mode arithmetic ------------
++    slot_modes = _flat_modes(A2[0])
++    notes.append(f"slot modes = {slot_modes}")
++    run = 1
++    if slot_modes and slot_modes[0][1] == elem_bytes:
++        run = slot_modes[0][0]
++    max_vector = min(S, (vector_bits // 8) // max(1, elem_bytes))
++    vector = 1
++    cand = 32
++    while cand >= 2:
++        if (
++            cand <= max_vector
++            and S % cand == 0
++            and run % cand == 0
++            and all(st % (cand * elem_bytes) == 0 for e, st in slot_modes[1:] if st != 0)
++            and all(st % (cand * elem_bytes) == 0 for e, st in _flat_modes(A2[1]) if st != 0)
++        ):
++            vector = cand
++            break
++        cand //= 2
++    steps = S // vector
++    lane_bytes = vector_bits // 8
++    issue = steps * T * lane_bytes
++
++    # --- Segments: bounded evaluation of the derived layout ---------------
++    # Base byte address per (step, warp, lane): evaluate A at
++    # cell = thread * S + slot with slot = q*vector, thread = w*W + lane.
++    # rep gating: rep(cell) = flat logical index // prod(shape) since rep is
++    # the slowest packed input (column-major).
++    prod_shape = 1
++    for s in shape:
++        prod_shape *= s
++    num_warps = (T + warp_size - 1) // warp_size
++    segments = 0
++    span = vector * elem_bytes - 1
++    for q in range(steps):
++        for w in range(num_warps):
++            seg_ids = set()
++            for lane in range(min(warp_size, T - w * warp_size)):
++                t = w * warp_size + lane
++                cell = t * S + q * vector
++                if is_store and R > 1:
++                    rep = int(inv(cell)) // prod_shape
++                    if rep != 0:
++                        continue  # guarded replica: idle for stores
++                base = int(A(cell))
++                seg_ids.add(base // segment_bytes)
++                seg_ids.add((base + span) // segment_bytes)
++            segments += len(seg_ids)
++    bw = segments * segment_bytes
++    return CuteScore(vector=vector, issue=int(issue), bw=int(bw), segments=int(segments), notes=notes)
+diff --git a/maint/layout_inference/expected/broadcast_read.json b/maint/layout_inference/expected/broadcast_read.json
+new file mode 100644
+index 0000000000..1d9d208a8d
+--- /dev/null
++++ b/maint/layout_inference/expected/broadcast_read.json
+@@ -0,0 +1,186 @@
++{
++  "issue1729_2x2560_t256": {
++    "io-aware": {
++      "buffers": {
++        "s_frag": {
++          "forward_index": [
++            "_i"
++          ],
++          "forward_thread": "_rep",
++          "input_shape": [
++            2
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            2
++          ],
++          "replicate": 256,
++          "thread_range": [
++            0,
++            256
++          ],
++          "threads": 256
++        }
++      },
++      "loops": {
++        "i,j[2x2560]": {
++          "forward_index": [
++            "(_i * 640 + _j // 4) // 256 * 4 + _j % 4"
++          ],
++          "forward_thread": "(_i * 640 + _j // 4) % 256",
++          "input_shape": [
++            2,
++            2560
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            20
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            256
++          ],
++          "threads": 256
++        }
++      }
++    },
++    "register-count": {
++      "buffers": {
++        "s_frag": {
++          "forward_index": [
++            "0"
++          ],
++          "forward_thread": "_rep * 2 + _i",
++          "input_shape": [
++            2
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            1
++          ],
++          "replicate": 128,
++          "thread_range": [
++            0,
++            256
++          ],
++          "threads": 256
++        }
++      },
++      "loops": {
++        "i,j[2x2560]": {
++          "forward_index": [
++            "_j"
++          ],
++          "forward_thread": "_rep * 2 + _i",
++          "input_shape": [
++            2,
++            2560
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            2560
++          ],
++          "replicate": 128,
++          "thread_range": [
++            0,
++            256
++          ],
++          "threads": 256
++        }
++      }
++    }
++  },
++  "rows4_cols1024_t128": {
++    "io-aware": {
++      "buffers": {
++        "s_frag": {
++          "forward_index": [
++            "_i"
++          ],
++          "forward_thread": "_rep",
++          "input_shape": [
++            4
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            4
++          ],
++          "replicate": 128,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      },
++      "loops": {
++        "i,j[4x1024]": {
++          "forward_index": [
++            "_i * 8 + _j // 512 * 4 + _j % 4"
++          ],
++          "forward_thread": "_j % 512 // 4",
++          "input_shape": [
++            4,
++            1024
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            32
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      }
++    },
++    "register-count": {
++      "buffers": {
++        "s_frag": {
++          "forward_index": [
++            "0"
++          ],
++          "forward_thread": "_rep * 4 + _i",
++          "input_shape": [
++            4
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            1
++          ],
++          "replicate": 32,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      },
++      "loops": {
++        "i,j[4x1024]": {
++          "forward_index": [
++            "_j"
++          ],
++          "forward_thread": "_rep * 4 + _i",
++          "input_shape": [
++            4,
++            1024
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            1024
++          ],
++          "replicate": 32,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      }
++    }
++  }
++}
+diff --git a/maint/layout_inference/expected/elementwise_copy.json b/maint/layout_inference/expected/elementwise_copy.json
+new file mode 100644
+index 0000000000..271b1b3eab
+--- /dev/null
++++ b/maint/layout_inference/expected/elementwise_copy.json
+@@ -0,0 +1,106 @@
++{
++  "fp16_128x128_t128": {
++    "io-aware": {
++      "buffers": {
++        "frag": {
++          "forward_index": [
++            "_i // 8 * 8 + _j % 8"
++          ],
++          "forward_thread": "_i % 8 * 16 + _j // 8",
++          "input_shape": [
++            128,
++            128
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            128
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      },
++      "loops": {}
++    },
++    "register-count": {
++      "buffers": {
++        "frag": {
++          "forward_index": [
++            "_i // 8 * 8 + _j % 8"
++          ],
++          "forward_thread": "_i % 8 * 16 + _j // 8",
++          "input_shape": [
++            128,
++            128
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            128
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      },
++      "loops": {}
++    }
++  },
++  "fp32_64x256_t256": {
++    "io-aware": {
++      "buffers": {
++        "frag": {
++          "forward_index": [
++            "_i // 4 * 4 + _j % 4"
++          ],
++          "forward_thread": "_i % 4 * 64 + _j // 4",
++          "input_shape": [
++            64,
++            256
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            64
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            256
++          ],
++          "threads": 256
++        }
++      },
++      "loops": {}
++    },
++    "register-count": {
++      "buffers": {
++        "frag": {
++          "forward_index": [
++            "_i // 4 * 4 + _j % 4"
++          ],
++          "forward_thread": "_i % 4 * 64 + _j // 4",
++          "input_shape": [
++            64,
++            256
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            64
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            256
++          ],
++          "threads": 256
++        }
++      },
++      "loops": {}
++    }
++  }
++}
+diff --git a/maint/layout_inference/expected/fp8_copy.json b/maint/layout_inference/expected/fp8_copy.json
+new file mode 100644
+index 0000000000..cca41d90ce
+--- /dev/null
++++ b/maint/layout_inference/expected/fp8_copy.json
+@@ -0,0 +1,106 @@
++{
++  "128x256_t128": {
++    "io-aware": {
++      "buffers": {
++        "frag": {
++          "forward_index": [
++            "_i // 8 * 16 + _j % 16"
++          ],
++          "forward_thread": "_i % 8 * 16 + _j // 16",
++          "input_shape": [
++            128,
++            256
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            256
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      },
++      "loops": {}
++    },
++    "register-count": {
++      "buffers": {
++        "frag": {
++          "forward_index": [
++            "_i // 8 * 16 + _j % 16"
++          ],
++          "forward_thread": "_i % 8 * 16 + _j // 16",
++          "input_shape": [
++            128,
++            256
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            256
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      },
++      "loops": {}
++    }
++  },
++  "64x128_t64": {
++    "io-aware": {
++      "buffers": {
++        "frag": {
++          "forward_index": [
++            "_i // 8 * 16 + _j % 16"
++          ],
++          "forward_thread": "_i % 8 * 8 + _j // 16",
++          "input_shape": [
++            64,
++            128
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            128
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            64
++          ],
++          "threads": 64
++        }
++      },
++      "loops": {}
++    },
++    "register-count": {
++      "buffers": {
++        "frag": {
++          "forward_index": [
++            "_i // 8 * 16 + _j % 16"
++          ],
++          "forward_thread": "_i % 8 * 8 + _j // 16",
++          "input_shape": [
++            64,
++            128
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            128
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            64
++          ],
++          "threads": 64
++        }
++      },
++      "loops": {}
++    }
++  }
++}
+diff --git a/maint/layout_inference/expected/mixed_dtype_chain.json b/maint/layout_inference/expected/mixed_dtype_chain.json
+new file mode 100644
+index 0000000000..31398e14f7
+--- /dev/null
++++ b/maint/layout_inference/expected/mixed_dtype_chain.json
+@@ -0,0 +1,270 @@
++{
++  "128x128_t128": {
++    "io-aware": {
++      "buffers": {
++        "x16": {
++          "forward_index": [
++            "_i // 4 * 4 + _j % 4"
++          ],
++          "forward_thread": "_i % 4 * 32 + _j // 4",
++          "input_shape": [
++            128,
++            128
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            128
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        },
++        "x32": {
++          "forward_index": [
++            "_i // 4 * 4 + _j % 4"
++          ],
++          "forward_thread": "_i % 4 * 32 + _j // 4",
++          "input_shape": [
++            128,
++            128
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            128
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      },
++      "loops": {
++        "i,j[128x128]": {
++          "forward_index": [
++            "_i // 4 * 4 + _j % 4"
++          ],
++          "forward_thread": "_i % 4 * 32 + _j // 4",
++          "input_shape": [
++            128,
++            128
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            128
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      }
++    },
++    "register-count": {
++      "buffers": {
++        "x16": {
++          "forward_index": [
++            "_i // 8 * 8 + _j % 8"
++          ],
++          "forward_thread": "_i % 8 * 16 + _j // 8",
++          "input_shape": [
++            128,
++            128
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            128
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        },
++        "x32": {
++          "forward_index": [
++            "_i // 8 * 8 + _j % 8"
++          ],
++          "forward_thread": "_i % 8 * 16 + _j // 8",
++          "input_shape": [
++            128,
++            128
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            128
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      },
++      "loops": {
++        "i,j[128x128]": {
++          "forward_index": [
++            "_i // 8 * 8 + _j % 8"
++          ],
++          "forward_thread": "_i % 8 * 16 + _j // 8",
++          "input_shape": [
++            128,
++            128
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            128
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      }
++    }
++  },
++  "64x512_t256": {
++    "io-aware": {
++      "buffers": {
++        "x16": {
++          "forward_index": [
++            "_i // 2 * 4 + _j % 4"
++          ],
++          "forward_thread": "_i % 2 * 128 + _j // 4",
++          "input_shape": [
++            64,
++            512
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            128
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            256
++          ],
++          "threads": 256
++        },
++        "x32": {
++          "forward_index": [
++            "_i // 2 * 4 + _j % 4"
++          ],
++          "forward_thread": "_i % 2 * 128 + _j // 4",
++          "input_shape": [
++            64,
++            512
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            128
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            256
++          ],
++          "threads": 256
++        }
++      },
++      "loops": {
++        "i,j[64x512]": {
++          "forward_index": [
++            "_i // 2 * 4 + _j % 4"
++          ],
++          "forward_thread": "_i % 2 * 128 + _j // 4",
++          "input_shape": [
++            64,
++            512
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            128
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            256
++          ],
++          "threads": 256
++        }
++      }
++    },
++    "register-count": {
++      "buffers": {
++        "x16": {
++          "forward_index": [
++            "_i // 4 * 8 + _j % 8"
++          ],
++          "forward_thread": "_i % 4 * 64 + _j // 8",
++          "input_shape": [
++            64,
++            512
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            128
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            256
++          ],
++          "threads": 256
++        },
++        "x32": {
++          "forward_index": [
++            "_i // 4 * 8 + _j % 8"
++          ],
++          "forward_thread": "_i % 4 * 64 + _j // 8",
++          "input_shape": [
++            64,
++            512
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            128
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            256
++          ],
++          "threads": 256
++        }
++      },
++      "loops": {
++        "i,j[64x512]": {
++          "forward_index": [
++            "_i // 4 * 8 + _j % 8"
++          ],
++          "forward_thread": "_i % 4 * 64 + _j // 8",
++          "input_shape": [
++            64,
++            512
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            128
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            256
++          ],
++          "threads": 256
++        }
++      }
++    }
++  }
++}
+diff --git a/maint/layout_inference/expected/offset_region_copy.json b/maint/layout_inference/expected/offset_region_copy.json
+new file mode 100644
+index 0000000000..fc4f6cc763
+--- /dev/null
++++ b/maint/layout_inference/expected/offset_region_copy.json
+@@ -0,0 +1,106 @@
++{
++  "fp16_tile64x64_t128": {
++    "io-aware": {
++      "buffers": {
++        "frag": {
++          "forward_index": [
++            "_i // 16 * 8 + _j % 8"
++          ],
++          "forward_thread": "_i % 16 * 8 + _j // 8",
++          "input_shape": [
++            64,
++            64
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            32
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      },
++      "loops": {}
++    },
++    "register-count": {
++      "buffers": {
++        "frag": {
++          "forward_index": [
++            "_i // 16 * 8 + _j % 8"
++          ],
++          "forward_thread": "_i % 16 * 8 + _j // 8",
++          "input_shape": [
++            64,
++            64
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            32
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      },
++      "loops": {}
++    }
++  },
++  "fp32_tile32x128_t128": {
++    "io-aware": {
++      "buffers": {
++        "frag": {
++          "forward_index": [
++            "_i // 4 * 4 + _j % 4"
++          ],
++          "forward_thread": "_i % 4 * 32 + _j // 4",
++          "input_shape": [
++            32,
++            128
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            32
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      },
++      "loops": {}
++    },
++    "register-count": {
++      "buffers": {
++        "frag": {
++          "forward_index": [
++            "_i // 4 * 4 + _j % 4"
++          ],
++          "forward_thread": "_i % 4 * 32 + _j // 4",
++          "input_shape": [
++            32,
++            128
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            32
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      },
++      "loops": {}
++    }
++  }
++}
+diff --git a/maint/layout_inference/expected/reduce_broadcast.json b/maint/layout_inference/expected/reduce_broadcast.json
+new file mode 100644
+index 0000000000..7d09e85cf3
+--- /dev/null
++++ b/maint/layout_inference/expected/reduce_broadcast.json
+@@ -0,0 +1,346 @@
++{
++  "128x256_t256": {
++    "io-aware": {
++      "buffers": {
++        "row_max": {
++          "forward_index": [
++            "_i // 4"
++          ],
++          "forward_thread": "_i % 4 * 64 + _rep",
++          "input_shape": [
++            128
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            32
++          ],
++          "replicate": 64,
++          "thread_range": [
++            0,
++            256
++          ],
++          "threads": 256
++        },
++        "x": {
++          "forward_index": [
++            "_i // 4 * 4 + _j % 4"
++          ],
++          "forward_thread": "_i % 4 * 64 + _j // 4",
++          "input_shape": [
++            128,
++            256
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            128
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            256
++          ],
++          "threads": 256
++        },
++        "y": {
++          "forward_index": [
++            "_i // 4 * 4 + _j % 4"
++          ],
++          "forward_thread": "_i % 4 * 64 + _j // 4",
++          "input_shape": [
++            128,
++            256
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            128
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            256
++          ],
++          "threads": 256
++        }
++      },
++      "loops": {
++        "i,j[128x256]": {
++          "forward_index": [
++            "_i // 4 * 4 + _j % 4"
++          ],
++          "forward_thread": "_i % 4 * 64 + _j // 4",
++          "input_shape": [
++            128,
++            256
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            128
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            256
++          ],
++          "threads": 256
++        }
++      }
++    },
++    "register-count": {
++      "buffers": {
++        "row_max": {
++          "forward_index": [
++            "_i // 4"
++          ],
++          "forward_thread": "_i % 4 * 64 + _rep",
++          "input_shape": [
++            128
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            32
++          ],
++          "replicate": 64,
++          "thread_range": [
++            0,
++            256
++          ],
++          "threads": 256
++        },
++        "x": {
++          "forward_index": [
++            "_i // 4 * 4 + _j % 4"
++          ],
++          "forward_thread": "_i % 4 * 64 + _j // 4",
++          "input_shape": [
++            128,
++            256
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            128
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            256
++          ],
++          "threads": 256
++        },
++        "y": {
++          "forward_index": [
++            "_i // 4 * 4 + _j % 4"
++          ],
++          "forward_thread": "_i % 4 * 64 + _j // 4",
++          "input_shape": [
++            128,
++            256
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            128
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            256
++          ],
++          "threads": 256
++        }
++      },
++      "loops": {
++        "i,j[128x256]": {
++          "forward_index": [
++            "_i // 4 * 4 + _j % 4"
++          ],
++          "forward_thread": "_i % 4 * 64 + _j // 4",
++          "input_shape": [
++            128,
++            256
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            128
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            256
++          ],
++          "threads": 256
++        }
++      }
++    }
++  },
++  "64x128_t128": {
++    "io-aware": {
++      "buffers": {
++        "row_max": {
++          "forward_index": [
++            "_i // 4"
++          ],
++          "forward_thread": "_i % 4 * 32 + _rep",
++          "input_shape": [
++            64
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            16
++          ],
++          "replicate": 32,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        },
++        "x": {
++          "forward_index": [
++            "_i // 4 * 4 + _j % 4"
++          ],
++          "forward_thread": "_i % 4 * 32 + _j // 4",
++          "input_shape": [
++            64,
++            128
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            64
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        },
++        "y": {
++          "forward_index": [
++            "_i // 4 * 4 + _j % 4"
++          ],
++          "forward_thread": "_i % 4 * 32 + _j // 4",
++          "input_shape": [
++            64,
++            128
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            64
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      },
++      "loops": {
++        "i,j[64x128]": {
++          "forward_index": [
++            "_i // 4 * 4 + _j % 4"
++          ],
++          "forward_thread": "_i % 4 * 32 + _j // 4",
++          "input_shape": [
++            64,
++            128
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            64
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      }
++    },
++    "register-count": {
++      "buffers": {
++        "row_max": {
++          "forward_index": [
++            "_i // 4"
++          ],
++          "forward_thread": "_i % 4 * 32 + _rep",
++          "input_shape": [
++            64
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            16
++          ],
++          "replicate": 32,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        },
++        "x": {
++          "forward_index": [
++            "_i // 4 * 4 + _j % 4"
++          ],
++          "forward_thread": "_i % 4 * 32 + _j // 4",
++          "input_shape": [
++            64,
++            128
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            64
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        },
++        "y": {
++          "forward_index": [
++            "_i // 4 * 4 + _j % 4"
++          ],
++          "forward_thread": "_i % 4 * 32 + _j // 4",
++          "input_shape": [
++            64,
++            128
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            64
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      },
++      "loops": {
++        "i,j[64x128]": {
++          "forward_index": [
++            "_i // 4 * 4 + _j % 4"
++          ],
++          "forward_thread": "_i % 4 * 32 + _j // 4",
++          "input_shape": [
++            64,
++            128
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            64
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      }
++    }
++  }
++}
+diff --git a/maint/layout_inference/expected/shared_staging.json b/maint/layout_inference/expected/shared_staging.json
+new file mode 100644
+index 0000000000..e7c7d1d888
+--- /dev/null
++++ b/maint/layout_inference/expected/shared_staging.json
+@@ -0,0 +1,106 @@
++{
++  "fp16_64x64_t128": {
++    "io-aware": {
++      "buffers": {
++        "frag": {
++          "forward_index": [
++            "_i // 16 * 8 + _j % 8"
++          ],
++          "forward_thread": "_i % 16 * 8 + _j // 8",
++          "input_shape": [
++            64,
++            64
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            32
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      },
++      "loops": {}
++    },
++    "register-count": {
++      "buffers": {
++        "frag": {
++          "forward_index": [
++            "_i // 16 * 8 + _j % 8"
++          ],
++          "forward_thread": "_i % 16 * 8 + _j // 8",
++          "input_shape": [
++            64,
++            64
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            32
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      },
++      "loops": {}
++    }
++  },
++  "fp32_128x128_t128": {
++    "io-aware": {
++      "buffers": {
++        "frag": {
++          "forward_index": [
++            "_i // 4 * 4 + _j % 4"
++          ],
++          "forward_thread": "_i % 4 * 32 + _j // 4",
++          "input_shape": [
++            128,
++            128
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            128
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      },
++      "loops": {}
++    },
++    "register-count": {
++      "buffers": {
++        "frag": {
++          "forward_index": [
++            "_i // 4 * 4 + _j % 4"
++          ],
++          "forward_thread": "_i % 4 * 32 + _j // 4",
++          "input_shape": [
++            128,
++            128
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            128
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      },
++      "loops": {}
++    }
++  }
++}
+diff --git a/maint/layout_inference/expected/transposed_store.json b/maint/layout_inference/expected/transposed_store.json
+new file mode 100644
+index 0000000000..60fb19fc1b
+--- /dev/null
++++ b/maint/layout_inference/expected/transposed_store.json
+@@ -0,0 +1,190 @@
++{
++  "fp16_64x256_t128": {
++    "io-aware": {
++      "buffers": {
++        "frag": {
++          "forward_index": [
++            "_i // 4 * 8 + _j % 8"
++          ],
++          "forward_thread": "_i % 4 * 32 + _j // 8",
++          "input_shape": [
++            64,
++            256
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            128
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      },
++      "loops": {
++        "i,j[64x256]": {
++          "forward_index": [
++            "_i // 4 * 8 + _j % 8"
++          ],
++          "forward_thread": "_i % 4 * 32 + _j // 8",
++          "input_shape": [
++            64,
++            256
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            128
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      }
++    },
++    "register-count": {
++      "buffers": {
++        "frag": {
++          "forward_index": [
++            "_i // 4 * 8 + _j % 8"
++          ],
++          "forward_thread": "_i % 4 * 32 + _j // 8",
++          "input_shape": [
++            64,
++            256
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            128
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      },
++      "loops": {
++        "i,j[64x256]": {
++          "forward_index": [
++            "_i // 4 * 8 + _j % 8"
++          ],
++          "forward_thread": "_i % 4 * 32 + _j // 8",
++          "input_shape": [
++            64,
++            256
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            128
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      }
++    }
++  },
++  "fp32_128x128_t128": {
++    "io-aware": {
++      "buffers": {
++        "frag": {
++          "forward_index": [
++            "_i"
++          ],
++          "forward_thread": "_j",
++          "input_shape": [
++            128,
++            128
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            128
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      },
++      "loops": {
++        "i,j[128x128]": {
++          "forward_index": [
++            "_i"
++          ],
++          "forward_thread": "_j",
++          "input_shape": [
++            128,
++            128
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            128
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      }
++    },
++    "register-count": {
++      "buffers": {
++        "frag": {
++          "forward_index": [
++            "_i // 4 * 4 + _j % 4"
++          ],
++          "forward_thread": "_i % 4 * 32 + _j // 4",
++          "input_shape": [
++            128,
++            128
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            128
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      },
++      "loops": {
++        "i,j[128x128]": {
++          "forward_index": [
++            "_i // 4 * 4 + _j % 4"
++          ],
++          "forward_thread": "_i % 4 * 32 + _j // 4",
++          "input_shape": [
++            128,
++            128
++          ],
++          "kind": "Fragment",
++          "output_shape": [
++            128
++          ],
++          "replicate": 1,
++          "thread_range": [
++            0,
++            128
++          ],
++          "threads": 128
++        }
++      }
++    }
++  }
++}
+diff --git a/maint/layout_inference/oracle.py b/maint/layout_inference/oracle.py
+new file mode 100644
+index 0000000000..a87aa16251
+--- /dev/null
++++ b/maint/layout_inference/oracle.py
+@@ -0,0 +1,163 @@
++"""Independent exact oracle for fragment<->global statement scoring.
++
++A vectorized (numpy) re-implementation of the retired C++ enumerator:
++evaluate the fragment's own forward expressions over the whole
++(logical, replica) grid in one pass, build the (thread, slot) -> address
++table, and measure vector width / issue / segment bytes with the exact
++same formulas (including base alignment and store replication gating).
++
++Independent of both the production C++ scorer and the CuTe conversion —
++this is the arbiter the symbolic reference path in cute_model.py is
++validated against.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++import numpy as np
++from tilelang import tvm
++
++
++@dataclass
++class OracleScore:
++    vector: int
++    issue: int
++    bw: int
++    segments: int
++
++
++class Unenumerable(Exception):
++    """The statement is outside the oracle's model (mirrors the C++
++    conservative fallback conditions)."""
++
++
++def eval_expr_grid(expr, env: dict) -> np.ndarray:
++    """Evaluate a quasi-affine PrimExpr over numpy coordinate grids.
++
++    `env` maps VarNode -> ndarray. Vars outside env evaluate to 0 (foreign
++    additive offsets, same convention as the C++ model). Supported node
++    family mirrors the model's; anything else raises Unenumerable.
++    """
++    tirx = tvm.tirx
++    if isinstance(expr, tirx.IntImm):
++        return np.int64(expr.value)
++    if isinstance(expr, tirx.Var):
++        for var, arr in env.items():
++            if expr.same_as(var):
++                return arr
++        return np.int64(0)  # foreign additive offset
++    if isinstance(expr, tirx.Cast):
++        return eval_expr_grid(expr.value, env)
++    a = lambda: eval_expr_grid(expr.a, env)  # noqa: E731
++    b = lambda: eval_expr_grid(expr.b, env)  # noqa: E731
++    if isinstance(expr, tirx.Add):
++        return a() + b()
++    if isinstance(expr, tirx.Sub):
++        return a() - b()
++    if isinstance(expr, tirx.Mul):
++        return a() * b()
++    if isinstance(expr, tirx.FloorDiv):
++        return np.floor_divide(a(), b())  # numpy floor semantics match TIR
++    if isinstance(expr, tirx.FloorMod):
++        return np.mod(a(), b())
++    if isinstance(expr, tirx.Min):
++        return np.minimum(a(), b())
++    if isinstance(expr, tirx.Max):
++        return np.maximum(a(), b())
++    raise Unenumerable(f"unsupported node {type(expr).__name__}: {expr}")
++
++
++def placeholder_vars(frag):
++    """(input placeholders, rep placeholder or None).
++
++    FragmentNode::GetForwardVars PREPENDS ReplicationPlaceholder when R > 1
++    (src/layout/layout.cc:1103-1112); the input placeholders are always the
++    trailing InputDim entries.
++    """
++    fwd_vars = list(frag.get_forward_vars())
++    ndim = len(frag.get_input_shape())
++    inputs = fwd_vars[-ndim:]
++    rep = fwd_vars[0] if len(fwd_vars) > ndim else None
++    return inputs, rep
++
++
++def score_statement_oracle(
++    frag, global_shape, elem_bytes: int, is_store: bool, vector_bits: int = 128, warp_size: int = 32, segment_bytes: int = 128
++) -> OracleScore:
++    """Score one fragment<->global copy statement by exact enumeration."""
++    shape = [int(x) for x in frag.get_input_shape()]
++    if len(global_shape) != len(shape):
++        raise Unenumerable("global rank mismatch")
++    R = int(frag.replicate_size)
++    S = int(frag.get_output_shape()[0])
++    T = int(frag.get_thread_size())
++    inputs, rep_var = placeholder_vars(frag)
++
++    grids = np.meshgrid(*[np.arange(s, dtype=np.int64) for s in shape], np.arange(R, dtype=np.int64), indexing="ij")
++    env = {inputs[d]: grids[d] for d in range(len(shape))}
++    if rep_var is not None:
++        env[rep_var] = grids[-1]
++
++    thread = np.broadcast_to(eval_expr_grid(frag.forward_thread, env), grids[0].shape)
++    slot = np.broadcast_to(eval_expr_grid(frag.get_forward_index()[0], env), grids[0].shape)
++    if thread.min() < 0 or thread.max() >= T or slot.min() < 0 or slot.max() >= S:
++        raise Unenumerable("thread/slot out of range")
++
++    # Row-major global element address over the logical coords (region
++    # offsets drop out: foreign vars are 0 by convention on both paths).
++    strides = np.ones(len(shape), dtype=np.int64)
++    for d in range(len(shape) - 2, -1, -1):
++        strides[d] = strides[d + 1] * global_shape[d + 1]
++    addr = np.zeros(grids[0].shape, dtype=np.int64)
++    for d in range(len(shape)):
++        addr = addr + grids[d] * strides[d]
++
++    # Fill the (thread, slot) table; bijectivity via bincount.
++    cell = (thread * S + slot).ravel()
++    counts = np.bincount(cell, minlength=T * S)
++    if counts.max() != 1 or cell.size != T * S:
++        raise Unenumerable("candidate is not a (logical, rep) <-> cell bijection")
++    table = np.empty(T * S, dtype=np.int64)
++    table[cell] = addr.ravel()
++    lead = np.zeros(T * S, dtype=bool)
++    lead[cell[(grids[-1] == 0).ravel()]] = True
++    table = table.reshape(T, S)
++    lead = lead.reshape(T, S)
++
++    # Vector width: widest power-of-two aligned contiguous run (the numeric
++    # mirror of IndicesCanVectorize, identical to the C++ model).
++    max_vector = min(S, (vector_bits // 8) // max(1, elem_bytes))
++    vector = 1
++    cand = 32
++    while cand >= 2:
++        if cand <= max_vector and S % cand == 0:
++            blocks = table.reshape(T, S // cand, cand)
++            contiguous = bool(np.all(blocks == blocks[:, :, :1] + np.arange(cand, dtype=np.int64)))
++            aligned = bool(np.all(blocks[:, :, 0] % cand == 0))
++            if contiguous and aligned:
++                vector = cand
++                break
++        cand //= 2
++    steps = S // vector
++
++    lane_bytes = vector_bits // 8
++    issue = steps * T * lane_bytes
++
++    # Segments: per (vector step, warp), distinct segment ids over active
++    # lanes' [base, base + vector*elem_bytes - 1] byte spans.
++    bases = table[:, ::vector] * elem_bytes  # (T, steps)
++    active = lead[:, ::vector] if is_store else np.ones_like(bases, dtype=bool)
++    num_warps = (T + warp_size - 1) // warp_size
++    segments = 0
++    for q in range(steps):
++        for w in range(num_warps):
++            lanes = slice(w * warp_size, min((w + 1) * warp_size, T))
++            base = bases[lanes, q][active[lanes, q]]
++            if base.size == 0:
++                continue
++            first = base // segment_bytes
++            last = (base + vector * elem_bytes - 1) // segment_bytes
++            segments += np.unique(np.concatenate([first, last])).size
++    bw = segments * segment_bytes
++    return OracleScore(vector=vector, issue=int(issue), bw=int(bw), segments=int(segments))
+diff --git a/maint/layout_inference/run.py b/maint/layout_inference/run.py
+new file mode 100755
+index 0000000000..393e65b754
+--- /dev/null
++++ b/maint/layout_inference/run.py
+@@ -0,0 +1,274 @@
++#!/usr/bin/env python
++"""Layout-inference verification driver.
++
++Each module under ``cases/`` constructs PrimFuncs whose free-mode layout
++search has a known-good answer.  This driver runs LayoutInference under
++both selection policies (``tl.layout_cost_model`` = "register-count" or
++"io-aware"), snapshots the inferred layouts, and compares them against
++the reviewed golden files under ``expected/``.
++
++Usage:
++    python run.py                 # verify every case against goldens
++    python run.py --case NAME     # verify one case (substring match)
++    python run.py --record        # (re)write goldens from current behavior
++    python run.py --show          # print inferred layouts as they run
++    python run.py --anchor        # lower fully and check that the widest
++                                  # per-buffer vector access in device TIR
++                                  # matches each case's VECTOR_ANCHOR (the
++                                  # width the cost model believed in);
++                                  # variants without an anchor print the
++                                  # observed widths for review
++    python run.py --cute          # compare the symbolic scorer with the
++                                  # independent exact-enumeration oracle
++
++Golden files are one JSON per case:
++    expected/<case>.json = {variant: {model: {"buffers": ..., "loops": ...}}}
++
++Record, review the diff by hand (the layouts ARE the expectation — never
++commit a recording you have not read), then commit.  A case module may
++additionally define ``check(variant, model, result)`` for invariants that
++must hold regardless of the exact golden (e.g. "this fragment must be
++fully replicated").
++"""
++
++from __future__ import annotations
++
++import argparse
++import importlib.util
++import json
++import sys
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++REPO_ROOT = HERE.parents[1]
++sys.path.insert(0, str(REPO_ROOT))
++sys.path.insert(0, str(HERE))
++
++from common import (  # noqa: E402
++    COST_MODELS,
++    lower_and_extract_vector_widths,
++    run_layout_inference,
++    run_layout_inference_objects,
++)
++
++CASES_DIR = HERE / "cases"
++EXPECTED_DIR = HERE / "expected"
++
++
++def load_case_modules(name_filter: str | None):
++    modules = []
++    for path in sorted(CASES_DIR.glob("*.py")):
++        if path.name.startswith("_"):
++            continue
++        if name_filter and name_filter not in path.stem:
++            continue
++        spec = importlib.util.spec_from_file_location(path.stem, path)
++        module = importlib.util.module_from_spec(spec)
++        spec.loader.exec_module(module)
++        modules.append((path.stem, module))
++    return modules
++
++
++def diff_result(expected, actual, prefix: str = "    ") -> list[str]:
++    """Recursive field-level diff: reports exactly which field moved."""
++    lines = []
++    for key in sorted(set(expected) | set(actual)):
++        exp, act = expected.get(key), actual.get(key)
++        if isinstance(exp, dict) and isinstance(act, dict):
++            lines.extend(diff_result(exp, act, prefix + f"{key}/"))
++        elif exp != act:
++            lines.append(f"{prefix}{key}: expected {exp!r}, got {act!r}")
++    return lines
++
++
++def format_layout(info: dict) -> str:
++    """One-line human view of a structured layout snapshot."""
++    parts = [f"{info.get('kind')} {info.get('input_shape')}->{info.get('output_shape')}"]
++    if "threads" in info:
++        parts.append(f"threads={info['threads']} rep={info['replicate']}")
++        parts.append(f"thread: {info['forward_thread']}")
++    parts.append(f"index: {', '.join(info.get('forward_index', []))}")
++    return "  |  ".join(parts)
++
++
++def run_anchor(modules) -> int:
++    """Anchor mode: lower each variant under the DEFAULT pass config and
++    check the widest per-buffer vector access in the device TIR against the
++    case's VECTOR_ANCHOR — the width the cost model's winning layout was
++    scored to sustain. A mismatch means the model believed a width the
++    vectorizer did not deliver (or vice versa)."""
++    failures = 0
++    for case_name, module in modules:
++        anchors = getattr(module, "VECTOR_ANCHOR", {})
++        for variant, build in module.VARIANTS.items():
++            tag = f"{case_name}/{variant}"
++            try:
++                widths = lower_and_extract_vector_widths(build())
++            except Exception as exc:  # noqa: BLE001 - report, keep going
++                print(f"ERROR {tag}: {type(exc).__name__}: {exc}")
++                failures += 1
++                continue
++            expected = anchors.get(variant)
++            if expected is None:
++                print(f"OBSERVED {tag}: {widths}  (no VECTOR_ANCHOR)")
++                continue
++            bad = {buf: (lanes, widths.get(buf)) for buf, lanes in expected.items() if widths.get(buf) != lanes}
++            if bad:
++                detail = ", ".join(f"{buf}: expected {want}, got {got}" for buf, (want, got) in bad.items())
++                print(f"FAIL {tag}: vector anchor: {detail}")
++                failures += 1
++            else:
++                print(f"PASS {tag}: {expected}")
++    return failures
++
++
++def run_cute(modules) -> int:
++    """CuTe-algebra parity check: for every golden fragment layout, score the
++    fragment<->global copy statement both symbolically (cute_model, via the
++    in-tree CuTe layout algebra) and by exact enumeration (oracle, numpy),
++    and diff (V, issue, bw, segments). This keeps the production C++ model's
++    symbolic formulation calibrated against an independent exact oracle."""
++    from tilelang import tvm  # noqa: PLC0415
++    from tilelang.layout import Fragment  # noqa: PLC0415
++
++    from cute_model import CuteScore, score_statement_cute  # noqa: PLC0415
++    from oracle import Unenumerable, score_statement_oracle  # noqa: PLC0415
++
++    failures = 0
++    total = converted = 0
++    for case_name, module in modules:
++        cute_specs = getattr(module, "CUTE_STATEMENTS", {})
++        for variant, build in module.VARIANTS.items():
++            for model in COST_MODELS:
++                objs = run_layout_inference_objects(build(), model)
++                for name, (buffer, layout) in sorted(objs["buffers"].items()):
++                    if not isinstance(layout, Fragment):
++                        continue
++                    dtype = tvm.DataType(buffer.dtype)
++                    elem_bytes = (dtype.bits * dtype.lanes) // 8
++                    if elem_bytes < 1:
++                        continue  # sub-byte: outside both paths, same as C++
++                    frag_shape = tuple(int(x) for x in layout.get_input_shape())
++                    global_shape = cute_specs.get(variant, {}).get(name, frag_shape)
++                    for is_store in (False, True):
++                        tag = f"{case_name}/{variant}/{model}/{name}/{'store' if is_store else 'load'}"
++                        total += 1
++                        got = score_statement_cute(layout, global_shape, elem_bytes, is_store)
++                        if not isinstance(got, CuteScore):
++                            print(f"UNCONVERTIBLE {tag}: {got.reason}")
++                            failures += 1
++                            continue
++                        converted += 1
++                        try:
++                            want = score_statement_oracle(layout, global_shape, elem_bytes, is_store)
++                        except Unenumerable as exc:
++                            print(f"ORACLE-SKIP {tag}: {exc}")
++                            failures += 1
++                            continue
++                        same = got.vector == want.vector and got.issue == want.issue and got.bw == want.bw and got.segments == want.segments
++                        if same:
++                            print(f"PASS {tag}: V={got.vector} issue={got.issue} bw={got.bw}")
++                        else:
++                            failures += 1
++                            print(f"FAIL {tag}:")
++                            print(f"    cute:   V={got.vector} issue={got.issue} bw={got.bw} segs={got.segments}")
++                            print(f"    oracle: V={want.vector} issue={want.issue} bw={want.bw} segs={want.segments}")
++                            for note in got.notes:
++                                print(f"    {note}")
++    print(f"\nconversion hit rate: {converted}/{total}")
++    return failures
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--case", help="substring filter on case name")
++    parser.add_argument("--record", action="store_true", help="write goldens instead of verifying")
++    parser.add_argument("--show", action="store_true", help="print inferred layouts")
++    parser.add_argument("--anchor", action="store_true", help="check lowered vector widths against VECTOR_ANCHOR")
++    parser.add_argument("--cute", action="store_true", help="diff the CuTe-algebra scorer against the exact oracle")
++    args = parser.parse_args()
++
++    modules = load_case_modules(args.case)
++    if not modules:
++        print(f"no case matches {args.case!r} under {CASES_DIR}")
++        return 2
++
++    if args.anchor:
++        failures = run_anchor(modules)
++        if failures:
++            print(f"\n{failures} failure(s)")
++            return 1
++        print("\nall anchor checks passed")
++        return 0
++
++    if args.cute:
++        failures = run_cute(modules)
++        if failures:
++            print(f"\n{failures} failure(s)")
++            return 1
++        print("\nall cute-vs-oracle checks passed")
++        return 0
++
++    failures = 0
++    for case_name, module in modules:
++        golden_path = EXPECTED_DIR / f"{case_name}.json"
++        golden = json.loads(golden_path.read_text()) if golden_path.exists() else {}
++        recording: dict = {}
++
++        for variant, build in module.VARIANTS.items():
++            for model in COST_MODELS:
++                tag = f"{case_name}/{variant}/{model}"
++                try:
++                    result = run_layout_inference(build(), model)
++                except Exception as exc:  # noqa: BLE001 - report, keep going
++                    print(f"ERROR {tag}: {type(exc).__name__}: {exc}")
++                    failures += 1
++                    continue
++
++                if args.show:
++                    print(f"---- {tag}")
++                    for section in ("buffers", "loops"):
++                        for key, layout in result[section].items():
++                            print(f"    {section}/{key}: {format_layout(layout)}")
++
++                # Structural invariants hold in both record and verify mode:
++                # a recording that violates them must never become a golden.
++                check = getattr(module, "check", None)
++                if check is not None:
++                    try:
++                        check(variant, model, result)
++                    except AssertionError as exc:
++                        print(f"FAIL {tag}: invariant check: {exc}")
++                        failures += 1
++                        continue
++
++                if args.record:
++                    recording.setdefault(variant, {})[model] = result
++                    print(f"RECORD {tag}")
++                    continue
++
++                expected = golden.get(variant, {}).get(model)
++                if expected is None:
++                    print(f"MISSING GOLDEN {tag} (run --record)")
++                    failures += 1
++                elif expected != result:
++                    print(f"FAIL {tag}: layout drift")
++                    print("\n".join(diff_result(expected, result)))
++                    failures += 1
++                else:
++                    print(f"PASS {tag}")
++
++        if args.record and recording:
++            EXPECTED_DIR.mkdir(exist_ok=True)
++            golden_path.write_text(json.dumps(recording, indent=2, sort_keys=True) + "\n")
++            print(f"wrote {golden_path}")
++
++    if failures:
++        print(f"\n{failures} failure(s)")
++        return 1
++    print("\nall checks passed")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/src/config.h b/src/config.h
+index 567f86bd1c..64f4e0987d 100644
+--- a/src/config.h
++++ b/src/config.h
+@@ -9,6 +9,8 @@
+ #include <tvm/ffi/optional.h>
+ #include <tvm/ir/transform.h>
+ 
++#include <string>
++
+ namespace tvm {
+ namespace tl {
+ namespace tl_config {
+@@ -25,6 +27,18 @@ inline bool ReducerPlanVerboseEnabled() {
+       .value_or(Bool(false));
+ }
+ 
++/*!
++ * \brief The cost model that ranks free-mode layout attempts. Valid
++ *  values: "io-aware" (default — bytes x vector-width/coalescing over
++ *  fragment<->global traffic, registers as tiebreak) and "register-count"
++ *  (the legacy total-register-slots ordering).
++ */
++inline std::string LayoutCostModelName() {
++  auto ctxt = tvm::transform::PassContext::Current();
++  return ctxt->GetConfig("tl.layout_cost_model", ffi::Optional<ffi::String>())
++      .value_or(ffi::String("io-aware"));
++}
++
+ /*!
+  * \brief Check if vectorize planner verbose output is enabled.
+  */
+diff --git a/src/op/builtin.cc b/src/op/builtin.cc
+index bbe33d6d19..65aebfb184 100644
+--- a/src/op/builtin.cc
++++ b/src/op/builtin.cc
+@@ -26,6 +26,7 @@ TVM_REGISTER_PASS_CONFIG_OPTION(kEnableFastMath, Bool);
+ TVM_REGISTER_PASS_CONFIG_OPTION(kEnableAsyncCopy, Bool);
+ TVM_REGISTER_PASS_CONFIG_OPTION(kReducerForceBaseline, Bool);
+ TVM_REGISTER_PASS_CONFIG_OPTION(kEnableReducerPlanVerbose, Bool);
++TVM_REGISTER_PASS_CONFIG_OPTION(kLayoutCostModel, ffi::String);
+ TVM_REGISTER_PASS_CONFIG_OPTION(kEnableVectorizePlannerVerbose, Bool);
+ TVM_REGISTER_PASS_CONFIG_OPTION(kStorageRewriteDetectInplace, Bool);
+ TVM_REGISTER_PASS_CONFIG_OPTION(kASTPrintEnable, Bool);
+diff --git a/src/op/builtin.h b/src/op/builtin.h
+index d0c85bb529..a8168eaae7 100644
+--- a/src/op/builtin.h
++++ b/src/op/builtin.h
+@@ -81,6 +81,12 @@ static constexpr const char *kReducerForceBaseline =
+     "tl.reducer_force_baseline";
+ static constexpr const char *kEnableReducerPlanVerbose =
+     "tl.enable_reducer_plan_verbose";
++// The cost model that ranks free-mode layout attempts, by name:
++// "io-aware" (default) scores estimated global-memory access cost —
++// vector width / coalescing of every fragment<->global copy, weighted by
++// bytes moved — with register count as the tiebreak; "register-count" is
++// the legacy total-register-slots-only ordering.
++static constexpr const char *kLayoutCostModel = "tl.layout_cost_model";
+ static constexpr const char *kEnableVectorizePlannerVerbose =
+     "tl.enable_vectorize_planner_verbose";
+ static constexpr const char *kDisableLoopUnswitching =
+diff --git a/src/op/parallel.cc b/src/op/parallel.cc
+index a440c4c268..b03e27647a 100644
+--- a/src/op/parallel.cc
++++ b/src/op/parallel.cc
+@@ -626,9 +626,45 @@ Fragment ParallelOpNode::CompleteBufferFragment(const Buffer &buffer) const {
+   PrimExpr thd_b = loop_layout_->ForwardThread(
+       ind_inv->Forward(fwd),
+       FloorDiv(ReplicationPlaceholder(), indice_rep_extent));
+-  return Fragment(buffer->shape, {}, thd_b, dest_buffer_rep_extent,
+-                  std::nullopt)
+-      ->CondenseReplicateVar();
++  Fragment completed =
++      Fragment(buffer->shape, {}, thd_b, dest_buffer_rep_extent, std::nullopt)
++          ->CondenseReplicateVar();
++  // Broadcast reads touched many times per thread produce an
++  // occurrence-indexed replication whose (logical, replica) -> physical map
++  // wraps around the thread extent and stops being injective; every
++  // consumer that partitions by such a fragment throws.
++  //
++  // Example (issue #1729): a (2,) fragment read as `src[i]` inside a
++  // coalesced `T.Parallel(2, 2560)` over 256 threads. The unused iterator
++  // j becomes the replicate axis (2560 occurrences per element, condensed
++  // to 640), yielding
++  //   Fragment((2,) -> (2,), replicate: 640,
++  //            thread: (_i * 640 + _rep) % 256, index: (_i,))
++  // 2 x 640 (logical, replica) points cannot fit 256 x 2 physical cells:
++  // replicas 0 / 256 / 512 of element 0 all land on (thread 0, slot 0).
++  //
++  // The thread OWNERSHIP the map describes is still sound -- the wrap
++  // covering the whole thread extent means every thread reads the element
++  // -- so for a buffer this loop only READS, fall back to the injective
++  // canonical form of exactly that ownership:
++  //   Fragment((2,) -> (2,), replicate: 256, thread: _rep, index: (_i,))
++  // i.e. full replication. (For written buffers replication changes
++  // execution multiplicity, so those keep the exact form and fail loudly
++  // downstream.)
++  if (!GetAccessInfo(buffer).is_write &&
++      !completed->DetectInjective()->errors.empty()) {
++    PrimExpr thread_extent = loop_layout_->ThreadExtent();
++    const int64_t *extent_ptr = as_const_int(thread_extent);
++    if (extent_ptr != nullptr) {
++      Fragment replicated = Fragment::FullyReplicated(
++          buffer->shape, static_cast<int>(*extent_ptr));
++      if (loop_layout_->ThreadRange().defined()) {
++        replicated = replicated->BindThreadRange(loop_layout_->ThreadRange());
++      }
++      return replicated;
++    }
++  }
++  return completed;
+ }
+ 
+ TVM_FFI_STATIC_INIT_BLOCK() { ParallelOpNode::RegisterReflection(); }
+diff --git a/src/transform/layout_inference/layout_cost_model.cc b/src/transform/layout_inference/layout_cost_model.cc
+new file mode 100644
+index 0000000000..9f76028f5e
+--- /dev/null
++++ b/src/transform/layout_inference/layout_cost_model.cc
+@@ -0,0 +1,1114 @@
++/*!
++ * \file layout_cost_model.cc
++ * \brief Statement-level bottleneck traffic model for free-mode layout
++ *        attempts (layout RFC, design B2). See layout_cost_model.h.
++ */
++
++#include "layout_cost_model.h"
++
++#include <tvm/runtime/logging.h>
++#include <tvm/tirx/expr.h>
++#include <tvm/tirx/op.h>
++#include <tvm/tirx/stmt_functor.h>
++
++#include <algorithm>
++#include <limits>
++#include <optional>
++#include <sstream>
++#include <string>
++#include <unordered_map>
++#include <unordered_set>
++#include <utility>
++#include <vector>
++
++#include "../../layout/cute_layout.h"
++#include "../../layout/layout.h"
++#include "../../layout/utils.h"
++#include "../../op/copy.h"
++#include "../../op/parallel.h"
++#include "../../op/utils.h"
++#include "../../span_utils.h"
++#include "../loop_vectorize.h"
++
++namespace tvm {
++namespace tl {
++
++using namespace tirx;
++
++namespace {
++
++using VarSet = std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual>;
++
++template <typename T> std::string FormatVector(const std::vector<T> &values) {
++  std::ostringstream os;
++  os << '[';
++  for (size_t i = 0; i < values.size(); ++i) {
++    if (i != 0) {
++      os << ", ";
++    }
++    os << values[i];
++  }
++  os << ']';
++  return os.str();
++}
++
++// ---------------------------------------------------------------------------
++// Statement-level bottleneck traffic model (layout RFC, design B2)
++//
++// The unit of account is one STATEMENT that touches global memory — a
++// fragment<->global tl.copy or a parallel loop with direct global accesses.
++// The statement is scored SYMBOLICALLY on the in-tree CuTe layout algebra
++// (src/layout/cute_layout.h). The forward maps are packed into one plain
++// multi-output layout whose row-major output serialization is exactly the
++// physical cell index `thread * slots + slot`; LayoutFromTileLang recovers
++// its (shape, stride) normal form (probe-then-prove, so the conversion is
++// self-certifying), RightInverse + Composition derive the per-cell address
++// layout, and the questions become mode arithmetic:
++//     vector = the innermost stride-1 run of the coalesced slot axis,
++//              alignment-checked against every other mode stride (the
++//              vectorizer's question, answered on the normal form)
++//     bw     = coalescing segments touched, counted exactly per (vector
++//              step, warp) by evaluating the DERIVED layout once per issued
++//              vector lane rather than once per logical point and replica.
++//              Intra-warp broadcast merges into one segment; store lanes
++//              holding a replica != 0 sleep behind the replication guard
++//              (the replica index is read back through the inverse) and
++//              count nothing.
++//     issue  = per-thread instruction depth x what a fully busy block
++//              would stream at max lane width over that many steps:
++//              steps x threads x lane_bytes. Idle lanes do not shorten
++//              the depth, so thread-collapse pathologies surface here
++//              (#1729).
++//     time(S) ~ max(bw, issue);      cost = sum over statements.
++//
++// Anything the algebra cannot express (non-affine indices, swizzle,
++// non-bijective candidates) is charged the conservative worst case — an
++// attempt must never profit from opacity. The mode arithmetic was audited
++// once against a full exact-enumeration oracle across the test corpus
++// (zero disagreements) before that oracle was removed; its Python mirror
++// survives in maint/layout_inference (`run.py --cute`).
++// Hardware geometry stays parameterized: lane width from the vectorizer's
++// shared MaxVectorLoadBits policy, warp size and coalescing-segment
++// granularity from the target (see BindMemoryGeometry).
++// ---------------------------------------------------------------------------
++
++/*! \brief One global-memory access stream of a statement. `addr` is the
++ *  flat element index into the global buffer, written in the probe's
++ *  point_vars — replica-independent by construction. */
++struct GlobalAccessProbe {
++  PrimExpr addr;
++  int64_t elem_bytes{4};
++  bool is_store{false};
++  int64_t repeat{1}; // enclosing serial trip count: the address pattern
++                     // replays (shifted) that many times per step
++};
++
++/*! \brief A statement prepared for scoring. Three states, told apart by
++ *  two fields (every consumer must honor this protocol):
++ *    accesses.empty()   — the statement touches no global memory: charge 0;
++ *    !measurable        — geometry outside the model: charge WorstCaseBytes
++ *                         (sized by `worst_elements`);
++ *    otherwise          — measure with ScoreStatement (which may still
++ *                         fail and fall back to WorstCaseBytes). */
++struct StatementProbe {
++  std::vector<GlobalAccessProbe> accesses;
++  bool measurable{false};
++  // Forward-walk geometry, valid when `measurable`:
++  std::vector<int64_t> extents; // logical iteration space, outermost first
++  std::vector<Var> point_vars;  // one per extent; addr/thread/slot
++                                // expressions are written in these
++  Var rep_var;                  // replica index var of thread_expr
++  int64_t rep{1};
++  int64_t threads{1};
++  int64_t slots{1};     // per-thread serial slots
++  PrimExpr thread_expr; // forward thread map: point_vars + rep_var
++  PrimExpr slot_expr;   // forward slot map: point_vars
++  // Widest vector access in bits the vectorizer will plan for this
++  // statement's memory mix (MaxVectorLoadBits — the shared policy).
++  int64_t vector_bits{128};
++  // Memory-system geometry of the target: how many threads issue one
++  // coalesced request together, and the byte granularity each request is
++  // charged at.
++  int64_t warp_size{32};
++  int64_t segment_bytes{128};
++  int64_t worst_elements{0};
++};
++
++struct StatementTraffic {
++  int64_t bw{0};
++  int64_t issue{0};
++  int64_t Time() const { return std::max(bw, issue); }
++};
++
++void LogProbe(int member_idx, const char *what, const StatementProbe &probe) {
++  const char *state = probe.accesses.empty()
++                          ? "no-global-access"
++                          : (probe.measurable ? "measurable" : "worst-case");
++  DLOG(INFO) << "[LayoutCost] member " << member_idx << ' ' << what
++             << " probe: state=" << state
++             << " accesses=" << probe.accesses.size()
++             << " extents=" << FormatVector(probe.extents)
++             << " worst_elements=" << probe.worst_elements
++             << " threads=" << probe.threads << " slots=" << probe.slots
++             << " replicas=" << probe.rep
++             << " vector_bits=" << probe.vector_bits
++             << " warp_size=" << probe.warp_size
++             << " segment_bytes=" << probe.segment_bytes;
++  if (probe.measurable) {
++    DLOG(INFO) << "[LayoutCost] member " << member_idx << ' ' << what
++               << " maps: thread=" << probe.thread_expr
++               << " slot=" << probe.slot_expr;
++  }
++  for (size_t i = 0; i < probe.accesses.size(); ++i) {
++    const GlobalAccessProbe &access = probe.accesses[i];
++    std::ostringstream os;
++    os << "[LayoutCost] member " << member_idx << ' ' << what << " access[" << i
++       << "]: kind=" << (access.is_store ? "store" : "load")
++       << " elem_bytes=" << access.elem_bytes << " repeat=" << access.repeat
++       << " addr=";
++    if (access.addr.defined()) {
++      os << access.addr;
++    } else {
++      os << "<unavailable>";
++    }
++    DLOG(INFO) << os.str();
++  }
++}
++
++/*! \brief The conservative charge for a statement outside the model:
++ *  every element its own full-segment transaction. An attempt must never
++ *  profit from opacity — evaluability depends on the layout under test. */
++int64_t WorstCaseBytes(const StatementProbe &probe) {
++  int64_t total = 0;
++  for (const auto &access : probe.accesses) {
++    total += probe.worst_elements * access.repeat * probe.segment_bytes;
++  }
++  return total;
++}
++
++bool TryMultiplyPositive(int64_t lhs, int64_t rhs, int64_t *product) {
++  if (lhs <= 0 || rhs <= 0 || lhs > std::numeric_limits<int64_t>::max() / rhs) {
++    return false;
++  }
++  *product = lhs * rhs;
++  return true;
++}
++
++/*! \brief Zero out vars outside the probe's own coordinate set: block
++ *  indices inside region offsets shift every address of the statement
++ *  equally and cancel out of both contiguity and segment geometry.
++ *  Non-int foreign vars are kept and fail the affine recovery, marking the
++ *  statement outside the model. */
++PrimExpr ZeroForeignVars(const PrimExpr &e, const VarSet &own) {
++  return Substitute(e, [&](const Var &var) -> ffi::Optional<PrimExpr> {
++    if (own.count(var) || (!var->dtype.is_int() && !var->dtype.is_uint())) {
++      return ffi::Optional<PrimExpr>();
++    }
++    return make_zero(var->dtype);
++  });
++}
++
++/*! \brief The probe's iteration space as IterVars: (point_vars..., rep) —
++ *  the canonical packing of FragmentNode::InverseWithLevel, replication as
++ *  a trailing ordinary dimension. */
++Array<IterVar> ProbeIterVars(const StatementProbe &probe) {
++  Array<IterVar> ivs;
++  for (size_t d = 0; d < probe.point_vars.size(); ++d) {
++    ivs.push_back(IterVar(Range(IntImm(DataType::Int(32), 0),
++                                IntImm(DataType::Int(32), probe.extents[d])),
++                          probe.point_vars[d], IterVarType::kDataPar));
++  }
++  ivs.push_back(IterVar(
++      Range(IntImm(DataType::Int(32), 0), IntImm(DataType::Int(32), probe.rep)),
++      probe.rep_var, IterVarType::kDataPar));
++  return ivs;
++}
++
++/*! \brief Recover expressions over the probe's iteration space as ONE
++ *  plain strided CuTe layout. Multi-output layouts are serialized
++ *  row-major by the recovery probe, so outputs [thread, slot] yield the
++ *  physical cell index `thread * slots + slot` directly. Nullopt when the
++ *  expressions are not affine-recoverable (the conversion proves its own
++ *  equivalence, so a wrong recovery cannot slip through). */
++Optional<cute::Layout> ProbeExprsToCute(const StatementProbe &probe,
++                                        Array<PrimExpr> outputs,
++                                        const VarSet &own) {
++  outputs =
++      outputs.Map([&](const PrimExpr &e) { return ZeroForeignVars(e, own); });
++  Layout packed(ProbeIterVars(probe), outputs);
++  return cute::LayoutFromTileLang(packed);
++}
++
++/*! \brief Evaluate flattened (extent, stride) modes at a linear coordinate
++ *  (column-major digit decomposition — the same function the layout
++ *  computes, minus the ObjectRef machinery). The scoring loops evaluate at
++ *  most one coordinate per physical cell; plain int64 arithmetic keeps that
++ *  walk at nanoseconds per point. */
++int64_t EvalModes(const std::vector<std::pair<int64_t, int64_t>> &modes,
++                  int64_t coord) {
++  int64_t value = 0;
++  for (const auto &[extent, stride] : modes) {
++    value += (coord % extent) * stride;
++    coord /= extent;
++  }
++  return value;
++}
++
++/*! \brief CuTe spelling of a layout, for diagnostics. */
++std::string CuteToString(const cute::Layout &layout) {
++  std::ostringstream os;
++  layout.Print(os);
++  return os.str();
++}
++
++/*! \brief Coalesced (extent, stride) mode pairs, innermost first; nullopt
++ *  when any leaf is not a constant (dynamic strides are outside the
++ *  model). */
++std::optional<std::vector<std::pair<int64_t, int64_t>>>
++FlatModes(const cute::Layout &layout) {
++  cute::Layout lay = cute::Coalesce(layout);
++  cute::IntTuple shape = cute::Flatten(lay->shape);
++  cute::IntTuple stride = cute::Flatten(lay->stride);
++  Array<cute::IntTuple> shapes = cute::Wrap(shape)->fields;
++  Array<cute::IntTuple> strides = cute::Wrap(stride)->fields;
++  if (shapes.size() != strides.size()) {
++    return std::nullopt;
++  }
++  std::vector<std::pair<int64_t, int64_t>> modes;
++  modes.reserve(shapes.size());
++  for (size_t i = 0; i < shapes.size(); ++i) {
++    if (!cute::IsConst(shapes[i]) || !cute::IsConst(strides[i])) {
++      return std::nullopt;
++    }
++    modes.emplace_back(cute::AsConst(shapes[i]), cute::AsConst(strides[i]));
++  }
++  return modes;
++}
++
++/*! \brief Score one prepared statement on the CuTe layout algebra.
++ *
++ *  Pack (coords, rep) -> [thread, slot] and recover it as the plain
++ *  strided cell layout; RightInverse (bijectivity checked by size) and
++ *  per-access Composition derive `cell -> element address` layouts. The
++ *  vector width is read off the coalesced (slot, thread) mode split; the
++ *  segment count evaluates the derived layouts at (step, warp, lane)
++ *  granularity only. Every failure — non-affine expressions, dynamic
++ *  modes, algebra ICHECKs (caught by the ScoreStatement wrapper) — lands
++ *  on nullopt and the caller charges the conservative worst case. */
++std::optional<StatementTraffic> ScoreStatementImpl(const StatementProbe &probe,
++                                                   int member_idx,
++                                                   const char *what) {
++  if (probe.accesses.empty()) {
++    return StatementTraffic{};
++  }
++  if (!probe.measurable || probe.threads <= 0 || probe.slots <= 0 ||
++      probe.rep <= 0 || probe.warp_size <= 0 || probe.segment_bytes <= 0 ||
++      !probe.rep_var.defined()) {
++    DLOG(INFO) << "[LayoutCost] member " << member_idx << ' ' << what
++               << " cannot be measured: invalid probe geometry";
++    return std::nullopt;
++  }
++
++  int64_t points = 1;
++  for (int64_t extent : probe.extents) {
++    if (!TryMultiplyPositive(points, extent, &points)) {
++      DLOG(INFO) << "[LayoutCost] member " << member_idx << ' ' << what
++                 << " cannot be measured: invalid or overflowing logical "
++                    "domain at extent="
++                 << extent;
++      return std::nullopt;
++    }
++  }
++  int64_t physical_cells = 0;
++  int64_t logical_size = 0;
++  // A fragment the lowering accepts is a bijection between
++  // (logical point, replica) and (thread, slot); anything else is
++  // outside the model. The size identity is the cheap necessary half;
++  // the RightInverse size check below is the sufficient half.
++  if (!TryMultiplyPositive(probe.threads, probe.slots, &physical_cells) ||
++      !TryMultiplyPositive(points, probe.rep, &logical_size) ||
++      logical_size != physical_cells) {
++    DLOG(INFO) << "[LayoutCost] member " << member_idx << ' ' << what
++               << " cannot be measured: forward map is not a bounded "
++                  "logical-to-(thread,slot) bijection";
++    return std::nullopt;
++  }
++
++  VarSet own;
++  for (const Var &v : probe.point_vars) {
++    own.insert(v);
++  }
++  own.insert(probe.rep_var);
++
++  // Recover the packed forward map as the plain strided cell layout.
++  Optional<cute::Layout> flat =
++      ProbeExprsToCute(probe, {probe.thread_expr, probe.slot_expr}, own);
++  if (!flat.defined()) {
++    DLOG(INFO) << "[LayoutCost] member " << member_idx << ' ' << what
++               << " cannot be measured: forward map is not affine-"
++                  "recoverable (thread="
++               << probe.thread_expr << " slot=" << probe.slot_expr << ")";
++    return std::nullopt;
++  }
++  cute::Layout inv = cute::RightInverse(flat.value());
++  if (cute::AsConst(cute::Size(inv)) != physical_cells) {
++    DLOG(INFO) << "[LayoutCost] member " << member_idx << ' ' << what
++               << " cannot be measured: candidate is not injective "
++                  "(right-inverse covers "
++               << cute::AsConst(cute::Size(inv)) << " of " << physical_cells
++               << " cells)";
++    return std::nullopt;
++  }
++  auto inv_modes = FlatModes(inv);
++  if (!inv_modes) {
++    return std::nullopt; // unreachable: a right inverse is const-strided
++  }
++
++  // Derive one `cell -> element address` layout per access and its
++  // (slot, thread) mode split.
++  cute::IntTuple st_shape = cute::IntTupleTuple(
++      {cute::IntTuple(probe.slots), cute::IntTuple(probe.threads)});
++  size_t naccess = probe.accesses.size();
++  std::vector<std::vector<std::pair<int64_t, int64_t>>> addr_modes;
++  std::vector<std::vector<std::pair<int64_t, int64_t>>> slot_modes;
++  std::vector<std::vector<std::pair<int64_t, int64_t>>> thread_modes;
++  addr_modes.reserve(naccess);
++  slot_modes.reserve(naccess);
++  thread_modes.reserve(naccess);
++  for (size_t a = 0; a < naccess; ++a) {
++    const auto &access = probe.accesses[a];
++    if (access.elem_bytes <= 0 ||
++        probe.segment_bytes % access.elem_bytes != 0) {
++      DLOG(INFO) << "[LayoutCost] member " << member_idx << ' ' << what
++                 << " cannot be measured: element size does not divide the "
++                    "segment granularity";
++      return std::nullopt;
++    }
++    Optional<cute::Layout> g = ProbeExprsToCute(probe, {access.addr}, own);
++    if (!g.defined()) {
++      DLOG(INFO) << "[LayoutCost] member " << member_idx << ' ' << what
++                 << " has a non-affine address expression; charged "
++                    "worst-case: "
++                 << access.addr;
++      return std::nullopt;
++    }
++    cute::Layout addr = cute::Composition(g.value(), inv);
++    cute::Layout split = addr.WithShape(st_shape);
++    auto amodes = FlatModes(addr);
++    auto smodes = FlatModes(split[0]);
++    auto tmodes = FlatModes(split[1]);
++    if (!amodes || !smodes || !tmodes) {
++      DLOG(INFO) << "[LayoutCost] member " << member_idx << ' ' << what
++                 << " cannot be measured: derived address modes are not "
++                    "constant";
++      return std::nullopt;
++    }
++    DLOG(INFO) << "[LayoutCost] member " << member_idx << ' ' << what
++               << " access[" << a
++               << "] address layout: " << CuteToString(split);
++    addr_modes.push_back(std::move(*amodes));
++    slot_modes.push_back(std::move(*smodes));
++    thread_modes.push_back(std::move(*tmodes));
++  }
++
++  // Widest power-of-two vector width every access sustains, read off the
++  // mode decomposition (the vectorizer's question on the normal form):
++  //   - width cap: the shared MaxVectorLoadBits policy per access dtype;
++  //   - extent divisibility: slots % cand == 0;
++  //   - contiguity: the innermost slot mode must be a stride-1 run whose
++  //     extent the width divides;
++  //   - base alignment: every other nonzero mode stride (higher slot
++  //     modes and all thread modes) divisible by the width.
++  int64_t vector_lane_bytes = probe.vector_bits / 8;
++  int64_t max_vector = probe.slots;
++  for (const auto &access : probe.accesses) {
++    max_vector = std::min<int64_t>(max_vector,
++                                   vector_lane_bytes /
++                                       std::max<int64_t>(1, access.elem_bytes));
++  }
++  int64_t vector = 1;
++  for (int64_t cand = 32; cand >= 2; cand /= 2) {
++    if (cand > max_vector || probe.slots % cand != 0) {
++      continue;
++    }
++    bool sustained = true;
++    for (size_t a = 0; a < naccess && sustained; ++a) {
++      const auto &smodes = slot_modes[a];
++      int64_t run =
++          (!smodes.empty() && smodes[0].second == 1) ? smodes[0].first : 1;
++      if (run % cand != 0) {
++        sustained = false;
++        break;
++      }
++      for (size_t m = 1; m < smodes.size() && sustained; ++m) {
++        if (smodes[m].second != 0 && smodes[m].second % cand != 0) {
++          sustained = false;
++        }
++      }
++      for (const auto &mode : thread_modes[a]) {
++        if (mode.second != 0 && mode.second % cand != 0) {
++          sustained = false;
++          break;
++        }
++      }
++    }
++    if (sustained) {
++      vector = cand;
++      break;
++    }
++  }
++  int64_t steps = probe.slots / vector;
++  DLOG(INFO) << "[LayoutCost] member " << member_idx << ' ' << what
++             << " vectorization: vector_lanes=" << vector
++             << " issue_bytes_per_thread_step=" << vector_lane_bytes
++             << " steps_per_thread=" << steps;
++
++  // Segments per (vector step, warp): evaluate the derived address layout
++  // at warp/step granularity — steps x warps x warp_size points, bounded
++  // by the machine shape. The replica index of a cell is read back through
++  // the inverse (rep is the slowest packed input, so it is the flat
++  // logical index divided by the logical point count).
++  StatementTraffic traffic;
++  int64_t num_warps = (probe.threads + probe.warp_size - 1) / probe.warp_size;
++  std::vector<int64_t> segments;
++  segments.reserve(2 * probe.warp_size);
++  for (size_t a = 0; a < naccess; ++a) {
++    const auto &access = probe.accesses[a];
++    int64_t issue_contribution =
++        steps * access.repeat * probe.threads * vector_lane_bytes;
++    traffic.issue += issue_contribution;
++
++    int64_t seg_elems = probe.segment_bytes / access.elem_bytes;
++    int64_t segments_total = 0;
++    for (int64_t q = 0; q < steps; ++q) {
++      for (int64_t w = 0; w < num_warps; ++w) {
++        segments.clear();
++        for (int64_t lane = 0; lane < probe.warp_size; ++lane) {
++          int64_t t = w * probe.warp_size + lane;
++          if (t >= probe.threads) {
++            break;
++          }
++          int64_t cell = t * probe.slots + q * vector;
++          if (access.is_store && probe.rep > 1 &&
++              EvalModes(*inv_modes, cell) / points != 0) {
++            continue; // guarded replica: this lane is idle for stores
++          }
++          int64_t first = EvalModes(addr_modes[a], cell);
++          int64_t last = first + vector - 1;
++          for (int64_t seg = first / seg_elems; seg <= last / seg_elems;
++               ++seg) {
++            if (std::find(segments.begin(), segments.end(), seg) ==
++                segments.end()) {
++              segments.push_back(seg);
++            }
++          }
++        }
++        segments_total += static_cast<int64_t>(segments.size());
++      }
++    }
++    int64_t bw_contribution =
++        access.repeat * segments_total * probe.segment_bytes;
++    traffic.bw += bw_contribution;
++    DLOG(INFO) << "[LayoutCost] member " << member_idx << ' ' << what
++               << " access[" << a
++               << "] contribution: segments=" << segments_total
++               << " bw=" << bw_contribution << " issue=" << issue_contribution;
++  }
++
++  return traffic;
++}
++
++/*! \brief Exception-safe wrapper: printing/substitution on pathological
++ *  candidate layouts can throw deep inside the layout stack; every such
++ *  case is simply outside the model. */
++std::optional<StatementTraffic>
++ScoreStatement(const StatementProbe &probe, int member_idx, const char *what) {
++  try {
++    return ScoreStatementImpl(probe, member_idx, what);
++  } catch (const std::exception &e) {
++    DLOG(INFO) << "[LayoutCost] member " << member_idx << ' ' << what
++               << " scoring threw; charged worst-case: " << e.what();
++    return std::nullopt;
++  }
++}
++
++/*! \brief Row-major element strides; nullopt when the shape is symbolic
++ *  or the buffer exceeds the int32 address algebra. */
++std::optional<std::vector<int64_t>> RowMajorStrides(const Buffer &buffer) {
++  size_t ndim = buffer->shape.size();
++  std::vector<int64_t> strides(ndim, 1);
++  for (int d = static_cast<int>(ndim) - 2; d >= 0; --d) {
++    const int64_t *extent = as_const_int(buffer->shape[d + 1]);
++    if (!extent) {
++      return std::nullopt;
++    }
++    strides[d] = strides[d + 1] * *extent;
++  }
++  const int64_t *outer = as_const_int(buffer->shape[0]);
++  if (!outer || strides[0] * *outer >= (int64_t(1) << 31)) {
++    return std::nullopt;
++  }
++  return strides;
++}
++
++/*! \brief Bind the target's memory-system geometry on a probe. The warp
++ *  size comes from the target (32 CUDA lanes, 64 ROCm wavefront lanes);
++ *  the segment granularity stays at 128B — the L1-line coalescing unit on
++ *  NVIDIA and a serviceable approximation elsewhere — until calibration
++ *  demands a per-target dispatch here. */
++void BindMemoryGeometry(StatementProbe *probe, const Target &target) {
++  probe->warp_size = target->GetAttr<Integer>("thread_warp_size", Integer(32))
++                         .value()
++                         .IntValue();
++  probe->segment_bytes = 128;
++}
++
++/*! \brief Fresh point vars for a probe's logical space. */
++std::vector<Var> MakePointVars(size_t ndim) {
++  std::vector<Var> vars;
++  vars.reserve(ndim);
++  for (size_t d = 0; d < ndim; ++d) {
++    vars.push_back(Var("_cost_x" + std::to_string(d), DataType::Int(32)));
++  }
++  return vars;
++}
++
++/*! \brief Install a fragment's forward maps on a probe: point_vars must
++ *  already be set. Returns false (probe untouched otherwise) when the
++ *  fragment's geometry is not constant-sized. */
++bool BindForwardMaps(StatementProbe *probe, const Fragment &layout) {
++  if (layout->OutputDim() != 1) {
++    return false;
++  }
++  // Keep the expressions alive: as_const_int returns a pointer into the
++  // node, and OutputShape()/ThreadExtent() build fresh temporaries.
++  PrimExpr slots_expr = layout->OutputShape()[0];
++  PrimExpr threads_expr = layout->ThreadExtent();
++  PrimExpr rep_expr = layout->ReplicateExtent();
++  const int64_t *slots_ptr = as_const_int(slots_expr);
++  const int64_t *threads_ptr = as_const_int(threads_expr);
++  const int64_t *rep_ptr = as_const_int(rep_expr);
++  if (!slots_ptr || !threads_ptr || !rep_ptr || *slots_ptr <= 0 ||
++      *threads_ptr <= 0 || *rep_ptr <= 0) {
++    return false;
++  }
++  Array<PrimExpr> points;
++  for (const Var &v : probe->point_vars) {
++    points.push_back(v);
++  }
++  probe->rep_var = Var("_cost_rep", DataType::Int(32));
++  probe->thread_expr = layout->ForwardThread(points, probe->rep_var);
++  probe->slot_expr = layout->Forward(points)[0];
++  probe->slots = *slots_ptr;
++  probe->threads = *threads_ptr;
++  probe->rep = *rep_ptr;
++  return true;
++}
++
++/*! \brief Prepare a fragment<->global tl.copy for scoring: the logical
++ *  walk is the fragment's full logical shape, the thread/slot maps are
++ *  the fragment layout's own forward expressions, and the single access
++ *  is the global side's affine address in the same logical point. */
++StatementProbe BuildCopyProbe(const Copy &copy, const Fragment &frag_layout,
++                              bool frag_is_src, const Target &target) {
++  const Buffer &global = frag_is_src ? copy->dst : copy->src;
++  const Array<Range> &frag_range =
++      frag_is_src ? copy->src_range : copy->dst_range;
++  const Array<Range> &global_range =
++      frag_is_src ? copy->dst_range : copy->src_range;
++
++  // Sized worst-case fallback for every shape outside the model: logical
++  // elements from the fragment-side range (symbolic extents count as 1 —
++  // worst geometry, optimistic count).
++  auto worst_only = [&](const char *reason) {
++    DLOG(INFO) << "[LayoutCost] copy probe falls back to worst-case: "
++               << reason;
++    StatementProbe probe;
++    BindMemoryGeometry(&probe, target);
++    probe.worst_elements = 1;
++    for (const Range &r : frag_range) {
++      const int64_t *extent = as_const_int(r->extent);
++      probe.worst_elements *= extent ? *extent : 1;
++    }
++    GlobalAccessProbe access;
++    access.is_store = frag_is_src;
++    probe.accesses.push_back(std::move(access));
++    return probe;
++  };
++
++  size_t ndim = frag_layout->InputShape().size();
++  if (frag_range.size() != ndim || global_range.size() != ndim) {
++    return worst_only("region rank differs from fragment layout rank");
++  }
++  // Whole-fragment copies only: the iteration space is the fragment's full
++  // logical shape.
++  std::vector<int64_t> extents;
++  int64_t logical_elements = 1;
++  for (size_t d = 0; d < ndim; ++d) {
++    if (!is_zero(frag_range[d]->min)) {
++      return worst_only("copy covers a nonzero fragment-side offset");
++    }
++    const int64_t *frag_extent = as_const_int(frag_range[d]->extent);
++    const int64_t *global_extent = as_const_int(global_range[d]->extent);
++    const int64_t *shape_extent = as_const_int(frag_layout->InputShape()[d]);
++    if (!frag_extent || !global_extent || !shape_extent ||
++        *frag_extent != *shape_extent || *global_extent != *shape_extent) {
++      return worst_only("copy is symbolic, partial, or shape-mismatched");
++    }
++    extents.push_back(*shape_extent);
++    logical_elements *= *shape_extent;
++  }
++
++  int64_t elem_bits = global->dtype.bits() * global->dtype.lanes();
++  if (elem_bits < 8) {
++    return worst_only("global element width is below one byte");
++  }
++  auto strides = RowMajorStrides(global);
++  if (!strides.has_value()) {
++    return worst_only("global buffer shape has unsupported address geometry");
++  }
++
++  StatementProbe probe;
++  probe.worst_elements = logical_elements;
++  probe.extents = std::move(extents);
++  probe.point_vars = MakePointVars(ndim);
++  if (!BindForwardMaps(&probe, frag_layout)) {
++    return worst_only("fragment forward maps have unsupported geometry");
++  }
++  // A fragment<->global copy touches global memory and no shared memory.
++  probe.vector_bits = MaxVectorLoadBits(target, /*global_only_access=*/true);
++  BindMemoryGeometry(&probe, target);
++
++  PrimExpr addr = make_zero(DataType::Int(32));
++  for (size_t d = 0; d < ndim; ++d) {
++    addr = addr + (global_range[d]->min + probe.point_vars[d]) *
++                      IntImm(DataType::Int(32), (*strides)[d]);
++  }
++  GlobalAccessProbe access;
++  access.addr = std::move(addr);
++  access.elem_bytes = elem_bits / 8;
++  access.is_store = frag_is_src;
++  probe.accesses.push_back(std::move(access));
++  probe.measurable = true;
++  return probe;
++}
++
++/*! \brief Collect the direct global-memory accesses of a parallel loop
++ *  body, with the trip count of any enclosing serial loops (the access
++ *  pattern replays, shifted, once per serial iteration). */
++class LoopGlobalAccessCollector : public StmtExprVisitor {
++public:
++  struct RawAccess {
++    Buffer buffer;
++    Array<PrimExpr> indices;
++    bool is_store;
++    int64_t repeat;
++    bool symbolic_repeat;
++  };
++  std::vector<RawAccess> accesses;
++  // Whether the loop body also touches shared memory: feeds the shared
++  // width-cap policy (256-bit loads are global-only).
++  bool touches_shared{false};
++
++  void Collect(const Stmt &stmt) { VisitStmt(stmt); }
++
++private:
++  void VisitStmt_(const ForNode *op) final {
++    if (op->kind == ForKind::kParallel) {
++      StmtExprVisitor::VisitStmt_(op);
++      return;
++    }
++    const int64_t *extent = as_const_int(op->extent);
++    serial_stack_.push_back(extent ? *extent : -1);
++    StmtExprVisitor::VisitStmt_(op);
++    serial_stack_.pop_back();
++  }
++  void VisitStmt_(const BufferStoreNode *op) final {
++    Record(op->buffer, op->indices, /*is_store=*/true);
++    StmtExprVisitor::VisitStmt_(op);
++  }
++  void VisitExpr_(const BufferLoadNode *op) final {
++    Record(op->buffer, op->indices, /*is_store=*/false);
++    StmtExprVisitor::VisitExpr_(op);
++  }
++  void Record(const Buffer &buffer, const Array<PrimExpr> &indices,
++              bool is_store) {
++    if (IsSharedBuffer(buffer)) {
++      touches_shared = true;
++    }
++    if (!IsGlobalBuffer(buffer)) {
++      return;
++    }
++    int64_t repeat = 1;
++    bool symbolic = false;
++    for (int64_t extent : serial_stack_) {
++      if (extent < 0) {
++        symbolic = true;
++      } else {
++        repeat *= extent;
++      }
++    }
++    accesses.push_back(RawAccess{buffer, indices, is_store, repeat, symbolic});
++  }
++  std::vector<int64_t> serial_stack_;
++};
++
++/*! \brief Prepare a parallel loop with direct global accesses for scoring
++ *  (issue #1729, extension E1): the logical walk is the loop nest itself,
++ *  the thread/slot maps are the loop layout's forward expressions bound
++ *  to the loop vars, and each access keeps its raw index expressions —
++ *  they are already written in the loop vars, so no substitution at all.
++ *  Returns: probe with empty accesses (charge zero) when the loop touches
++ *  no global memory; a full probe otherwise; nullopt when the loop cannot
++ *  even be sized (skip — nothing sensible to charge). */
++std::optional<StatementProbe> BuildLoopProbe(const ParallelOp &loop,
++                                             const Target &target) {
++  LoopGlobalAccessCollector collector;
++  collector.Collect(loop->GetRoot());
++  StatementProbe probe;
++  if (collector.accesses.empty()) {
++    DLOG(INFO) << "[LayoutCost] parallel-loop probe has no direct global "
++                  "accesses";
++    return probe; // pure fragment/shared loop: no global traffic to model
++  }
++
++  // Loop nest geometry, taken from the For nest so it exists even when
++  // the loop has no layout: an attempt must never profit from an unsolved
++  // (opaque) loop.
++  std::vector<int64_t> extents;
++  std::vector<Var> nest_vars;
++  int64_t domain = 1;
++  {
++    const ForNode *cur = loop->GetRoot().get();
++    while (cur != nullptr && cur->kind == ForKind::kParallel) {
++      const int64_t *value = as_const_int(cur->extent);
++      if (!value) {
++        DLOG(INFO) << "[LayoutCost] parallel-loop probe is unavailable: "
++                      "symbolic parallel extent";
++        return std::nullopt; // truly unsizeable: nothing sensible to charge
++      }
++      extents.push_back(*value);
++      nest_vars.push_back(cur->loop_var);
++      domain *= *value;
++      cur = cur->body.as<ForNode>();
++    }
++  }
++  probe.worst_elements = domain;
++
++  // Mark the probe un-scoreable but sized (worst-case) when any structural
++  // requirement fails. Symbolic serial trip counts fall back to repeat=1:
++  // worst geometry, optimistic count.
++  auto worst_only = [&](const char *reason) -> std::optional<StatementProbe> {
++    DLOG(INFO) << "[LayoutCost] parallel-loop probe falls back to worst-case: "
++               << reason;
++    StatementProbe worst;
++    BindMemoryGeometry(&worst, target);
++    worst.worst_elements = probe.worst_elements;
++    for (const auto &raw : collector.accesses) {
++      GlobalAccessProbe access;
++      access.elem_bytes = std::max<int64_t>(
++          1, raw.buffer->dtype.bits() * raw.buffer->dtype.lanes() / 8);
++      access.is_store = raw.is_store;
++      access.repeat = raw.symbolic_repeat ? 1 : raw.repeat;
++      worst.accesses.push_back(std::move(access));
++    }
++    return worst;
++  };
++
++  Fragment layout = loop->GetLoopLayout();
++  if (!layout.defined()) {
++    return worst_only("loop layout is undefined");
++  }
++  if (nest_vars.size() != layout->InputShape().size()) {
++    return worst_only("loop nest rank differs from loop layout rank");
++  }
++  probe.extents = std::move(extents);
++  probe.point_vars = std::move(nest_vars);
++  if (!BindForwardMaps(&probe, layout)) {
++    return worst_only("loop forward maps have unsupported geometry");
++  }
++  probe.vector_bits = MaxVectorLoadBits(
++      target, /*global_only_access=*/!collector.touches_shared);
++  BindMemoryGeometry(&probe, target);
++
++  for (const auto &raw : collector.accesses) {
++    if (raw.symbolic_repeat) {
++      return worst_only("global access has a symbolic serial repeat count");
++    }
++    int64_t elem_bits = raw.buffer->dtype.bits() * raw.buffer->dtype.lanes();
++    auto strides = RowMajorStrides(raw.buffer);
++    if (elem_bits < 8 || !strides.has_value() ||
++        raw.indices.size() != raw.buffer->shape.size()) {
++      return worst_only("global access has unsupported dtype, shape, or rank");
++    }
++    PrimExpr addr = make_zero(DataType::Int(32));
++    for (size_t d = 0; d < raw.indices.size(); ++d) {
++      addr = addr + raw.indices[d] * IntImm(DataType::Int(32), (*strides)[d]);
++    }
++    GlobalAccessProbe access;
++    access.addr = std::move(addr);
++    access.elem_bytes = elem_bits / 8;
++    access.is_store = raw.is_store;
++    access.repeat = raw.repeat;
++    probe.accesses.push_back(std::move(access));
++  }
++  probe.measurable = true;
++  return probe;
++}
++
++/*! \brief Total per-thread register slots across every fragment layout of
++ *  the attempt. Shared by every cost model: it is the legacy score and the
++ *  IO-aware model's tiebreak. */
++int64_t CountRegisterSlots(const LayoutMap &tmp_layout_map) {
++  DLOG(INFO) << "[LayoutCost] register count: layout_entries="
++             << tmp_layout_map.size();
++  int64_t regs = 0;
++  for (const auto &[buffer, layout] : tmp_layout_map) {
++    if (auto frag = layout.as<Fragment>()) {
++      int64_t frag_reg_num = 1;
++      for (auto i : frag.value()->OutputShape()) {
++        auto pci = as_const_int(i);
++        ICHECK(pci != nullptr) << "Can not use non-constant range to "
++                                  "iterate over a fragment/local "
++                                  "buffer. Non-constant shape expr is: "
++                               << i
++                               << ". This is possibly because you use "
++                                  "symbolic shape when "
++                                  "accessing a fragment/local buffer."
++                               << SpanHintSuffix(buffer->span);
++        frag_reg_num *= *pci;
++      }
++      regs += frag_reg_num;
++      DLOG(INFO) << "[LayoutCost] register count: buffer=" << buffer
++                 << " output_shape=" << frag.value()->OutputShape()
++                 << " contribution=" << frag_reg_num
++                 << " running_total=" << regs;
++    }
++  }
++  DLOG(INFO) << "[LayoutCost] register count total=" << regs;
++  return regs;
++}
++
++/*! \brief Legacy policy: total register slots, nothing else. `mem` stays 0
++ *  so the ordering is byte-identical to the historical register-count
++ *  selection. */
++class RegisterCountCostModel final : public LayoutCostModel {
++public:
++  AttemptCost Score(const std::vector<int> &members,
++                    const std::vector<TileOperator> &infer_list,
++                    const LayoutMap &tmp_layout_map) const final {
++    (void)infer_list;
++    DLOG(INFO) << "[LayoutCost] register-count score begin: members="
++               << FormatVector(members);
++    AttemptCost cost;
++    cost.regs = CountRegisterSlots(tmp_layout_map);
++    DLOG(INFO) << "[LayoutCost] register-count score end: mem=" << cost.mem
++               << " regs=" << cost.regs;
++    return cost;
++  }
++  const char *Name() const final { return "register-count"; }
++};
++
++/*! \brief IO-aware policy (layout RFC, design B2): every global-touching
++ *  statement is charged max(bandwidth bytes, issue-equivalent bytes) under
++ *  the attempt's tentative layouts; statements outside the model are
++ *  charged a conservative worst case (an attempt must never profit from
++ *  opacity). Registers remain the lexicographic tiebreak. */
++class IOAwareCostModel final : public LayoutCostModel {
++public:
++  explicit IOAwareCostModel(Target target) : target_(std::move(target)) {}
++
++  AttemptCost Score(const std::vector<int> &members,
++                    const std::vector<TileOperator> &infer_list,
++                    const LayoutMap &tmp_layout_map) const final {
++    DLOG(INFO) << "[LayoutCost] io-aware score begin: members="
++               << FormatVector(members)
++               << " layout_entries=" << tmp_layout_map.size();
++    AttemptCost cost;
++    cost.regs = CountRegisterSlots(tmp_layout_map);
++
++    for (int idx : members) {
++      const TileOperator &op = infer_list[idx];
++      DLOG(INFO) << "[LayoutCost] member " << idx
++                 << " begin: type=" << op->GetTypeKey();
++      if (const auto *copy = infer_list[idx].as<CopyNode>()) {
++        Copy copy_op = GetRef<Copy>(copy);
++        DLOG(INFO) << "[LayoutCost] member " << idx
++                   << " copy: src=" << copy->src
++                   << " (scope=" << copy->src.scope() << ") dst=" << copy->dst
++                   << " (scope=" << copy->dst.scope() << ')';
++        bool src_frag = IsFragmentBuffer(copy->src);
++        bool dst_frag = IsFragmentBuffer(copy->dst);
++        Buffer frag;
++        bool frag_is_src = false;
++        if (src_frag && IsGlobalBuffer(copy->dst)) {
++          frag = copy->src;
++          frag_is_src = true;
++        } else if (dst_frag && IsGlobalBuffer(copy->src)) {
++          frag = copy->dst;
++        } else {
++          DLOG(INFO) << "[LayoutCost] member " << idx
++                     << " copy ignored: not a fragment<->global transfer";
++          continue; // register moves / shared staging: out of the model
++        }
++        DLOG(INFO) << "[LayoutCost] member " << idx
++                   << " copy modeled as global "
++                   << (frag_is_src ? "store" : "load")
++                   << " through fragment=" << frag;
++        auto layout = tmp_layout_map.Get(frag);
++        if (!layout.has_value()) {
++          DLOG(INFO) << "[LayoutCost] member " << idx
++                     << " copy ignored: fragment has no tentative layout";
++          continue;
++        }
++        auto frag_layout = layout.value().as<Fragment>();
++        if (!frag_layout.has_value()) {
++          DLOG(INFO) << "[LayoutCost] member " << idx
++                     << " copy ignored: tentative layout is not a Fragment";
++          continue;
++        }
++        DLOG(INFO) << "[LayoutCost] member " << idx << " copy fragment layout: "
++                   << frag_layout.value()->DebugOutput();
++        int64_t statement_mem =
++            CachedStatementMem(idx, frag_layout.value(), [&]() {
++              std::optional<StatementProbe> probe;
++              try {
++                probe = BuildCopyProbe(copy_op, frag_layout.value(),
++                                       frag_is_src, target_);
++              } catch (const std::exception &e) {
++                DLOG(INFO) << "[LayoutCost] member " << idx
++                           << " copy probe construction threw: " << e.what();
++                probe = std::nullopt; // skipped below; builder-side fallbacks
++                                      // cover every non-throwing failure
++              }
++              return ChargeStatement(probe, idx, "copy");
++            });
++        cost.mem += statement_mem;
++        DLOG(INFO) << "[LayoutCost] member " << idx
++                   << " copy contribution=" << statement_mem
++                   << " running_mem=" << cost.mem;
++      } else if (const auto *loop = infer_list[idx].as<ParallelOpNode>()) {
++        ParallelOp loop_op = GetRef<ParallelOp>(loop);
++        Fragment loop_layout = loop_op->GetLoopLayout();
++        if (loop_layout.defined()) {
++          DLOG(INFO) << "[LayoutCost] member " << idx
++                     << " parallel-loop layout: " << loop_layout->DebugOutput();
++        } else {
++          DLOG(INFO) << "[LayoutCost] member " << idx
++                     << " parallel-loop layout is undefined";
++        }
++        auto compute = [&]() {
++          std::optional<StatementProbe> probe;
++          try {
++            probe = BuildLoopProbe(loop_op, target_);
++          } catch (const std::exception &e) {
++            DLOG(INFO) << "[LayoutCost] member " << idx
++                       << " parallel-loop probe construction threw: "
++                       << e.what();
++            probe = std::nullopt;
++          }
++          return ChargeStatement(probe, idx, "parallel-loop");
++        };
++        int64_t statement_mem =
++            loop_layout.defined()
++                ? CachedStatementMem(idx, loop_layout, compute)
++                : compute();
++        cost.mem += statement_mem;
++        DLOG(INFO) << "[LayoutCost] member " << idx
++                   << " parallel-loop contribution=" << statement_mem
++                   << " running_mem=" << cost.mem;
++      } else {
++        DLOG(INFO) << "[LayoutCost] member " << idx
++                   << " ignored: type=" << op->GetTypeKey()
++                   << " is outside the IO-aware statement model";
++      }
++    }
++    DLOG(INFO) << "[LayoutCost] io-aware score end: mem=" << cost.mem
++               << " regs=" << cost.regs;
++    return cost;
++  }
++
++  const char *Name() const final { return "io-aware"; }
++
++private:
++  /*! \brief Final charge of one prepared statement, honoring the probe's
++   *  three-state protocol (zero / worst-case / measured). */
++  static int64_t ChargeStatement(const std::optional<StatementProbe> &probe,
++                                 int member_idx, const char *what) {
++    if (!probe.has_value()) {
++      DLOG(INFO) << "[LayoutCost] member " << member_idx << ' ' << what
++                 << " probe unavailable; contribution=0";
++      return 0; // nothing sensible to charge
++    }
++    LogProbe(member_idx, what, *probe);
++    if (probe->accesses.empty()) {
++      DLOG(INFO) << "[LayoutCost] member " << member_idx << ' ' << what
++                 << " has no direct global traffic; contribution=0";
++      return 0;
++    }
++    std::optional<StatementTraffic> traffic;
++    if (probe->measurable) {
++      traffic = ScoreStatement(*probe, member_idx, what);
++    }
++    if (traffic.has_value()) {
++      DLOG(INFO) << "[LayoutCost] member " << member_idx << ' ' << what
++                 << " measured: bw=" << traffic->bw
++                 << " issue=" << traffic->issue
++                 << " contribution=max(bw,issue)=" << traffic->Time();
++      return traffic->Time();
++    }
++    int64_t worst_case = WorstCaseBytes(*probe);
++    DLOG(INFO) << "[LayoutCost] member " << member_idx << ' ' << what
++               << " outside the measurable model; worst-case contribution="
++               << worst_case;
++    return worst_case;
++  }
++
++  /*! \brief Memoize a statement's charge by (op index, layout): the charge
++   *  depends only on the op (fixed per index) and the layout under test,
++   *  and different attempt roots frequently converge to the same layout —
++   *  those attempts then score the statement for free. Structural layout
++   *  equality; entries per index stay tiny (one per distinct layout). */
++  template <typename F>
++  int64_t CachedStatementMem(int idx, const Fragment &layout,
++                             F &&compute) const {
++    auto &entries = stmt_cache_[idx];
++    for (const auto &[cached_layout, mem] : entries) {
++      if (cached_layout->IsEqual(layout.get())) {
++        DLOG(INFO) << "[LayoutCost] member " << idx
++                   << " statement cache hit: contribution=" << mem;
++        return mem;
++      }
++    }
++    DLOG(INFO) << "[LayoutCost] member " << idx
++               << " statement cache miss: cached_layouts=" << entries.size();
++    int64_t mem = compute();
++    entries.emplace_back(layout, mem);
++    DLOG(INFO) << "[LayoutCost] member " << idx
++               << " statement cache store: contribution=" << mem;
++    return mem;
++  }
++
++  Target target_;
++  mutable std::unordered_map<int, std::vector<std::pair<Fragment, int64_t>>>
++      stmt_cache_;
++};
++
++} // namespace
++
++std::unique_ptr<LayoutCostModel>
++LayoutCostModel::Create(const std::string &name, Target target) {
++  if (name == "io-aware") {
++    return std::make_unique<IOAwareCostModel>(std::move(target));
++  }
++  if (name == "register-count") {
++    return std::make_unique<RegisterCountCostModel>();
++  }
++  LOG(FATAL) << "Unknown layout cost model \"" << name
++             << "\" for pass config `tl.layout_cost_model`; valid values "
++                "are \"io-aware\" (default) and \"register-count\".";
++  return nullptr; // unreachable
++}
++
++} // namespace tl
++} // namespace tvm
+diff --git a/src/transform/layout_inference/layout_cost_model.h b/src/transform/layout_inference/layout_cost_model.h
+new file mode 100644
+index 0000000000..342f7ab03d
+--- /dev/null
++++ b/src/transform/layout_inference/layout_cost_model.h
+@@ -0,0 +1,80 @@
++/*!
++ * \file layout_cost_model.h
++ * \brief Cost models that rank free-mode layout attempts.
++ *
++ * The inference engine enumerates one attempt per candidate root inside a
++ * connected component and keeps the cheapest complete layout assignment.
++ * What "cheapest" means is a pluggable policy behind LayoutCostModel:
++ *
++ *  - RegisterCountCostModel (legacy): total fragment register slots,
++ *    nothing else. Available through
++ *    `tl.layout_cost_model="register-count"` for A/B comparisons.
++ *  - IOAwareCostModel (layout RFC, design B2): walks the component's
++ *    global-memory-touching statements (fragment<->global copies and
++ *    parallel loops with direct global accesses) and charges each one
++ *    max(bandwidth bytes, issue-equivalent bytes) under the attempt's
++ *    tentative layouts; registers remain the lexicographic tiebreak. This
++ *    is the default policy.
++ *
++ * Concrete models live in the .cc; callers go through Create().
++ */
++
++#ifndef TVM_TL_TRANSFORM_LAYOUT_INFERENCE_LAYOUT_COST_MODEL_H_
++#define TVM_TL_TRANSFORM_LAYOUT_INFERENCE_LAYOUT_COST_MODEL_H_
++
++#include <cstdint>
++#include <memory>
++#include <string>
++#include <vector>
++
++#include <tvm/target/target.h>
++
++#include "../../op/operator.h"
++
++namespace tvm {
++namespace tl {
++
++/*! \brief Score of one complete free-mode layout assignment. Compared
++ *  lexicographically: estimated memory cost first, total register count as
++ *  the tiebreak. Models that do not estimate memory leave `mem` at 0, so
++ *  their ordering degenerates to the register count. */
++struct AttemptCost {
++  int64_t mem{0};
++  int64_t regs{0};
++  bool BetterThan(const AttemptCost &other) const {
++    if (mem != other.mem) {
++      return mem < other.mem;
++    }
++    return regs < other.regs;
++  }
++};
++
++/*! \brief Policy interface: rank one attempt of a component.
++ *
++ *  `members` indexes the component's operators inside `infer_list` (which
++ *  carries the attempt's solved state, e.g. loop layouts), and
++ *  `tmp_layout_map` holds the attempt's tentative buffer layouts. */
++class LayoutCostModel {
++public:
++  virtual ~LayoutCostModel() = default;
++
++  virtual AttemptCost Score(const std::vector<int> &members,
++                            const std::vector<TileOperator> &infer_list,
++                            const LayoutMap &tmp_layout_map) const = 0;
++
++  /*! \brief Model name for diagnostics. */
++  virtual const char *Name() const = 0;
++
++  /*! \brief Instantiate the model selected by `tl.layout_cost_model`
++   *  by name ("io-aware" or "register-count" — each model's Name());
++   *  unknown names are a hard error listing the valid values. `target`
++   *  feeds the vectorizer's shared width-cap policy (MaxVectorLoadBits);
++   *  the legacy model ignores it. */
++  static std::unique_ptr<LayoutCostModel> Create(const std::string &name,
++                                                 Target target);
++};
++
++} // namespace tl
++} // namespace tvm
++
++#endif // TVM_TL_TRANSFORM_LAYOUT_INFERENCE_LAYOUT_COST_MODEL_H_
+diff --git a/src/transform/layout_inference.cc b/src/transform/layout_inference/layout_inference.cc
+similarity index 94%
+rename from src/transform/layout_inference.cc
+rename to src/transform/layout_inference/layout_inference.cc
+index a9050eb45e..a85928303f 100644
+--- a/src/transform/layout_inference.cc
++++ b/src/transform/layout_inference/layout_inference.cc
+@@ -5,6 +5,7 @@
+ 
+ #include "support/check.h"
+ #include <tvm/ir/cast.h>
++#include <tvm/ir/repr.h>
+ #include <tvm/runtime/logging.h>
+ #include <tvm/s_tir/utils.h>
+ #include <tvm/tirx/builtin.h>
+@@ -20,19 +21,22 @@
+ #include <optional>
+ #include <queue>
+ 
+-#include "../layout/layout.h"
+-#include "../layout/utils.h"
+-#include "../op/builtin.h"
+-#include "../op/parallel.h"
+-#include "../op/utils.h"
++#include "../../config.h"
++#include "../../layout/layout.h"
++#include "../../layout/utils.h"
++#include "../../op/builtin.h"
++#include "../../op/copy.h"
++#include "../../op/parallel.h"
++#include "../../op/utils.h"
++#include "../../span_utils.h"
++#include "../common/loop_fusion_utils.h"
++#include "../common/pipeline_utils.h"
++#include "../common/union_find.h"
+ #include "arith/ir_mutator_with_analyzer.h"
+ #include "arith/ir_visitor_with_analyzer.h"
+ #include "backend/common/target_utils.h"
+-#include "common/loop_fusion_utils.h"
+-#include "common/pipeline_utils.h"
+-#include "common/union_find.h"
++#include "layout_cost_model.h"
+ #include "parallel_loop_layout_validator.h"
+-#include "span_utils.h"
+ #include "tir/transforms/ir_utils.h"
+ 
+ namespace tvm {
+@@ -75,6 +79,10 @@ Optional<Buffer> FindLayoutAnchorBuffer(const Array<Buffer> &buffers,
+   return Optional<Buffer>();
+ }
+ 
++// ---------------------------------------------------------------------------
++// Free-mode attempt scoring (layout RFC, design B)
++// ---------------------------------------------------------------------------
++
+ } // namespace
+ 
+ using namespace tirx;
+@@ -1072,13 +1080,17 @@ class BufferUseDefCollector : public IRVisitorWithAnalyzer {
+     std::deque<int> q;
+     std::vector<bool> in_queue(infer_list_.size(), false);
+ 
++    std::unique_ptr<LayoutCostModel> cost_model =
++        LayoutCostModel::Create(tl_config::LayoutCostModelName(), target_);
++    DLOG(INFO) << "[InferInFreeMode] cost model: " << cost_model->Name();
+     for (auto &&[root, members] : components) {
+       DLOG(INFO) << "======================= processing component " << root
+                  << '\n';
+       decltype(infer_list_) best_infer_list;
+       LayoutMap best_layout_map;
+-      int64_t min_reg_num = INT64_MAX;
+-      int min_reg_num_infer_root = -1;
++      AttemptCost best_cost;
++      bool has_best = false;
++      int best_infer_root = -1;
+ 
+       // Try each member as the root of inference for this component
+       for (int attempt_infer_root : members) {
+@@ -1108,59 +1120,54 @@ class BufferUseDefCollector : public IRVisitorWithAnalyzer {
+           }
+         } catch (const LayoutConflictException &e) {
+           do_update = false;
+-          DLOG(INFO) << "attempt failed due to LayoutConflictException "
+-                     << e.what() << '\n';
++          DLOG(INFO) << "[InferInFreeMode] attempt root " << attempt_infer_root
++                     << " failed due to LayoutConflictException " << e.what();
+         } catch (const NormalizeIterException &e) {
+           do_update = false;
+-          DLOG(INFO) << "attempt failed due to NormalizeIterException "
+-                     << e.what() << '\n';
++          DLOG(INFO) << "[InferInFreeMode] attempt root " << attempt_infer_root
++                     << " failed due to NormalizeIterException " << e.what();
+         } catch (const LoopLayoutInjectiveException &e) {
+           do_update = false;
+-          DLOG(INFO) << "attempt failed due to LoopLayoutInjectiveException "
+-                     << e.what() << '\n';
++          DLOG(INFO) << "[InferInFreeMode] attempt root " << attempt_infer_root
++                     << " failed due to LoopLayoutInjectiveException "
++                     << e.what();
+         }
+ 
+         if (do_update) {
+-          // Compute the total register number for this layout
+-          int64_t reg_num = 0;
+-          for (const auto &[buffer, layout] : tmp_layout_map) {
+-            if (auto frag = layout.as<Fragment>()) {
+-              int64_t frag_reg_num = 1;
+-              for (auto i : frag.value()->OutputShape()) {
+-                auto pci = as_const_int(i);
+-                ICHECK(pci != nullptr)
+-                    << "Can not use non-constant range to "
+-                       "iterate over a fragment/local "
+-                       "buffer. Non-constant shape expr is: "
+-                    << i
+-                    << ". This is possibly because you use symbolic shape when "
+-                       "accessing a fragment/local buffer."
+-                    << SpanHintSuffix(buffer->span);
+-                frag_reg_num *= *pci;
+-              }
+-              reg_num += frag_reg_num;
+-            }
+-          }
+-          // Update the best plan if this one uses fewer registers
+-          if (reg_num < min_reg_num ||
+-              (reg_num == min_reg_num &&
+-               attempt_infer_root < min_reg_num_infer_root)) {
++          AttemptCost cost =
++              cost_model->Score(members, infer_list_, tmp_layout_map);
++          DLOG(INFO) << "[InferInFreeMode] attempt root " << attempt_infer_root
++                     << " cost model " << cost_model->Name()
++                     << " output: mem=" << cost.mem << " regs=" << cost.regs;
++          // Keep the cheapest attempt; ties resolve to the earliest root so
++          // the selection stays deterministic (and, with the cost model
++          // disabled, byte-identical to the legacy register ordering).
++          if (!has_best || cost.BetterThan(best_cost) ||
++              (!best_cost.BetterThan(cost) &&
++               attempt_infer_root < best_infer_root)) {
+             best_infer_list =
+                 BackupInferList(); // Use backup to avoid moving out infer_list_
+             best_layout_map = tmp_layout_map;
+-            min_reg_num = reg_num;
+-            min_reg_num_infer_root = attempt_infer_root;
++            best_cost = cost;
++            has_best = true;
++            best_infer_root = attempt_infer_root;
+           }
++        } else {
++          DLOG(INFO) << "[InferInFreeMode] attempt root " << attempt_infer_root
++                     << " cost model " << cost_model->Name()
++                     << " skipped because layout inference failed";
+         }
+         // Restore infer_list_ state for the next attempt
+         infer_list_ = std::move(back_infer_list);
+       }
+-      ICHECK(min_reg_num < INT64_MAX) << "no available layout found" << '\n';
++      ICHECK(has_best) << "no available layout found" << '\n';
+       // Apply the best plan for this component
+       infer_list_ = std::move(best_infer_list);
+       layout_map = best_layout_map;
+-      DLOG(INFO) << "[InferInFreeMode] Final selection is attempt_infer_root = "
+-                 << min_reg_num_infer_root << '\n';
++      DLOG(INFO) << "[InferInFreeMode] final selection: attempt root "
++                 << best_infer_root << " cost model " << cost_model->Name()
++                 << " output: mem=" << best_cost.mem
++                 << " regs=" << best_cost.regs;
+     }
+   }
+ };
+diff --git a/src/transform/parallel_loop_layout_validator.h b/src/transform/layout_inference/parallel_loop_layout_validator.h
+similarity index 99%
+rename from src/transform/parallel_loop_layout_validator.h
+rename to src/transform/layout_inference/parallel_loop_layout_validator.h
+index 14e1a59402..72ac86f17b 100644
+--- a/src/transform/parallel_loop_layout_validator.h
++++ b/src/transform/layout_inference/parallel_loop_layout_validator.h
+@@ -11,7 +11,7 @@
+ #include <tvm/runtime/logging.h>
+ #include <tvm/tirx/stmt_functor.h>
+ 
+-#include "../layout/layout.h"
++#include "../../layout/layout.h"
+ 
+ namespace tvm {
+ namespace tl {
+diff --git a/src/transform/loop_vectorize.cc b/src/transform/loop_vectorize.cc
+index 8434027915..bddec9cb6f 100644
+--- a/src/transform/loop_vectorize.cc
++++ b/src/transform/loop_vectorize.cc
+@@ -214,18 +214,12 @@ class VectorizePlanner : public arith::IRMutatorWithAnalyzer {
+       : arith::IRMutatorWithAnalyzer(analyzer), layout_map_(layout_map) {}
+ 
+   int Plan(const For &node) {
+-    bool disable_vectorize_256 = tl_config::Vectorize256Disabled();
+     bool verbose = tl_config::VectorizePlannerVerboseEnabled();
+ 
+-    if (TargetSupportVectorize256(Target::Current(false)) &&
+-        !disable_vectorize_256 &&
+-        VectorizeFindMemoryAccess::MaySupportVectorize256(node)) {
+-      vector_load_bits_max_ = initial_vector_size_ = loop_extent_vector_size_ =
+-          256;
+-    } else {
+-      vector_load_bits_max_ = initial_vector_size_ = loop_extent_vector_size_ =
+-          128;
+-    }
++    vector_load_bits_max_ = initial_vector_size_ = loop_extent_vector_size_ =
++        MaxVectorLoadBits(
++            Target::Current(false),
++            VectorizeFindMemoryAccess::MaySupportVectorize256(node));
+ 
+     // Check if For body contains SeqStmt (multiple statements).
+     // When there's SeqStmt, we use conservative strategy - treating local
+@@ -1110,6 +1104,14 @@ bool IsExprInvariantInVectorBoundary(const PrimExpr &expr, Var var,
+   return false;
+ }
+ 
++int MaxVectorLoadBits(const Target &target, bool global_only_access) {
++  if (TargetSupportVectorize256(target) && !tl_config::Vectorize256Disabled() &&
++      global_only_access) {
++    return 256;
++  }
++  return 128;
++}
++
+ bool IndicesCanVectorize(const PrimExpr &expr, Var var,
+                          const PrimExpr &iter_var_size,
+                          int target_vectorized_size,
+diff --git a/src/transform/loop_vectorize.h b/src/transform/loop_vectorize.h
+index bfa4bca0a9..9489ad6637 100644
+--- a/src/transform/loop_vectorize.h
++++ b/src/transform/loop_vectorize.h
+@@ -27,6 +27,7 @@
+ 
+ #include "../op/operator.h"
+ #include <tvm/arith/analyzer.h>
++#include <tvm/target/target.h>
+ #include <tvm/tirx/op.h>
+ 
+ namespace tvm {
+@@ -34,6 +35,14 @@ namespace tl {
+ 
+ using namespace tirx;
+ 
++// Widest vector memory access, in bits, that the vectorize planner will
++// consider for code whose memory-access mix is described by
++// `global_only_access` (touches global memory and no shared memory).
++// Single source of truth for the width-cap policy: the layout-inference
++// cost model calls this too, so a candidate layout is scored under exactly
++// the cap the vectorizer will later enforce on it.
++int MaxVectorLoadBits(const Target &target, bool global_only_access);
++
+ int GetVectorizeSize(const For &loop, const LayoutMap &layout_map = {});
+ 
+ int GetVectorizeSize(const For &loop, arith::Analyzer *analyzer,
+diff --git a/tilelang/transform/pass_config.py b/tilelang/transform/pass_config.py
+index f45493cc25..f094820c15 100644
+--- a/tilelang/transform/pass_config.py
++++ b/tilelang/transform/pass_config.py
+@@ -97,6 +97,13 @@ class PassConfigKey(str, Enum):
+     rejection reason) at INFO level during ReducerPlanAndMaterialize.
+     Default: False"""
+ 
++    TL_LAYOUT_COST_MODEL = "tl.layout_cost_model"
++    """The cost model that ranks free-mode layout attempts, by name:
++    "io-aware" scores estimated global-memory access cost (vector width /
++    warp coalescing of every fragment<->global copy, weighted by bytes
++    moved) with register count as the tiebreak; "register-count" is the
++    legacy total-register-slots-only ordering. Default: 'io-aware'"""
++
+     TL_REDUCER_FORCE_BASELINE = "tl.reducer_force_baseline"
+     """Force the canonical FullParticipant baseline for every reducer epoch,
+     disabling narrow physical plans (compact storage / sub-block collectives).

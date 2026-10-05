@@ -1,0 +1,3144 @@
+diff --git a/benchmarks/bench_fused_qk_rope_append.py b/benchmarks/bench_fused_qk_rope_append.py
+new file mode 100644
+index 00000000000..9a870df8fdf
+--- /dev/null
++++ b/benchmarks/bench_fused_qk_rope_append.py
+@@ -0,0 +1,185 @@
++"""Benchmark fused QK RMSNorm/RoPE/paged append against stable primitives."""
++
++from __future__ import annotations
++
++import argparse
++import statistics
++
++import torch
++
++import flashinfer
++import flashinfer.norm
++from flashinfer.testing import bench_gpu_time
++
++
++def _median_ms(fn, enable_cupti: bool) -> float:
++    return statistics.median(
++        bench_gpu_time(
++            fn,
++            enable_cupti=enable_cupti,
++            dry_run_iters=10,
++            repeat_iters=30,
++            cold_l2_cache=True,
++        )
++    )
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--batch-size", type=int, default=32)
++    parser.add_argument("--qo-len", type=int, default=1)
++    parser.add_argument("--context-len", type=int, default=2048)
++    parser.add_argument("--page-size", type=int, default=64)
++    parser.add_argument("--cuda-events", action="store_true")
++    args = parser.parse_args()
++
++    device = torch.device("cuda")
++    q_heads, kv_heads, head_dim = 8, 1, 128
++    rows = args.batch_size * args.qo_len
++    final_len = args.context_len + args.qo_len
++    pages_per_request = (final_len + args.page_size - 1) // args.page_size
++    num_pages = args.batch_size * pages_per_request
++    width = (q_heads + 2 * kv_heads) * head_dim
++
++    qkv = torch.randn(rows, width, device=device, dtype=torch.bfloat16)
++    q = qkv[:, : q_heads * head_dim].view(rows, q_heads, head_dim)
++    k = qkv[:, q_heads * head_dim : (q_heads + kv_heads) * head_dim].view(
++        rows, kv_heads, head_dim
++    )
++    v = qkv[:, (q_heads + kv_heads) * head_dim :].view(rows, kv_heads, head_dim)
++    # The imported kernel consumes FP32 norm weights, while the stable
++    # ``rmsnorm`` primitive requires weights to match its BF16 input. Use the
++    # same BF16-rounded values in both paths.
++    q_weight_bf16 = torch.rand(head_dim, device=device, dtype=torch.bfloat16) + 0.5
++    k_weight_bf16 = torch.rand(head_dim, device=device, dtype=torch.bfloat16) + 0.5
++    q_weight = q_weight_bf16.float()
++    k_weight = k_weight_bf16.float()
++    q_indptr = (
++        torch.arange(args.batch_size + 1, device=device, dtype=torch.int32)
++        * args.qo_len
++    )
++    seq_lens = torch.full(
++        (args.batch_size,), final_len, device=device, dtype=torch.int32
++    )
++    page_indices = torch.arange(num_pages, device=device, dtype=torch.int32).view(
++        args.batch_size, pages_per_request
++    )
++    kv_indptr = (
++        torch.arange(args.batch_size + 1, device=device, dtype=torch.int32)
++        * pages_per_request
++    )
++    kv_last_page_len = torch.full(
++        (args.batch_size,),
++        (final_len - 1) % args.page_size + 1,
++        device=device,
++        dtype=torch.int32,
++    )
++    batch_indices = (
++        torch.arange(args.batch_size, device=device)
++        .repeat_interleave(args.qo_len)
++        .int()
++    )
++    positions = (
++        torch.arange(args.qo_len, device=device)
++        .repeat(args.batch_size)
++        .add(args.context_len)
++        .int()
++    )
++    pos_ids = positions
++    inv_freq = 1.0 / (
++        1e4
++        ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim)
++    )
++    freqs = torch.outer(
++        torch.arange(final_len, device=device, dtype=torch.float32), inv_freq
++    )
++    cos_sin = torch.cat([freqs.cos(), freqs.sin()], dim=-1)
++
++    fused_cache = (
++        torch.empty(
++            num_pages,
++            args.page_size,
++            kv_heads,
++            head_dim,
++            device=device,
++            dtype=torch.bfloat16,
++        ),
++        torch.empty(
++            num_pages,
++            args.page_size,
++            kv_heads,
++            head_dim,
++            device=device,
++            dtype=torch.bfloat16,
++        ),
++    )
++    baseline_cache = tuple(torch.empty_like(x) for x in fused_cache)
++    fused_q = torch.empty_like(q)
++    norm_q = torch.empty_like(q)
++    norm_k = torch.empty_like(k)
++
++    def fused() -> None:
++        flashinfer.rope.fused_qk_rmsnorm_rope_append_paged_kv_cache(
++            qkv,
++            cos_sin,
++            seq_lens,
++            q_indptr,
++            page_indices,
++            fused_cache,
++            args.qo_len > 1,
++            q_weight,
++            k_weight,
++            2,
++            out_q=fused_q,
++        )
++
++    def baseline() -> None:
++        flashinfer.norm.rmsnorm(q, q_weight_bf16, out=norm_q)
++        flashinfer.norm.rmsnorm(k, k_weight_bf16, out=norm_k)
++        flashinfer.rope.apply_rope_pos_ids_inplace(norm_q, norm_k, pos_ids)
++        flashinfer.append_paged_kv_cache(
++            norm_k,
++            v,
++            batch_indices,
++            positions,
++            baseline_cache,
++            page_indices.flatten(),
++            kv_indptr,
++            kv_last_page_len,
++        )
++
++    fused()
++    baseline()
++    torch.cuda.synchronize()
++    torch.testing.assert_close(fused_q, norm_q, atol=2e-2, rtol=2e-2)
++    for batch, position in zip(batch_indices.tolist(), positions.tolist(), strict=True):
++        page = int(page_indices[batch, position // args.page_size])
++        offset = position % args.page_size
++        torch.testing.assert_close(
++            fused_cache[0][page, offset],
++            baseline_cache[0][page, offset],
++            atol=2e-2,
++            rtol=2e-2,
++        )
++        torch.testing.assert_close(
++            fused_cache[1][page, offset],
++            baseline_cache[1][page, offset],
++            atol=0,
++            rtol=0,
++        )
++
++    enable_cupti = not args.cuda_events
++    fused_ms = _median_ms(fused, enable_cupti)
++    baseline_ms = _median_ms(baseline, enable_cupti)
++    print(f"gpu={torch.cuda.get_device_name(device)}")
++    print(
++        f"shape=B{args.batch_size},Q{args.qo_len},Hq{q_heads},Hkv{kv_heads},"
++        f"D{head_dim},context={args.context_len},page={args.page_size}"
++    )
++    print(f"fused_ms={fused_ms:.6f}")
++    print(f"stable_primitive_pipeline_ms={baseline_ms:.6f}")
++    print(f"speedup={baseline_ms / fused_ms:.3f}x")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/examples/experimental/fused_qk_rope_append.py b/examples/experimental/fused_qk_rope_append.py
+new file mode 100644
+index 00000000000..2c08dcdbeae
+--- /dev/null
++++ b/examples/experimental/fused_qk_rope_append.py
+@@ -0,0 +1,63 @@
++"""Minimal fused QK RMSNorm, RoPE, and paged KV append example."""
++
++import torch
++
++from flashinfer.rope import fused_qk_rmsnorm_rope_append_paged_kv_cache
++
++
++def main() -> None:
++    torch.manual_seed(0)
++    device = torch.device("cuda")
++    batch_size, qo_len = 2, 1
++    q_heads, kv_heads, head_dim = 8, 1, 128
++    page_size, context_len = 16, 31
++    final_len = context_len + qo_len
++    pages_per_request = (final_len + page_size - 1) // page_size
++
++    q_indptr = torch.arange(batch_size + 1, device=device, dtype=torch.int32) * qo_len
++    seq_lens = torch.full((batch_size,), final_len, device=device, dtype=torch.int32)
++    page_indices = torch.arange(
++        batch_size * pages_per_request, device=device, dtype=torch.int32
++    ).view(batch_size, pages_per_request)
++
++    width = (q_heads + 2 * kv_heads) * head_dim
++    qkv = torch.randn(batch_size * qo_len, width, device=device, dtype=torch.bfloat16)
++    inv_freq = 1.0 / (
++        1e4
++        ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim)
++    )
++    freqs = torch.outer(
++        torch.arange(final_len, device=device, dtype=torch.float32), inv_freq
++    )
++    cos_sin = torch.cat([freqs.cos(), freqs.sin()], dim=-1)
++    q_weight = torch.ones(head_dim, device=device)
++    k_weight = torch.ones(head_dim, device=device)
++    cache = tuple(
++        torch.empty(
++            batch_size * pages_per_request,
++            page_size,
++            kv_heads,
++            head_dim,
++            device=device,
++            dtype=torch.bfloat16,
++        )
++        for _ in range(2)
++    )
++
++    q = fused_qk_rmsnorm_rope_append_paged_kv_cache(
++        qkv,
++        cos_sin,
++        seq_lens,
++        q_indptr,
++        page_indices,
++        cache,
++        False,
++        q_weight,
++        k_weight,
++        2,
++    )
++    print(f"Q: {tuple(q.shape)}, K cache: {tuple(cache[0].shape)}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/flashinfer/experimental/fused_qk_rope_append/README.md b/flashinfer/experimental/fused_qk_rope_append/README.md
+new file mode 100644
+index 00000000000..69e371a4550
+--- /dev/null
++++ b/flashinfer/experimental/fused_qk_rope_append/README.md
+@@ -0,0 +1,28 @@
++# Experimental fused QK RMSNorm, RoPE, and paged KV append
++
++This JIT-only backend fuses packed-QKV unpacking, optional per-head Q/K
++RMSNorm, NeoX RoPE, Q output production, and paged K/V cache append. The FP8
++variant additionally quantizes Q/K/V in the same launch and supports dynamic
++per-token/per-Q-head or static Q scaling.
++
++It fills a narrow gap in current FlashInfer: the stable tree has QK
++RMSNorm+RoPE and RoPE+FP8 paged-append primitives, but does not combine the
++complete serving preprocessing path into one GQA launch.
++
++Limitations:
++
++- SM90 and SM100 only;
++- BF16 packed input;
++- Q/K/V head dimension 128;
++- `(num_q_heads, num_kv_heads)` is `(8, 1)` or `(64, 8)`;
++- NHD cache layout `[page, page_size, kv_head, head_dim]`;
++- FP8 cache type is E4M3 and K/V scales are scalar;
++- JIT only, no automatic routing and no AOT registration.
++
++The implementation is derived from Tencent hpc-ops commit
++`2a2e26562433a8ba4b504858f1c938eb7612c901` and retains its MIT attribution.
++The experimental owner is [`@slhslh`](https://github.com/slhslh). Lifecycle
++and graduation work is tracked in
++[flashinfer-ai/flashinfer#5368](https://github.com/flashinfer-ai/flashinfer/issues/5368).
++
++See [RESULTS.md](RESULTS.md) for B200 correctness and latency measurements.
+diff --git a/flashinfer/experimental/fused_qk_rope_append/RESULTS.md b/flashinfer/experimental/fused_qk_rope_append/RESULTS.md
+new file mode 100644
+index 00000000000..99b54a6cf5c
+--- /dev/null
++++ b/flashinfer/experimental/fused_qk_rope_append/RESULTS.md
+@@ -0,0 +1,26 @@
++# Fused QK/RoPE/append results
++
++Measured on one NVIDIA B200 with CUDA 13.3 and PyTorch 2.11.0+cu130. Timings
++are median kernel time over 30 CUPTI measurements after 10 warmups, with the L2
++cache flushed before every measurement. The comparison pipeline uses the
++stable FlashInfer RMSNorm, RoPE, and paged KV append primitives. Both paths
++consume the same BF16-rounded norm weights, and the benchmark validates Q, K,
++and V before timing.
++
++| Shape | Fused | Stable primitive pipeline | Speedup |
++| --- | ---: | ---: | ---: |
++| B=32, Q=1, Hq=8, Hkv=1, D=128, context=2048 | 0.005280 ms | 0.030368 ms | 5.752x |
++| B=8, Q=16, Hq=8, Hkv=1, D=128, context=2048 | 0.005344 ms | 0.034015 ms | 6.365x |
++
++Reproduce from the repository root:
++
++```bash
++python benchmarks/bench_fused_qk_rope_append.py \
++  --batch-size 32 --qo-len 1 --context-len 2048
++python benchmarks/bench_fused_qk_rope_append.py \
++  --batch-size 8 --qo-len 16 --context-len 2048
++```
++
++These numbers demonstrate launch and memory-traffic savings for the exact
++supported shapes; they are not a claim about other head configurations. SM90
++correctness and performance still need to be run on H100/H200 hardware.
+diff --git a/flashinfer/experimental/fused_qk_rope_append/__init__.py b/flashinfer/experimental/fused_qk_rope_append/__init__.py
+new file mode 100644
+index 00000000000..6fb809813ea
+--- /dev/null
++++ b/flashinfer/experimental/fused_qk_rope_append/__init__.py
+@@ -0,0 +1,11 @@
++"""Experimental fused QK RMSNorm/RoPE/paged-append backend."""
++
++from .backend import (
++    fused_qk_norm_rope_append_paged_kv_cache,
++    fused_qk_norm_rope_quantize_fp8_append_paged_kv_cache,
++)
++
++__all__ = [
++    "fused_qk_norm_rope_append_paged_kv_cache",
++    "fused_qk_norm_rope_quantize_fp8_append_paged_kv_cache",
++]
+diff --git a/flashinfer/experimental/fused_qk_rope_append/backend.py b/flashinfer/experimental/fused_qk_rope_append/backend.py
+new file mode 100644
+index 00000000000..eeb919713ce
+--- /dev/null
++++ b/flashinfer/experimental/fused_qk_rope_append/backend.py
+@@ -0,0 +1,186 @@
++"""Backend for fused QK RMSNorm, RoPE, quantization, and paged append."""
++
++import functools
++import math
++from typing import Optional, Tuple
++
++import torch
++
++from .jit import load_fused_qk_rope_append_module
++
++
++@functools.cache
++def _get_hpc_rope_module():
++    return load_fused_qk_rope_append_module()
++
++
++def _q_heads_from_packed_qkv(
++    qkv: torch.Tensor, key_cache: torch.Tensor, value_cache: torch.Tensor
++) -> int:
++    kv_heads = key_cache.shape[2]
++    qk_dim = key_cache.shape[3]
++    v_dim = value_cache.shape[3]
++    q_width = qkv.shape[1] - kv_heads * (qk_dim + v_dim)
++    if q_width <= 0 or q_width % qk_dim:
++        raise ValueError("qkv width is inconsistent with the KV cache shape")
++    return q_width // qk_dim
++
++
++def fused_qk_norm_rope_append_paged_kv_cache(
++    qkv: torch.Tensor,
++    cos_sin_cache: torch.Tensor,
++    seq_lens: torch.Tensor,
++    q_indptr: torch.Tensor,
++    page_indices: torch.Tensor,
++    paged_kv_cache: Tuple[torch.Tensor, torch.Tensor],
++    is_prefill: bool,
++    q_norm_weight: Optional[torch.Tensor] = None,
++    k_norm_weight: Optional[torch.Tensor] = None,
++    qk_norm_policy: int = 0,
++    out_q: Optional[torch.Tensor] = None,
++    out_k: Optional[torch.Tensor] = None,
++    out_v: Optional[torch.Tensor] = None,
++) -> torch.Tensor:
++    r"""Fuse NeoX RoPE, optional Q/K RMSNorm, and paged BF16 KV append.
++
++    ``qkv`` is packed as ``[Q heads, K heads, V heads]``. ``qk_norm_policy``
++    is 0 (disabled), 1 (RoPE then RMSNorm), or 2 (RMSNorm then RoPE).
++    The optimized hpc-ops kernel supports ``(q_heads, kv_heads)`` equal to
++    ``(8, 1)`` or ``(64, 8)``, with Q/K/V head dimension 128 and NHD cache
++    layout ``[page, page_size, kv_head, head_dim]``.
++
++    ``seq_lens`` contains total sequence lengths after appending, ``q_indptr``
++    maps packed input rows to requests, and ``page_indices`` is the dense
++    per-request physical page table.
++    """
++    if len(paged_kv_cache) != 2:
++        raise ValueError("paged_kv_cache must be (key_cache, value_cache)")
++    key_cache, value_cache = paged_kv_cache
++    q_heads = _q_heads_from_packed_qkv(qkv, key_cache, value_cache)
++    if out_q is None:
++        out_q = torch.empty(
++            (qkv.shape[0], q_heads, key_cache.shape[3]),
++            dtype=qkv.dtype,
++            device=qkv.device,
++        )
++    _get_hpc_rope_module().hpc_rope_norm_store_kv(
++        out_q,
++        key_cache,
++        value_cache,
++        qkv,
++        cos_sin_cache,
++        seq_lens,
++        q_indptr,
++        page_indices,
++        is_prefill,
++        q_norm_weight,
++        k_norm_weight,
++        out_k,
++        out_v,
++        qk_norm_policy,
++    )
++    return out_q
++
++
++def fused_qk_norm_rope_quantize_fp8_append_paged_kv_cache(
++    qkv: torch.Tensor,
++    cos_sin_cache: torch.Tensor,
++    seq_lens: torch.Tensor,
++    q_indptr: torch.Tensor,
++    page_indices: torch.Tensor,
++    paged_kv_cache: Tuple[torch.Tensor, torch.Tensor],
++    is_prefill: bool,
++    k_scale: torch.Tensor,
++    v_scale: torch.Tensor,
++    quant_policy: int,
++    max_seqlen: int = 0,
++    upper_max: float = 448.0,
++    q_scale_inv: Optional[torch.Tensor] = None,
++    q_norm_weight: Optional[torch.Tensor] = None,
++    k_norm_weight: Optional[torch.Tensor] = None,
++    qk_norm_policy: int = 0,
++    out_q: Optional[torch.Tensor] = None,
++    out_k: Optional[torch.Tensor] = None,
++    out_v: Optional[torch.Tensor] = None,
++    q_scale: Optional[torch.Tensor] = None,
++    split_k_flag: Optional[torch.Tensor] = None,
++) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    r"""Fused QK-Norm/RoPE, FP8 quantization, and paged KV append.
++
++    ``quant_policy=1`` computes an exact per-token/per-Q-head scale. Decode
++    returns scales shaped ``[num_rows, q_heads]``; prefill returns
++    ``[num_requests, q_heads, round_up(max_seqlen, 128)]``.
++    ``quant_policy=2`` uses scalar ``q_scale_inv`` and returns an empty scale
++    tensor. K and V use scalar dequantization scales ``k_scale`` and ``v_scale``.
++    Dynamic prefill requires ``max_seqlen`` to cover the longest request in
++    ``q_indptr``. ``upper_max`` is the E4M3 finite magnitude and must be in
++    ``(0, 448]``. Validation stays asynchronous: if ``q_indptr`` is malformed
++    or any request exceeds ``max_seqlen``, the kernel leaves Q/K/V outputs
++    untouched and returns ``split_k_flag`` filled with ``-1``.
++    """
++    if len(paged_kv_cache) != 2:
++        raise ValueError("paged_kv_cache must be (key_cache, value_cache)")
++    if quant_policy not in (1, 2):
++        raise ValueError("quant_policy must be 1 (dynamic Q) or 2 (static Q)")
++    if not math.isfinite(upper_max) or not 0.0 < upper_max <= 448.0:
++        raise ValueError("upper_max must be finite and in the interval (0, 448]")
++    if quant_policy == 2 and q_scale_inv is None:
++        raise ValueError("q_scale_inv is required when quant_policy=2")
++    if quant_policy == 1 and is_prefill and max_seqlen <= 0:
++        raise ValueError("max_seqlen must be positive for dynamic prefill quantization")
++    key_cache, value_cache = paged_kv_cache
++    q_heads = _q_heads_from_packed_qkv(qkv, key_cache, value_cache)
++    num_rows = qkv.shape[0]
++    num_requests = seq_lens.shape[0]
++    num_kv_heads = key_cache.shape[2]
++    if out_q is None:
++        out_q = torch.empty(
++            (num_rows, q_heads, key_cache.shape[3]),
++            dtype=torch.float8_e4m3fn,
++            device=qkv.device,
++        )
++    if q_scale is None:
++        if quant_policy == 1 and is_prefill:
++            aligned = (max_seqlen + 127) // 128 * 128
++            q_scale = torch.empty(
++                (num_requests, q_heads, aligned),
++                dtype=torch.float32,
++                device=qkv.device,
++            )
++        elif quant_policy == 1:
++            q_scale = torch.empty(
++                (num_rows, q_heads), dtype=torch.float32, device=qkv.device
++            )
++        else:
++            q_scale = torch.empty(0, dtype=torch.float32, device=qkv.device)
++    if split_k_flag is None:
++        split_k_flag = torch.zeros(
++            (num_requests, num_kv_heads), dtype=torch.int32, device=qkv.device
++        )
++    else:
++        split_k_flag.zero_()
++    _get_hpc_rope_module().hpc_rope_norm_store_kv_fp8(
++        out_q,
++        q_scale,
++        split_k_flag,
++        key_cache,
++        value_cache,
++        qkv,
++        cos_sin_cache,
++        seq_lens,
++        q_indptr,
++        page_indices,
++        is_prefill,
++        k_scale,
++        v_scale,
++        quant_policy,
++        max_seqlen,
++        upper_max,
++        q_scale_inv,
++        q_norm_weight,
++        k_norm_weight,
++        out_k,
++        out_v,
++        qk_norm_policy,
++    )
++    return out_q, q_scale, split_k_flag
+diff --git a/flashinfer/experimental/fused_qk_rope_append/csrc/hpc_rope.cu b/flashinfer/experimental/fused_qk_rope_append/csrc/hpc_rope.cu
+new file mode 100644
+index 00000000000..7773014838c
+--- /dev/null
++++ b/flashinfer/experimental/fused_qk_rope_append/csrc/hpc_rope.cu
+@@ -0,0 +1,997 @@
++// Copyright (C) 2026 Tencent.
++
++#include <cuda.h>
++#include <cuda_bf16.h>
++#include <cuda_fp8.h>
++#include <flashinfer/hpc_rope.h>
++#include <stdio.h>
++
++#include <flashinfer/hpc_utils.cuh>
++#include <stdexcept>
++#include <string>
++
++namespace hpc {
++namespace rope {
++
++struct FastDivmod {
++  int divisor;
++
++  explicit FastDivmod(int value) : divisor(value) {}
++
++  __device__ __forceinline__ void operator()(int& quotient, int& remainder, int dividend) const {
++    quotient = dividend / divisor;
++    remainder = dividend - quotient * divisor;
++  }
++};
++
++namespace kernels {
++
++template <int kNumerator, int kDenominator>
++__device__ __forceinline__ constexpr int ceil_div() {
++  static_assert(kDenominator > 0, "denominator must >0");
++  return (kNumerator + kDenominator - 1) / kDenominator;
++}
++
++constexpr float kEps = 1e-6f;
++
++/// In-place rotate a pair of RoPE elements (NeoX version)
++__device__ __forceinline__ void rope_rotate_pair(float& x1, float& x2, float cos_val,
++                                                 float sin_val) {
++  float y1 = x1 * cos_val - x2 * sin_val;
++  float y2 = x2 * cos_val + x1 * sin_val;
++  x1 = y1;
++  x2 = y2;
++}
++
++/// RMSNorm in-place: compute RMS over register values, apply weight from shared memory
++template <int kNumItemPerThread, int kHeadDim, typename T, int N, int kWarpSize = 32>
++__device__ __forceinline__ void rms_norm_apply(vec_t<T, N>& data, const float* smem_weight,
++                                               int ilane) {
++  float sum_sq = 0.f;
++#pragma unroll
++  for (int i = 0; i < kNumItemPerThread; ++i) sum_sq += data[i] * data[i];
++  sum_sq = warp_reduce_sum_xor(sum_sq);
++  float inv_rms = rsqrtf(sum_sq / kHeadDim + kEps);
++  constexpr int kRoundsHalf = (kHeadDim / 2 + kWarpSize - 1) / kWarpSize;
++#pragma unroll
++  for (int r = 0; r < kRoundsHalf; ++r) {
++    int i = r * kWarpSize + ilane;
++    if (i < kHeadDim / 2) {
++      data[r * 2] *= inv_rms * smem_weight[i];
++      data[r * 2 + 1] *= inv_rms * smem_weight[i + kHeadDim / 2];
++    }
++  }
++}
++
++/// Warp-level max absolute value
++template <int kN, typename T, int N>
++__device__ __forceinline__ float warp_abs_max(vec_t<T, N>& data) {
++  float m = kEps;
++#pragma unroll
++  for (int i = 0; i < kN; ++i) m = fmaxf(m, fabsf(data[i]));
++  return warp_reduce_max_xor(m);
++}
++
++/// Load a NeoX-layout BF16 head into float registers.
++template <int kQKHeadDim, int kNumItemPerThread, int kWarpSize = 32>
++__device__ __forceinline__ void vectorized_load_neox(vec_t<float, kNumItemPerThread>& data,
++                                                     const __nv_bfloat16* src, int ilane) {
++  constexpr int kNumRoundsHalf = ceil_div<kQKHeadDim / 2, kWarpSize>();
++  static_assert(kNumItemPerThread == kNumRoundsHalf * 2,
++                "kNumItemPerThread must match NeoX load rounds");
++#pragma unroll
++  for (int r = 0; r < kNumRoundsHalf; ++r) {
++    int i = r * kWarpSize + ilane;
++    if (i < kQKHeadDim / 2) {
++      data[r * 2] = __bfloat162float(src[i]);
++      data[r * 2 + 1] = __bfloat162float(src[i + kQKHeadDim / 2]);
++    }
++  }
++}
++
++/// Zero rows [from_row, to_row) of a KV cache block
++template <typename CacheT, int kElemPerRow, int kWarpSize = 32>
++__device__ __forceinline__ void zero_kv_rows(CacheT* block_start, int from_row, int to_row,
++                                             int ilane) {
++  constexpr int kItemPerThread = 16 / sizeof(CacheT);
++  vec_t<CacheT, kItemPerThread> zero_vec;
++#pragma unroll
++  for (int i = 0; i < kItemPerThread; ++i) zero_vec[i] = CacheT(0);
++  for (int row = from_row; row < to_row; ++row) {
++    CacheT* row_ptr = block_start + row * kElemPerRow;
++    for (int idx = ilane * kItemPerThread; idx < kElemPerRow; idx += kWarpSize * kItemPerThread)
++      store(row_ptr + idx, zero_vec);
++  }
++}
++
++template <int kWarpsPerBlock, int kNumQHeads, int kNumKVHeads, int kQKHeadDim, int kVHeadDim,
++          int kNormPolicy>
++__global__ void rope_norm_store_kv_kernel(
++    __nv_bfloat16* out_q_ptr, __nv_bfloat16* kcache_ptr, __nv_bfloat16* vcache_ptr,
++    __nv_bfloat16* out_k_ptr, __nv_bfloat16* out_v_ptr, const __nv_bfloat16* in_qkv_ptr,
++    const float* cos_sin_ptr, const int* num_seqlen_per_req_ptr, const int* q_index_ptr,
++    const int* kvcache_indices_ptr, const float* q_norm_weight_ptr, const float* k_norm_weight_ptr,
++    int kcache_block_offset, int vcache_block_offset, int num_batch, int max_num_kv_block_per_batch,
++    FastDivmod kv_block_size_divider, int num_rows, int num_compute_blocks) {
++  using DType = __nv_bfloat16;
++
++  static_assert(kNumQHeads % kNumKVHeads == 0, "kNumQHeads must be divisible by kNumKVHeads");
++  constexpr int kQPerKV = kNumQHeads / kNumKVHeads;
++  constexpr int kKVPerCTA = 1;
++  constexpr int kQPerCTA = kQPerKV;
++  const int kv_head_start = blockIdx.y;
++  const int q_head_start = kv_head_start * kQPerKV;
++
++  constexpr int kWarpSize = 32;
++  constexpr int kNumElemPerRow =
++      kNumQHeads * kQKHeadDim + kNumKVHeads * kQKHeadDim + kNumKVHeads * kVHeadDim;
++  constexpr int kNumRoundsHalf = ceil_div<kQKHeadDim / 2, kWarpSize>();
++  constexpr int kNumItemPerThread = kNumRoundsHalf * 2;
++
++  constexpr int kNumSmemQElemPerRow = kQPerCTA * kQKHeadDim;
++  constexpr int kNumSmemKElemPerRow = kKVPerCTA * kQKHeadDim;
++  constexpr int kNumSmemElemPerRow = kNumSmemQElemPerRow + kNumSmemKElemPerRow;
++
++  int tid = threadIdx.x;
++  int bid = blockIdx.x;
++  int iwarp = tid / kWarpSize;
++  int ilane = tid % kWarpSize;
++
++  __shared__ float smem_cos_sin[kWarpsPerBlock][kQKHeadDim];
++  __shared__ float smem_q_norm_w[kQKHeadDim];
++  __shared__ float smem_k_norm_w[kQKHeadDim];
++  __shared__ int smem_batch_id[kWarpsPerBlock];
++  __shared__ int smem_token_pos[kWarpsPerBlock];
++  extern __shared__ DType smem_qkv[];
++
++  // ---- Clear blocks: bid >= num_compute_blocks → one block per request -----
++  // Each clear block clears one KV head slice.
++  if (bid >= num_compute_blocks) {
++    int req_id = bid - num_compute_blocks;
++    if (req_id >= num_batch) return;
++
++    // Last token of this request determines the clear range
++    int last_token_pos = num_seqlen_per_req_ptr[req_id] - 1;
++    if (last_token_pos < 0) return;
++
++    int block_idx_in_batch, pos_in_block;
++    kv_block_size_divider(block_idx_in_batch, pos_in_block, last_token_pos);
++    int phys_block_id =
++        kvcache_indices_ptr[req_id * max_num_kv_block_per_batch + block_idx_in_batch];
++
++    int zero_from = pos_in_block + 1;
++    int zero_to = kv_block_size_divider.divisor;
++    if (zero_from < zero_to) {
++      constexpr int kKItemPerThread = 16 / sizeof(DType);
++      static_assert(kQKHeadDim % kKItemPerThread == 0,
++                    "kQKHeadDim must be divisible by kKItemPerThread");
++      static_assert(kVHeadDim % kKItemPerThread == 0,
++                    "kVHeadDim must be divisible by kKItemPerThread");
++      vec_t<DType, kKItemPerThread> zero_vec;
++#pragma unroll
++      for (int z = 0; z < kKItemPerThread; ++z) zero_vec[z] = DType(0);
++      // Each clear block clears the kKVPerCTA KV head slice it owns.
++      for (int row = zero_from + iwarp; row < zero_to; row += kWarpsPerBlock) {
++#pragma unroll
++        for (int h = 0; h < kKVPerCTA; ++h) {
++          int kv_head = kv_head_start + h;
++          DType* k_row = kcache_ptr + (int64_t)phys_block_id * (int64_t)kcache_block_offset +
++                         row * (kNumKVHeads * kQKHeadDim) + kv_head * kQKHeadDim;
++          DType* v_row = vcache_ptr + (int64_t)phys_block_id * (int64_t)vcache_block_offset +
++                         row * (kNumKVHeads * kVHeadDim) + kv_head * kVHeadDim;
++          for (int idx = ilane * kKItemPerThread; idx < kQKHeadDim;
++               idx += kWarpSize * kKItemPerThread)
++            store(k_row + idx, zero_vec);
++          for (int idx = ilane * kKItemPerThread; idx < kVHeadDim;
++               idx += kWarpSize * kKItemPerThread)
++            store(v_row + idx, zero_vec);
++        }
++      }
++    }
++    return;
++  }
++
++  // Search q_index to find batch_id.
++  int batch_id = 0;
++  int token_id = 0;
++  int irow = bid * kWarpsPerBlock + iwarp;
++
++  // Initialize sentinels for padding rows.
++  if (tid < kWarpsPerBlock) {
++    smem_batch_id[tid] = -1;
++    smem_token_pos[tid] = -1;
++  }
++  __syncthreads();
++
++  // Each thread claims one batch id and checks whether it covers any of this
++  // block's kWarpsPerBlock rows. q_index segments are non-overlapping so at
++  // most one thread writes each smem[iw].
++  {
++    constexpr int kNumSearchThreads = kWarpSize * kWarpsPerBlock;
++    int num_search_rounds = (num_batch + kNumSearchThreads - 1) / kNumSearchThreads;
++    for (int round = 0; round < num_search_rounds; round++) {
++      int b = round * kNumSearchThreads + tid;
++      if (b < num_batch) {
++        int q_begin = q_index_ptr[b];
++        int q_end = q_index_ptr[b + 1];
++#pragma unroll
++        for (int iw = 0; iw < kWarpsPerBlock; iw++) {
++          int global_row = bid * kWarpsPerBlock + iw;
++          if (q_begin <= global_row && global_row < q_end) {
++            smem_batch_id[iw] = b;
++            smem_token_pos[iw] = global_row + num_seqlen_per_req_ptr[b] - q_index_ptr[b + 1];
++          }
++        }
++      }
++    }
++  }
++
++  // Load norm weights into shared memory (once per block)
++  if constexpr (kNormPolicy > 0) {
++    constexpr int kItemPerThread = 16 / sizeof(float);
++    constexpr int kNumPacks = kQKHeadDim / kItemPerThread;
++    static_assert(kQKHeadDim % kItemPerThread == 0,
++                  "kQKHeadDim must be divisible by kItemPerThread");
++    static_assert(kItemPerThread * kWarpSize >= kQKHeadDim, "otherwise here should loop");
++    if (tid < kNumPacks) {
++      int ioffset = tid * kItemPerThread;
++      store(smem_q_norm_w + ioffset, load<float, kItemPerThread>(q_norm_weight_ptr + ioffset));
++      store(smem_k_norm_w + ioffset, load<float, kItemPerThread>(k_norm_weight_ptr + ioffset));
++    }
++  }
++
++  // Stage this CTA's Q/K slice into shared memory. V is streamed from global memory.
++  {
++    constexpr int kElemPerThread = 16 / sizeof(DType);
++    static_assert(kNumSmemQElemPerRow % kElemPerThread == 0,
++                  "Q slice must align to packed load width");
++    static_assert(kNumSmemKElemPerRow % kElemPerThread == 0,
++                  "K slice must align to packed load width");
++    constexpr int kQPacks = kNumSmemQElemPerRow / kElemPerThread;
++    constexpr int kKPacks = kNumSmemKElemPerRow / kElemPerThread;
++    constexpr int kQRounds = ceil_div<kQPacks, kWarpSize>();
++    constexpr int kKRounds = ceil_div<kKPacks, kWarpSize>();
++    int irow_local = bid * kWarpsPerBlock + iwarp;
++    if (irow_local < num_rows) {
++      const DType* src_q = in_qkv_ptr + irow_local * kNumElemPerRow + q_head_start * kQKHeadDim;
++      const DType* src_k = in_qkv_ptr + irow_local * kNumElemPerRow + kNumQHeads * kQKHeadDim +
++                           kv_head_start * kQKHeadDim;
++      DType* dst_q = smem_qkv + iwarp * kNumSmemElemPerRow;
++      DType* dst_k = dst_q + kNumSmemQElemPerRow;
++#pragma unroll
++      for (int r = 0; r < kQRounds; ++r) {
++        int ioffset = (r * kWarpSize + ilane) * kElemPerThread;
++        if (ioffset < kNumSmemQElemPerRow) {
++          store(dst_q + ioffset, load<DType, kElemPerThread>(src_q + ioffset));
++        }
++      }
++#pragma unroll
++      for (int r = 0; r < kKRounds; ++r) {
++        int ioffset = (r * kWarpSize + ilane) * kElemPerThread;
++        if (ioffset < kNumSmemKElemPerRow) {
++          store(dst_k + ioffset, load<DType, kElemPerThread>(src_k + ioffset));
++        }
++      }
++    }
++  }
++
++  __syncthreads();
++
++  //  Early-exit for invalid rows
++  if (irow >= num_rows) return;
++  batch_id = smem_batch_id[iwarp];
++  token_id = smem_token_pos[iwarp];
++  if (token_id < 0) return;
++
++  //  Load cos_sin
++  {
++    constexpr int kItemPerThread = 16 / sizeof(float);
++    constexpr int kNumPacks = kQKHeadDim / kItemPerThread;
++    static_assert(kQKHeadDim % kItemPerThread == 0, "");
++    static_assert(kNumPacks <= kWarpSize, "");
++    const float* cos_sin_row = cos_sin_ptr + token_id * kQKHeadDim;
++    if (ilane < kNumPacks) {
++      int ioffset = ilane * kItemPerThread;
++      store(&smem_cos_sin[iwarp][0] + ioffset, load<float, kItemPerThread>(cos_sin_row + ioffset));
++    }
++    __syncwarp();
++  }
++
++  //  KV cache block addressing
++  int block_idx_in_batch, block_row;
++  kv_block_size_divider(block_idx_in_batch, block_row, token_id);
++  int phys_block_id =
++      kvcache_indices_ptr[batch_id * max_num_kv_block_per_batch + block_idx_in_batch];
++
++  DType* k_cache_row_start = kcache_ptr + (int64_t)phys_block_id * (int64_t)kcache_block_offset +
++                             block_row * (kNumKVHeads * kQKHeadDim);
++  DType* v_cache_row_start = vcache_ptr + (int64_t)phys_block_id * (int64_t)vcache_block_offset +
++                             block_row * (kNumKVHeads * kVHeadDim);
++
++  // Q/K heads for this CTA are staged in smem_qkv. V is streamed from global memory.
++  const DType* qkv_row_smem = smem_qkv + iwarp * kNumSmemElemPerRow;
++  const DType* qkv_row_global = in_qkv_ptr + irow * kNumElemPerRow;
++
++  // Process Q heads for this CTA's KV group range:
++  // [q_head_start, q_head_start + kQPerCTA)
++#pragma unroll
++  for (int dq = 0; dq < kQPerCTA; ++dq) {
++    int q_head = q_head_start + dq;
++    // Q is indexed by dq within this CTA's Q slice.
++    const DType* q_src = qkv_row_smem + dq * kQKHeadDim;
++    DType* q_dst = out_q_ptr + irow * kNumQHeads * kQKHeadDim + q_head * kQKHeadDim;
++
++    vec_t<float, kNumItemPerThread> data = {0};
++
++    // Load Q head from shared memory into registers.
++    vectorized_load_neox<kQKHeadDim, kNumItemPerThread, kWarpSize>(data, q_src, ilane);
++
++    // norm-then-rope
++    if constexpr (kNormPolicy == 2) {
++      rms_norm_apply<kNumItemPerThread, kQKHeadDim>(data, smem_q_norm_w, ilane);
++    }
++
++    // RoPE rotation
++#pragma unroll
++    for (int r = 0; r < kNumRoundsHalf; ++r) {
++      int i = r * kWarpSize + ilane;
++      if (i < kQKHeadDim / 2) {
++        rope_rotate_pair(data[r * 2], data[r * 2 + 1], smem_cos_sin[iwarp][i],
++                         smem_cos_sin[iwarp][i + kQKHeadDim / 2]);
++      }
++    }
++
++    // rope-then-norm
++    if constexpr (kNormPolicy == 1) {
++      rms_norm_apply<kNumItemPerThread, kQKHeadDim>(data, smem_q_norm_w, ilane);
++    }
++
++    // Store Q output
++#pragma unroll
++    for (int r = 0; r < kNumRoundsHalf; ++r) {
++      int i = r * kWarpSize + ilane;
++      if (i < kQKHeadDim / 2) {
++        q_dst[i] = __float2bfloat16(data[r * 2]);
++        q_dst[i + kQKHeadDim / 2] = __float2bfloat16(data[r * 2 + 1]);
++      }
++    }
++  }
++
++  // Process K heads owned by this CTA: [kv_head_start, kv_head_start + kKVPerCTA)
++#pragma unroll
++  for (int dh = 0; dh < kKVPerCTA; ++dh) {
++    const int kv_head = kv_head_start + dh;
++    // K is indexed by dh within this CTA's K slice.
++    const DType* k_src = qkv_row_smem + kNumSmemQElemPerRow + dh * kQKHeadDim;
++
++    vec_t<float, kNumItemPerThread> data = {0};
++
++    vectorized_load_neox<kQKHeadDim, kNumItemPerThread, kWarpSize>(data, k_src, ilane);
++
++    if constexpr (kNormPolicy == 2) {
++      rms_norm_apply<kNumItemPerThread, kQKHeadDim>(data, smem_k_norm_w, ilane);
++    }
++
++#pragma unroll
++    for (int r = 0; r < kNumRoundsHalf; ++r) {
++      int i = r * kWarpSize + ilane;
++      if (i < kQKHeadDim / 2) {
++        rope_rotate_pair(data[r * 2], data[r * 2 + 1], smem_cos_sin[iwarp][i],
++                         smem_cos_sin[iwarp][i + kQKHeadDim / 2]);
++      }
++    }
++
++    if constexpr (kNormPolicy == 1) {
++      rms_norm_apply<kNumItemPerThread, kQKHeadDim>(data, smem_k_norm_w, ilane);
++    }
++
++    // Write K output
++    DType* k_dst = (out_k_ptr != nullptr)
++                       ? out_k_ptr + irow * kNumKVHeads * kQKHeadDim + kv_head * kQKHeadDim
++                       : k_cache_row_start + kv_head * kQKHeadDim;
++
++#pragma unroll
++    for (int r = 0; r < kNumRoundsHalf; ++r) {
++      int i = r * kWarpSize + ilane;
++      if (i < kQKHeadDim / 2) {
++        k_dst[i] = __float2bfloat16(data[r * 2]);
++        k_dst[i + kQKHeadDim / 2] = __float2bfloat16(data[r * 2 + 1]);
++      }
++    }
++  }
++
++  // Process V heads owned by this CTA: [kv_head_start, kv_head_start + kKVPerCTA)
++  {
++    constexpr int kItemPerThread = 16 / sizeof(DType);
++    static_assert(kVHeadDim % kItemPerThread == 0, "kVHeadDim must be divisible by kItemPerThread");
++    constexpr int kNumPackPerHead = kVHeadDim / kItemPerThread;
++    constexpr int kNumLoadRound = ceil_div<kNumPackPerHead, kWarpSize>();
++#pragma unroll
++    for (int dh = 0; dh < kKVPerCTA; ++dh) {
++      const int kv_head = kv_head_start + dh;
++      const DType* v_src =
++          qkv_row_global + (kNumQHeads + kNumKVHeads) * kQKHeadDim + kv_head * kVHeadDim;
++      DType* v_dst = (out_v_ptr != nullptr)
++                         ? out_v_ptr + irow * kNumKVHeads * kVHeadDim + kv_head * kVHeadDim
++                         : v_cache_row_start + kv_head * kVHeadDim;
++#pragma unroll
++      for (int r = 0; r < kNumLoadRound; ++r) {
++        int ioffset = (r * kWarpSize + ilane) * kItemPerThread;
++        if (ioffset < kVHeadDim) {
++          store(v_dst + ioffset, load<DType, kItemPerThread>(v_src + ioffset));
++        }
++      }
++    }
++  }
++}
++
++__global__ void validate_dynamic_prefill_indptr_kernel(const int* q_indptr, int num_batch,
++                                                       int num_rows, int max_seqlen,
++                                                       int32_t* split_k_flag, int num_kv_heads) {
++  __shared__ int invalid;
++  if (threadIdx.x == 0) invalid = 0;
++  __syncthreads();
++
++  for (int request = threadIdx.x; request < num_batch; request += blockDim.x) {
++    const int begin = q_indptr[request];
++    const int end = q_indptr[request + 1];
++    if (begin < 0 || end < begin || end > num_rows || end - begin > max_seqlen) {
++      atomicExch(&invalid, 1);
++    }
++  }
++  if (threadIdx.x == 0 && (q_indptr[0] != 0 || q_indptr[num_batch] != num_rows)) {
++    invalid = 1;
++  }
++  __syncthreads();
++  if (invalid) {
++    for (int i = threadIdx.x; i < num_batch * num_kv_heads; i += blockDim.x) {
++      split_k_flag[i] = -1;
++    }
++  }
++}
++
++template <int kQuantPolicy, int kWarpsPerBlock, int kNumQHeads, int kNumKVHeads, int kQKHeadDim,
++          int kVHeadDim, int kNormPolicy>
++__global__ void rope_norm_store_kv_fp8_kernel(
++    __nv_fp8_e4m3* out_q_ptr, __nv_fp8_e4m3* kcache_ptr, __nv_fp8_e4m3* vcache_ptr,
++    __nv_fp8_e4m3* out_k_ptr, __nv_fp8_e4m3* out_v_ptr, int32_t* split_k_flag_ptr,
++    float* q_scale_ptr, const __nv_bfloat16* in_qkv_ptr, const float* cos_sin_ptr,
++    const int* num_seqlen_per_req_ptr, const int* q_index_ptr, const int* kvcache_indices_ptr,
++    const float* q_norm_weight_ptr, const float* k_norm_weight_ptr, const float* k_scale_ptr,
++    const float* v_scale_ptr, const float* q_scale_inv_ptr, float upper_max, int max_seqlen_aligned,
++    int kcache_block_offset, int vcache_block_offset, int num_batch, int max_num_kv_block_per_batch,
++    FastDivmod kv_block_size_divider, int num_rows, int num_compute_blocks, bool is_prefill) {
++  using DType = __nv_bfloat16;
++  using QType = __nv_fp8_e4m3;
++
++  static_assert(kNumQHeads % kNumKVHeads == 0, "kNumQHeads must be divisible by kNumKVHeads");
++  constexpr int kQPerKV = kNumQHeads / kNumKVHeads;
++  constexpr int kKVPerCTA = 1;
++  constexpr int kQPerCTA = kQPerKV;
++  const int kv_head_start = blockIdx.y;
++  const int q_head_start = kv_head_start * kQPerKV;
++
++  constexpr int kWarpSize = 32;
++  constexpr int kNumElemPerRow =
++      kNumQHeads * kQKHeadDim + kNumKVHeads * kQKHeadDim + kNumKVHeads * kVHeadDim;
++  constexpr int kNumRoundsHalf = ceil_div<kQKHeadDim / 2, kWarpSize>();
++  constexpr int kNumItemPerThread = kNumRoundsHalf * 2;
++  constexpr int kNumSmemQElemPerRow = kQPerCTA * kQKHeadDim;
++  constexpr int kNumSmemKElemPerRow = kKVPerCTA * kQKHeadDim;
++  constexpr int kNumSmemElemPerRow = kNumSmemQElemPerRow + kNumSmemKElemPerRow;
++
++  int tid = threadIdx.x;
++  int bid = blockIdx.x;
++  int iwarp = tid / kWarpSize;
++  int ilane = tid % kWarpSize;
++
++  // The validation kernel runs immediately before this kernel on the same
++  // stream.  A negative flag means q_indptr cannot fit the caller-provided
++  // dynamic-prefill scale buffer; leave every output/cache untouched.
++  if constexpr (kQuantPolicy == 1) {
++    if (is_prefill && split_k_flag_ptr[0] < 0) return;
++  }
++
++  // Shared memory
++  __shared__ float smem_cos_sin[kWarpsPerBlock][kQKHeadDim];
++  __shared__ float smem_q_norm_w[kQKHeadDim];
++  __shared__ float smem_k_norm_w[kQKHeadDim];
++  __shared__ int smem_batch_id[kWarpsPerBlock];
++  __shared__ int smem_token_pos[kWarpsPerBlock];
++  extern __shared__ DType smem_qkv[];
++
++  // ---- Clear blocks: bid >= num_compute_blocks → one block per request -----
++  if (bid >= num_compute_blocks) {
++    int req_id = bid - num_compute_blocks;
++    if (req_id >= num_batch) return;
++
++    int last_token_pos = num_seqlen_per_req_ptr[req_id] - 1;
++    if (last_token_pos < 0) return;
++
++    int block_idx_in_batch, pos_in_block;
++    kv_block_size_divider(block_idx_in_batch, pos_in_block, last_token_pos);
++    int phys_block_id =
++        kvcache_indices_ptr[req_id * max_num_kv_block_per_batch + block_idx_in_batch];
++
++    int zero_from = pos_in_block + 1;
++    int zero_to = kv_block_size_divider.divisor;
++    if (zero_from < zero_to) {
++      constexpr int kKItemPerThread = 16 / sizeof(QType);
++      static_assert(kQKHeadDim % kKItemPerThread == 0,
++                    "kQKHeadDim must be divisible by kKItemPerThread");
++      static_assert(kVHeadDim % kKItemPerThread == 0,
++                    "kVHeadDim must be divisible by kKItemPerThread");
++      vec_t<QType, kKItemPerThread> zero_vec;
++#pragma unroll
++      for (int z = 0; z < kKItemPerThread; ++z) zero_vec[z] = QType(0);
++      for (int row = zero_from + iwarp; row < zero_to; row += kWarpsPerBlock) {
++#pragma unroll
++        for (int h = 0; h < kKVPerCTA; ++h) {
++          int kv_head = kv_head_start + h;
++          QType* k_row = kcache_ptr + (int64_t)phys_block_id * (int64_t)kcache_block_offset +
++                         row * (kNumKVHeads * kQKHeadDim) + kv_head * kQKHeadDim;
++          QType* v_row = vcache_ptr + (int64_t)phys_block_id * (int64_t)vcache_block_offset +
++                         row * (kNumKVHeads * kVHeadDim) + kv_head * kVHeadDim;
++          for (int idx = ilane * kKItemPerThread; idx < kQKHeadDim;
++               idx += kWarpSize * kKItemPerThread)
++            store(k_row + idx, zero_vec);
++          for (int idx = ilane * kKItemPerThread; idx < kVHeadDim;
++               idx += kWarpSize * kKItemPerThread)
++            store(v_row + idx, zero_vec);
++        }
++      }
++    }
++    return;
++  }
++
++  // Determine batch_id and token position.
++  int batch_id = 0;
++  int token_id = 0;
++  int irow = bid * kWarpsPerBlock + iwarp;
++
++  if (tid < kWarpsPerBlock) {
++    smem_batch_id[tid] = -1;
++    smem_token_pos[tid] = -1;
++  }
++  __syncthreads();
++
++  {
++    constexpr int kNumSearchThreads = kWarpSize * kWarpsPerBlock;
++    int num_search_rounds = (num_batch + kNumSearchThreads - 1) / kNumSearchThreads;
++    for (int round = 0; round < num_search_rounds; round++) {
++      int b = round * kNumSearchThreads + tid;
++      if (b < num_batch) {
++        int q_begin = q_index_ptr[b];
++        int q_end = q_index_ptr[b + 1];
++#pragma unroll
++        for (int iw = 0; iw < kWarpsPerBlock; iw++) {
++          int global_row = bid * kWarpsPerBlock + iw;
++          if (q_begin <= global_row && global_row < q_end) {
++            smem_batch_id[iw] = b;
++            smem_token_pos[iw] = global_row + num_seqlen_per_req_ptr[b] - q_index_ptr[b + 1];
++          }
++        }
++      }
++    }
++  }
++
++  // Load norm weights
++  if constexpr (kNormPolicy > 0) {
++    constexpr int kItemPerThread = 16 / sizeof(float);
++    constexpr int kNumPacks = kQKHeadDim / kItemPerThread;
++    static_assert(kQKHeadDim % kItemPerThread == 0, "");
++    static_assert(kItemPerThread * kWarpSize >= kQKHeadDim, "");
++    if (tid < kNumPacks) {
++      int ioffset = tid * kItemPerThread;
++      store(smem_q_norm_w + ioffset, load<float, kItemPerThread>(q_norm_weight_ptr + ioffset));
++      store(smem_k_norm_w + ioffset, load<float, kItemPerThread>(k_norm_weight_ptr + ioffset));
++    }
++  }
++
++  // Stage this CTA's Q/K slice into shared memory. V is streamed from global memory.
++  {
++    constexpr int kElemPerThread = 16 / sizeof(DType);
++    static_assert(kNumSmemQElemPerRow % kElemPerThread == 0,
++                  "Q slice must align to packed load width");
++    static_assert(kNumSmemKElemPerRow % kElemPerThread == 0,
++                  "K slice must align to packed load width");
++    constexpr int kQPacks = kNumSmemQElemPerRow / kElemPerThread;
++    constexpr int kKPacks = kNumSmemKElemPerRow / kElemPerThread;
++    constexpr int kQRounds = ceil_div<kQPacks, kWarpSize>();
++    constexpr int kKRounds = ceil_div<kKPacks, kWarpSize>();
++    int irow_local = bid * kWarpsPerBlock + iwarp;
++    if (irow_local < num_rows) {
++      const DType* src_q = in_qkv_ptr + irow_local * kNumElemPerRow + q_head_start * kQKHeadDim;
++      const DType* src_k = in_qkv_ptr + irow_local * kNumElemPerRow + kNumQHeads * kQKHeadDim +
++                           kv_head_start * kQKHeadDim;
++      DType* dst_q = smem_qkv + iwarp * kNumSmemElemPerRow;
++      DType* dst_k = dst_q + kNumSmemQElemPerRow;
++#pragma unroll
++      for (int r = 0; r < kQRounds; ++r) {
++        int ioffset = (r * kWarpSize + ilane) * kElemPerThread;
++        if (ioffset < kNumSmemQElemPerRow) {
++          store(dst_q + ioffset, load<DType, kElemPerThread>(src_q + ioffset));
++        }
++      }
++#pragma unroll
++      for (int r = 0; r < kKRounds; ++r) {
++        int ioffset = (r * kWarpSize + ilane) * kElemPerThread;
++        if (ioffset < kNumSmemKElemPerRow) {
++          store(dst_k + ioffset, load<DType, kElemPerThread>(src_k + ioffset));
++        }
++      }
++    }
++  }
++
++  // Single barrier: makes batch_id, token_pos, norm weights, and Q/K smem visible.
++  __syncthreads();
++
++  // Early-exit for invalid/padding rows
++  if (irow >= num_rows) return;
++  batch_id = smem_batch_id[iwarp];
++  token_id = smem_token_pos[iwarp];
++  if (token_id < 0) return;
++
++  // Load cos/sin (per-warp, needs __syncwarp for intra-warp visibility)
++  {
++    constexpr int kItemPerThread = 16 / sizeof(float);
++    constexpr int kNumPacks = kQKHeadDim / kItemPerThread;
++    const float* cos_sin_row = cos_sin_ptr + token_id * kQKHeadDim;
++    if (ilane < kNumPacks) {
++      int ioffset = ilane * kItemPerThread;
++      store(&smem_cos_sin[iwarp][0] + ioffset, load<float, kItemPerThread>(cos_sin_row + ioffset));
++    }
++    __syncwarp();
++  }
++
++  // KV cache block addressing
++  int block_idx_in_batch, block_row;
++  kv_block_size_divider(block_idx_in_batch, block_row, token_id);
++  int phys_block_id =
++      kvcache_indices_ptr[batch_id * max_num_kv_block_per_batch + block_idx_in_batch];
++
++  QType* k_cache_row_start = kcache_ptr + (int64_t)phys_block_id * (int64_t)kcache_block_offset +
++                             block_row * (kNumKVHeads * kQKHeadDim);
++  QType* v_cache_row_start = vcache_ptr + (int64_t)phys_block_id * (int64_t)vcache_block_offset +
++                             block_row * (kNumKVHeads * kVHeadDim);
++
++  // Q/K heads for this CTA are staged in smem_qkv. V is streamed from global memory.
++  const DType* qkv_row_smem = smem_qkv + iwarp * kNumSmemElemPerRow;
++  const DType* qkv_row_global = in_qkv_ptr + irow * kNumElemPerRow;
++
++  // ========= Process Q heads for this CTA's KV group range =========
++#pragma unroll
++  for (int dq = 0; dq < kQPerCTA; ++dq) {
++    int q_head = q_head_start + dq;
++    // Q is indexed by dq within this CTA's Q slice.
++    const DType* q_src = qkv_row_smem + dq * kQKHeadDim;
++    QType* q_dst = out_q_ptr + irow * kNumQHeads * kQKHeadDim + q_head * kQKHeadDim;
++
++    vec_t<float, kNumItemPerThread> data = {0};
++
++    vectorized_load_neox<kQKHeadDim, kNumItemPerThread, kWarpSize>(data, q_src, ilane);
++
++    if constexpr (kNormPolicy == 2) {
++      rms_norm_apply<kNumItemPerThread, kQKHeadDim>(data, smem_q_norm_w, ilane);
++    }
++
++#pragma unroll
++    for (int r = 0; r < kNumRoundsHalf; ++r) {
++      int i = r * kWarpSize + ilane;
++      if (i < kQKHeadDim / 2) {
++        rope_rotate_pair(data[r * 2], data[r * 2 + 1], smem_cos_sin[iwarp][i],
++                         smem_cos_sin[iwarp][i + kQKHeadDim / 2]);
++      }
++    }
++
++    if constexpr (kNormPolicy == 1) {
++      rms_norm_apply<kNumItemPerThread, kQKHeadDim>(data, smem_q_norm_w, ilane);
++    }
++
++    // Q quantization
++    float q_mult;
++    if constexpr (kQuantPolicy == 1) {
++      // dqskv: dynamic per-token per-head
++      float max_abs = warp_abs_max<kNumItemPerThread>(data);
++      float q_scale_val = max_abs / upper_max;
++      if (ilane == 0) {
++        if (is_prefill) {
++          int tok_in_chunk = irow - q_index_ptr[batch_id];
++          if (tok_in_chunk < max_seqlen_aligned) {
++            q_scale_ptr[batch_id * kNumQHeads * max_seqlen_aligned + q_head * max_seqlen_aligned +
++                        tok_in_chunk] = q_scale_val;
++          }
++        } else {
++          q_scale_ptr[irow * kNumQHeads + q_head] = q_scale_val;
++        }
++      }
++      q_mult = __frcp_rn(q_scale_val);
++    } else if constexpr (kQuantPolicy == 2) {
++      q_mult = q_scale_inv_ptr[0];
++    }
++
++    // Store FP8 Q
++#pragma unroll
++    for (int r = 0; r < kNumRoundsHalf; ++r) {
++      int i = r * kWarpSize + ilane;
++      if (i < kQKHeadDim / 2) {
++        q_dst[i] = QType(data[r * 2] * q_mult);
++        q_dst[i + kQKHeadDim / 2] = QType(data[r * 2 + 1] * q_mult);
++      }
++    }
++  }
++
++  // ========= Process K heads owned by this CTA =========
++  {
++    float k_scale_inv = __frcp_rn(k_scale_ptr[0]);
++
++    // Zero split_k_flag once per (batch, kv_head). Only the CTA carrying the
++    // first row of this batch writes it, to avoid repeated writes.
++    if (irow == q_index_ptr[batch_id] && ilane == 0) {
++#pragma unroll
++      for (int dh = 0; dh < kKVPerCTA; ++dh) {
++        split_k_flag_ptr[batch_id * kNumKVHeads + kv_head_start + dh] = 0;
++      }
++    }
++
++#pragma unroll
++    for (int dh = 0; dh < kKVPerCTA; ++dh) {
++      const int kv_head = kv_head_start + dh;
++      // K is indexed by dh within this CTA's K slice.
++      const DType* k_src = qkv_row_smem + kNumSmemQElemPerRow + dh * kQKHeadDim;
++
++      vec_t<float, kNumItemPerThread> data = {0};
++
++      vectorized_load_neox<kQKHeadDim, kNumItemPerThread, kWarpSize>(data, k_src, ilane);
++
++      if constexpr (kNormPolicy == 2) {
++        rms_norm_apply<kNumItemPerThread, kQKHeadDim>(data, smem_k_norm_w, ilane);
++      }
++
++#pragma unroll
++      for (int r = 0; r < kNumRoundsHalf; ++r) {
++        int i = r * kWarpSize + ilane;
++        if (i < kQKHeadDim / 2) {
++          rope_rotate_pair(data[r * 2], data[r * 2 + 1], smem_cos_sin[iwarp][i],
++                           smem_cos_sin[iwarp][i + kQKHeadDim / 2]);
++        }
++      }
++
++      if constexpr (kNormPolicy == 1) {
++        rms_norm_apply<kNumItemPerThread, kQKHeadDim>(data, smem_k_norm_w, ilane);
++      }
++
++      QType* k_dst = (out_k_ptr != nullptr)
++                         ? out_k_ptr + irow * kNumKVHeads * kQKHeadDim + kv_head * kQKHeadDim
++                         : k_cache_row_start + kv_head * kQKHeadDim;
++
++#pragma unroll
++      for (int r = 0; r < kNumRoundsHalf; ++r) {
++        int i = r * kWarpSize + ilane;
++        if (i < kQKHeadDim / 2) {
++          k_dst[i] = QType(data[r * 2] * k_scale_inv);
++          k_dst[i + kQKHeadDim / 2] = QType(data[r * 2 + 1] * k_scale_inv);
++        }
++      }
++    }
++  }
++
++  // ========= Process V heads owned by this CTA (no RoPE, bf16→fp8) =========
++  {
++    float v_scale_inv = __frcp_rn(v_scale_ptr[0]);
++    using LoadDType = __nv_bfloat162;
++    using PackQType = __nv_fp8x4_e4m3;
++    constexpr int kItemPerThread = 16 / sizeof(DType);
++    static_assert(kVHeadDim % kItemPerThread == 0, "kVHeadDim must be divisible by kItemPerThread");
++    constexpr int kNumPackPerHead = kVHeadDim / kItemPerThread;
++    constexpr int kNumLoadRound = ceil_div<kNumPackPerHead, kWarpSize>();
++#pragma unroll
++    for (int dh = 0; dh < kKVPerCTA; ++dh) {
++      const int kv_head = kv_head_start + dh;
++      const DType* v_src =
++          qkv_row_global + (kNumQHeads + kNumKVHeads) * kQKHeadDim + kv_head * kVHeadDim;
++      QType* v_dst = (out_v_ptr != nullptr)
++                         ? out_v_ptr + irow * kNumKVHeads * kVHeadDim + kv_head * kVHeadDim
++                         : reinterpret_cast<QType*>(v_cache_row_start) + kv_head * kVHeadDim;
++#pragma unroll
++      for (int r = 0; r < kNumLoadRound; ++r) {
++        int ioffset = (r * kWarpSize + ilane) * kItemPerThread;
++        if (ioffset < kVHeadDim) {
++          auto vec_bf162 = load<LoadDType, kItemPerThread / 2>(v_src + ioffset);
++          auto vec_float = to<float>(vec_bf162);
++#pragma unroll
++          for (int i = 0; i < size(vec_float); i++) {
++            vec_float[i] = vec_float[i] * v_scale_inv;
++          }
++          store(v_dst + ioffset, to<PackQType>(vec_float));
++        }
++      }
++    }
++  }
++}
++
++}  // namespace kernels
++
++template <int kNumQHeads, int kNumKVHeads, int kQKHeadDim, int kVHeadDim>
++void launch_rope_norm_store_kv(__nv_bfloat16* out_q_ptr, __nv_bfloat16* kcache_ptr,
++                               __nv_bfloat16* vcache_ptr, __nv_bfloat16* out_k_ptr,
++                               __nv_bfloat16* out_v_ptr, const __nv_bfloat16* in_qkv_ptr,
++                               const float* cos_sin_ptr, const int* num_seqlen_per_req_ptr,
++                               const int* q_index_ptr, const int* kvcache_indices_ptr,
++                               const float* q_norm_weight_ptr, const float* k_norm_weight_ptr,
++                               int kcache_block_offset, int vcache_block_offset, int num_batch,
++                               int max_num_kv_block_per_batch, FastDivmod kv_block_size_divider,
++                               int num_rows, int qk_norm_policy, cudaStream_t stream) {
++  constexpr int kWarpsPerBlock = 4;
++  constexpr int kWarpSize = 32;
++
++  int num_compute_blocks = (num_rows + kWarpsPerBlock - 1) / kWarpsPerBlock;
++  int num_grid_x = num_compute_blocks + num_batch;
++
++  // Each blockIdx.y processes one KV head and its corresponding Q heads.
++  dim3 block(kWarpsPerBlock * kWarpSize);
++  dim3 grid(num_grid_x, kNumKVHeads);
++
++  auto launch = [&](auto norm_tag) {
++    constexpr int kNP = decltype(norm_tag)::value;
++    constexpr int kQPerKV = kNumQHeads / kNumKVHeads;
++    constexpr int kNumSmemElemPerRow = (kQPerKV + 1) * kQKHeadDim;
++    constexpr int kDynSmemBytes = kWarpsPerBlock * kNumSmemElemPerRow * sizeof(__nv_bfloat16);
++    auto* kernel = kernels::rope_norm_store_kv_kernel<kWarpsPerBlock, kNumQHeads, kNumKVHeads,
++                                                      kQKHeadDim, kVHeadDim, kNP>;
++    if constexpr (kDynSmemBytes > 48 * 1024) {
++      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kDynSmemBytes);
++    }
++    kernel<<<grid, block, kDynSmemBytes, stream>>>(
++        out_q_ptr, kcache_ptr, vcache_ptr, out_k_ptr, out_v_ptr, in_qkv_ptr, cos_sin_ptr,
++        num_seqlen_per_req_ptr, q_index_ptr, kvcache_indices_ptr, q_norm_weight_ptr,
++        k_norm_weight_ptr, kcache_block_offset, vcache_block_offset, num_batch,
++        max_num_kv_block_per_batch, kv_block_size_divider, num_rows, num_compute_blocks);
++  };
++
++  if (qk_norm_policy == 1) {
++    launch(std::integral_constant<int, 1>{});
++  } else if (qk_norm_policy == 2) {
++    launch(std::integral_constant<int, 2>{});
++  } else {
++    launch(std::integral_constant<int, 0>{});
++  }
++}
++
++void rope_norm_store_kv_async(__nv_bfloat16* out_q_ptr, __nv_bfloat16* kcache_ptr,
++                              __nv_bfloat16* vcache_ptr, __nv_bfloat16* out_k_ptr,
++                              __nv_bfloat16* out_v_ptr, const __nv_bfloat16* in_qkv_ptr,
++                              const float* cos_sin_ptr, const int* num_seqlen_per_req_ptr,
++                              const int* q_index_ptr, const int* kvcache_indices_ptr,
++                              const float* q_norm_weight_ptr, const float* k_norm_weight_ptr,
++                              int kcache_block_offset, int vcache_block_offset, int num_batch,
++                              int max_num_kv_block_per_batch, int kv_block_size, int num_rows,
++                              int num_q_heads, int num_kv_heads, int qk_head_dim, int v_head_dim,
++                              bool is_prefill, int qk_norm_policy, cudaStream_t stream) {
++  FastDivmod kv_block_size_divider(kv_block_size);
++
++  if (num_q_heads == 8 && num_kv_heads == 1 && qk_head_dim == 128 && v_head_dim == 128) {
++    launch_rope_norm_store_kv<8, 1, 128, 128>(
++        out_q_ptr, kcache_ptr, vcache_ptr, out_k_ptr, out_v_ptr, in_qkv_ptr, cos_sin_ptr,
++        num_seqlen_per_req_ptr, q_index_ptr, kvcache_indices_ptr, q_norm_weight_ptr,
++        k_norm_weight_ptr, kcache_block_offset, vcache_block_offset, num_batch,
++        max_num_kv_block_per_batch, kv_block_size_divider, num_rows, qk_norm_policy, stream);
++  } else if (num_q_heads == 64 && num_kv_heads == 8 && qk_head_dim == 128 && v_head_dim == 128) {
++    launch_rope_norm_store_kv<64, 8, 128, 128>(
++        out_q_ptr, kcache_ptr, vcache_ptr, out_k_ptr, out_v_ptr, in_qkv_ptr, cos_sin_ptr,
++        num_seqlen_per_req_ptr, q_index_ptr, kvcache_indices_ptr, q_norm_weight_ptr,
++        k_norm_weight_ptr, kcache_block_offset, vcache_block_offset, num_batch,
++        max_num_kv_block_per_batch, kv_block_size_divider, num_rows, qk_norm_policy, stream);
++  } else {
++    throw std::invalid_argument("rope_norm_store_kv_async: unsupported config, got: q_heads=" +
++                                std::to_string(num_q_heads) +
++                                ", kv_heads=" + std::to_string(num_kv_heads) +
++                                ", qk_head_dim=" + std::to_string(qk_head_dim) +
++                                ", v_head_dim=" + std::to_string(v_head_dim));
++  }
++}
++
++// Launch helper – dispatches kQuantPolicy + kNormPolicy at compile time
++template <int kNumQHeads, int kNumKVHeads, int kQKHeadDim, int kVHeadDim>
++void launch_rope_norm_store_kv_fp8(
++    __nv_fp8_e4m3* out_q_ptr, __nv_fp8_e4m3* kcache_ptr, __nv_fp8_e4m3* vcache_ptr,
++    __nv_fp8_e4m3* out_k_ptr, __nv_fp8_e4m3* out_v_ptr, int32_t* split_k_flag_ptr,
++    float* q_scale_ptr, const __nv_bfloat16* in_qkv_ptr, const float* cos_sin_ptr,
++    const int* num_seqlen_per_req_ptr, const int* q_index_ptr, const int* kvcache_indices_ptr,
++    const float* q_norm_weight_ptr, const float* k_norm_weight_ptr, const float* k_scale_ptr,
++    const float* v_scale_ptr, const float* q_scale_inv_ptr, float upper_max, int max_seqlen_aligned,
++    int kcache_block_offset, int vcache_block_offset, int num_batch, int max_num_kv_block_per_batch,
++    FastDivmod kv_block_size_divider, int num_rows, int qk_norm_policy, int quant_policy,
++    bool is_prefill, cudaStream_t stream) {
++  constexpr int kWarpsPerBlock = 4;
++  constexpr int kWarpSize = 32;
++
++  int num_compute_blocks = (num_rows + kWarpsPerBlock - 1) / kWarpsPerBlock;
++  int num_grid_x = num_compute_blocks + num_batch;
++
++  // Each blockIdx.y processes one KV head and its corresponding Q heads.
++  dim3 block(kWarpsPerBlock * kWarpSize);
++  dim3 grid(num_grid_x, kNumKVHeads);
++
++  auto launch = [&](auto quant_tag, auto norm_tag) {
++    constexpr int kQP = decltype(quant_tag)::value;
++    constexpr int kNP = decltype(norm_tag)::value;
++    constexpr int kQPerKV = kNumQHeads / kNumKVHeads;
++    constexpr int kNumSmemElemPerRow = (kQPerKV + 1) * kQKHeadDim;
++    constexpr int kDynSmemBytes = kWarpsPerBlock * kNumSmemElemPerRow * sizeof(__nv_bfloat16);
++    auto* kernel = kernels::rope_norm_store_kv_fp8_kernel<kQP, kWarpsPerBlock, kNumQHeads,
++                                                          kNumKVHeads, kQKHeadDim, kVHeadDim, kNP>;
++    if constexpr (kDynSmemBytes > 48 * 1024) {
++      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kDynSmemBytes);
++    }
++    kernel<<<grid, block, kDynSmemBytes, stream>>>(
++        out_q_ptr, kcache_ptr, vcache_ptr, out_k_ptr, out_v_ptr, split_k_flag_ptr, q_scale_ptr,
++        in_qkv_ptr, cos_sin_ptr, num_seqlen_per_req_ptr, q_index_ptr, kvcache_indices_ptr,
++        q_norm_weight_ptr, k_norm_weight_ptr, k_scale_ptr, v_scale_ptr, q_scale_inv_ptr, upper_max,
++        max_seqlen_aligned, kcache_block_offset, vcache_block_offset, num_batch,
++        max_num_kv_block_per_batch, kv_block_size_divider, num_rows, num_compute_blocks,
++        is_prefill);
++  };
++
++  auto dispatch_norm = [&](auto quant_tag) {
++    if (qk_norm_policy == 1) {
++      launch(quant_tag, std::integral_constant<int, 1>{});
++    } else if (qk_norm_policy == 2) {
++      launch(quant_tag, std::integral_constant<int, 2>{});
++    } else {
++      launch(quant_tag, std::integral_constant<int, 0>{});
++    }
++  };
++
++  if (quant_policy == 1) {
++    dispatch_norm(std::integral_constant<int, 1>{});
++  } else {
++    dispatch_norm(std::integral_constant<int, 2>{});
++  }
++}
++
++void rope_norm_store_kv_fp8_async(
++    __nv_fp8_e4m3* out_q_ptr, __nv_fp8_e4m3* kcache_ptr, __nv_fp8_e4m3* vcache_ptr,
++    __nv_fp8_e4m3* out_k_ptr, __nv_fp8_e4m3* out_v_ptr, int32_t* split_k_flag_ptr,
++    float* q_scale_ptr, const __nv_bfloat16* in_qkv_ptr, const float* cos_sin_ptr,
++    const int* num_seqlen_per_req_ptr, const int* q_index_ptr, const int* kvcache_indices_ptr,
++    const float* q_norm_weight_ptr, const float* k_norm_weight_ptr, const float* k_scale_ptr,
++    const float* v_scale_ptr, const float* q_scale_inv_ptr, float upper_max, int max_seqlens,
++    int kcache_block_offset, int vcache_block_offset, int num_batch, int max_num_kv_block_per_batch,
++    int kv_block_size, int num_rows, int num_q_heads, int num_kv_heads, int qk_head_dim,
++    int v_head_dim, bool is_prefill, int qk_norm_policy, int quant_policy, cudaStream_t stream) {
++  if (quant_policy == 1 && is_prefill) {
++    kernels::validate_dynamic_prefill_indptr_kernel<<<1, 256, 0, stream>>>(
++        q_index_ptr, num_batch, num_rows, max_seqlens, split_k_flag_ptr, num_kv_heads);
++  }
++
++  FastDivmod kv_block_size_divider(kv_block_size);
++  int max_seqlen_aligned = ((max_seqlens + 127) / 128) * 128;
++
++  if (num_q_heads == 8 && num_kv_heads == 1 && qk_head_dim == 128 && v_head_dim == 128) {
++    launch_rope_norm_store_kv_fp8<8, 1, 128, 128>(
++        out_q_ptr, kcache_ptr, vcache_ptr, out_k_ptr, out_v_ptr, split_k_flag_ptr, q_scale_ptr,
++        in_qkv_ptr, cos_sin_ptr, num_seqlen_per_req_ptr, q_index_ptr, kvcache_indices_ptr,
++        q_norm_weight_ptr, k_norm_weight_ptr, k_scale_ptr, v_scale_ptr, q_scale_inv_ptr, upper_max,
++        max_seqlen_aligned, kcache_block_offset, vcache_block_offset, num_batch,
++        max_num_kv_block_per_batch, kv_block_size_divider, num_rows, qk_norm_policy, quant_policy,
++        is_prefill, stream);
++  } else if (num_q_heads == 64 && num_kv_heads == 8 && qk_head_dim == 128 && v_head_dim == 128) {
++    launch_rope_norm_store_kv_fp8<64, 8, 128, 128>(
++        out_q_ptr, kcache_ptr, vcache_ptr, out_k_ptr, out_v_ptr, split_k_flag_ptr, q_scale_ptr,
++        in_qkv_ptr, cos_sin_ptr, num_seqlen_per_req_ptr, q_index_ptr, kvcache_indices_ptr,
++        q_norm_weight_ptr, k_norm_weight_ptr, k_scale_ptr, v_scale_ptr, q_scale_inv_ptr, upper_max,
++        max_seqlen_aligned, kcache_block_offset, vcache_block_offset, num_batch,
++        max_num_kv_block_per_batch, kv_block_size_divider, num_rows, qk_norm_policy, quant_policy,
++        is_prefill, stream);
++  } else {
++    throw std::invalid_argument("rope_norm_store_kv_fp8_async: unsupported config, got: q_heads=" +
++                                std::to_string(num_q_heads) +
++                                ", kv_heads=" + std::to_string(num_kv_heads) +
++                                ", qk_head_dim=" + std::to_string(qk_head_dim) +
++                                ", v_head_dim=" + std::to_string(v_head_dim));
++  }
++}
++
++}  // namespace rope
++}  // namespace hpc
+diff --git a/flashinfer/experimental/fused_qk_rope_append/csrc/hpc_rope_jit_binding.cu b/flashinfer/experimental/fused_qk_rope_append/csrc/hpc_rope_jit_binding.cu
+new file mode 100644
+index 00000000000..576a91ac088
+--- /dev/null
++++ b/flashinfer/experimental/fused_qk_rope_append/csrc/hpc_rope_jit_binding.cu
+@@ -0,0 +1,250 @@
++/*
++ * Copyright (c) 2026 by FlashInfer team.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ */
++
++#include <flashinfer/hpc_rope.h>
++
++#include <cmath>
++
++#include "tvm_ffi_utils.h"
++
++using tvm::ffi::Optional;
++
++namespace {
++
++void check_common(TensorView key_cache, TensorView value_cache, TensorView qkv, TensorView cos_sin,
++                  TensorView seq_lens, TensorView q_indptr, TensorView page_indices,
++                  int64_t qk_norm_policy) {
++  CHECK_INPUT(key_cache);
++  CHECK_INPUT(value_cache);
++  CHECK_INPUT_AND_TYPE(qkv, dl_bfloat16);
++  CHECK_INPUT_AND_TYPE(cos_sin, dl_float32);
++  CHECK_INPUT_AND_TYPE(seq_lens, dl_int32);
++  CHECK_INPUT_AND_TYPE(q_indptr, dl_int32);
++  CHECK_INPUT_AND_TYPE(page_indices, dl_int32);
++  CHECK_DIM(4, key_cache);
++  CHECK_DIM(4, value_cache);
++  CHECK_DIM(2, qkv);
++  CHECK_DIM(2, cos_sin);
++  CHECK_DIM(1, seq_lens);
++  CHECK_DIM(1, q_indptr);
++  CHECK_DIM(2, page_indices);
++  CHECK_DEVICE(value_cache, qkv);
++  CHECK_DEVICE(key_cache, qkv);
++  CHECK_DEVICE(cos_sin, qkv);
++  CHECK_DEVICE(seq_lens, qkv);
++  CHECK_DEVICE(q_indptr, qkv);
++  CHECK_DEVICE(page_indices, qkv);
++  TVM_FFI_ICHECK_GE(qk_norm_policy, 0);
++  TVM_FFI_ICHECK_LE(qk_norm_policy, 2);
++  TVM_FFI_ICHECK_EQ(q_indptr.size(0), seq_lens.size(0) + 1);
++  TVM_FFI_ICHECK_EQ(page_indices.size(0), seq_lens.size(0));
++  TVM_FFI_ICHECK_EQ(key_cache.size(0), value_cache.size(0));
++  TVM_FFI_ICHECK_EQ(key_cache.size(1), value_cache.size(1));
++  TVM_FFI_ICHECK_EQ(key_cache.size(2), value_cache.size(2));
++}
++
++void check_optional_weight(Optional<TensorView> value, TensorView like, int64_t head_dim,
++                           const char* name) {
++  if (!value.has_value()) return;
++  TensorView tensor = value.value();
++  CHECK_INPUT_AND_TYPE(tensor, dl_float32);
++  CHECK_DEVICE(tensor, like);
++  CHECK_DIM(1, tensor);
++  TVM_FFI_ICHECK_EQ(tensor.size(0), head_dim) << name;
++}
++
++template <typename T>
++T* optional_ptr(Optional<TensorView> value) {
++  return value.has_value() ? reinterpret_cast<T*>(value.value().data_ptr()) : nullptr;
++}
++
++void check_supported_shape(TensorView key_cache, TensorView value_cache, TensorView qkv) {
++  const int64_t kv_heads = key_cache.size(2);
++  const int64_t qk_dim = key_cache.size(3);
++  const int64_t v_dim = value_cache.size(3);
++  const int64_t q_heads = (qkv.size(1) - kv_heads * qk_dim - kv_heads * v_dim) / qk_dim;
++  TVM_FFI_ICHECK((q_heads == 8 && kv_heads == 1) || (q_heads == 64 && kv_heads == 8))
++      << "hpc fused RoPE supports (q_heads, kv_heads)=(8,1) or (64,8)";
++  TVM_FFI_ICHECK_EQ(qk_dim, 128);
++  TVM_FFI_ICHECK_EQ(v_dim, 128);
++  TVM_FFI_ICHECK_EQ(qkv.size(1), q_heads * qk_dim + kv_heads * qk_dim + kv_heads * v_dim);
++}
++
++void check_shape_3d(TensorView value, int64_t dim0, int64_t dim1, int64_t dim2, const char* name) {
++  TVM_FFI_ICHECK_EQ(value.ndim(), 3) << name << " must be 3D";
++  TVM_FFI_ICHECK_EQ(value.size(0), dim0) << name << " dimension 0 mismatch";
++  TVM_FFI_ICHECK_EQ(value.size(1), dim1) << name << " dimension 1 mismatch";
++  TVM_FFI_ICHECK_EQ(value.size(2), dim2) << name << " dimension 2 mismatch";
++}
++
++void check_shape_2d(TensorView value, int64_t dim0, int64_t dim1, const char* name) {
++  TVM_FFI_ICHECK_EQ(value.ndim(), 2) << name << " must be 2D";
++  TVM_FFI_ICHECK_EQ(value.size(0), dim0) << name << " dimension 0 mismatch";
++  TVM_FFI_ICHECK_EQ(value.size(1), dim1) << name << " dimension 1 mismatch";
++}
++
++}  // namespace
++
++void hpc_rope_norm_store_kv(TensorView out_q, TensorView key_cache, TensorView value_cache,
++                            TensorView qkv, TensorView cos_sin, TensorView seq_lens,
++                            TensorView q_indptr, TensorView page_indices, bool is_prefill,
++                            Optional<TensorView> q_norm_weight, Optional<TensorView> k_norm_weight,
++                            Optional<TensorView> out_k, Optional<TensorView> out_v,
++                            int64_t qk_norm_policy) {
++  check_common(key_cache, value_cache, qkv, cos_sin, seq_lens, q_indptr, page_indices,
++               qk_norm_policy);
++  CHECK_INPUT_AND_TYPE(out_q, dl_bfloat16);
++  CHECK_DEVICE(out_q, qkv);
++  TVM_FFI_ICHECK_EQ(key_cache.dtype(), dl_bfloat16);
++  TVM_FFI_ICHECK_EQ(value_cache.dtype(), dl_bfloat16);
++  check_supported_shape(key_cache, value_cache, qkv);
++  const int64_t num_rows = qkv.size(0);
++  const int64_t num_kv_heads = key_cache.size(2);
++  const int64_t head_dim = key_cache.size(3);
++  const int64_t num_q_heads =
++      (qkv.size(1) - num_kv_heads * (head_dim + value_cache.size(3))) / head_dim;
++  check_shape_3d(out_q, num_rows, num_q_heads, head_dim, "out_q");
++  TVM_FFI_ICHECK_EQ(cos_sin.size(1), head_dim)
++      << "cos_sin second dimension must equal the Q/K head dimension";
++  if (qk_norm_policy != 0) {
++    TVM_FFI_ICHECK(q_norm_weight.has_value() && k_norm_weight.has_value())
++        << "q_norm_weight and k_norm_weight are required when qk_norm_policy != 0";
++  }
++  check_optional_weight(q_norm_weight, qkv, key_cache.size(3), "q_norm_weight shape mismatch");
++  check_optional_weight(k_norm_weight, qkv, key_cache.size(3), "k_norm_weight shape mismatch");
++  if (out_k.has_value()) {
++    CHECK_INPUT_AND_TYPE(out_k.value(), dl_bfloat16);
++    CHECK_DEVICE(out_k.value(), qkv);
++    check_shape_3d(out_k.value(), num_rows, num_kv_heads, head_dim, "out_k");
++  }
++  if (out_v.has_value()) {
++    CHECK_INPUT_AND_TYPE(out_v.value(), dl_bfloat16);
++    CHECK_DEVICE(out_v.value(), qkv);
++    check_shape_3d(out_v.value(), num_rows, num_kv_heads, value_cache.size(3), "out_v");
++  }
++
++  ffi::CUDADeviceGuard device_guard(qkv.device().device_id);
++  hpc::rope::rope_norm_store_kv_async(
++      reinterpret_cast<__nv_bfloat16*>(out_q.data_ptr()),
++      reinterpret_cast<__nv_bfloat16*>(key_cache.data_ptr()),
++      reinterpret_cast<__nv_bfloat16*>(value_cache.data_ptr()), optional_ptr<__nv_bfloat16>(out_k),
++      optional_ptr<__nv_bfloat16>(out_v), reinterpret_cast<const __nv_bfloat16*>(qkv.data_ptr()),
++      static_cast<const float*>(cos_sin.data_ptr()), static_cast<const int*>(seq_lens.data_ptr()),
++      static_cast<const int*>(q_indptr.data_ptr()),
++      static_cast<const int*>(page_indices.data_ptr()), optional_ptr<float>(q_norm_weight),
++      optional_ptr<float>(k_norm_weight), static_cast<int>(key_cache.stride(0)),
++      static_cast<int>(value_cache.stride(0)), static_cast<int>(seq_lens.size(0)),
++      static_cast<int>(page_indices.size(1)), static_cast<int>(key_cache.size(1)),
++      static_cast<int>(qkv.size(0)), static_cast<int>(out_q.size(1)),
++      static_cast<int>(key_cache.size(2)), static_cast<int>(key_cache.size(3)),
++      static_cast<int>(value_cache.size(3)), is_prefill, static_cast<int>(qk_norm_policy),
++      get_stream(qkv.device()));
++  TVM_FFI_ICHECK_EQ(cudaGetLastError(), cudaSuccess);
++}
++
++void hpc_rope_norm_store_kv_fp8(TensorView out_q, TensorView q_scale, TensorView split_k_flag,
++                                TensorView key_cache, TensorView value_cache, TensorView qkv,
++                                TensorView cos_sin, TensorView seq_lens, TensorView q_indptr,
++                                TensorView page_indices, bool is_prefill, TensorView k_scale,
++                                TensorView v_scale, int64_t quant_policy, int64_t max_seqlen,
++                                double upper_max, Optional<TensorView> q_scale_inv,
++                                Optional<TensorView> q_norm_weight,
++                                Optional<TensorView> k_norm_weight, Optional<TensorView> out_k,
++                                Optional<TensorView> out_v, int64_t qk_norm_policy) {
++  check_common(key_cache, value_cache, qkv, cos_sin, seq_lens, q_indptr, page_indices,
++               qk_norm_policy);
++  CHECK_INPUT_AND_TYPE(out_q, dl_float8_e4m3fn);
++  CHECK_INPUT_AND_TYPE(q_scale, dl_float32);
++  CHECK_INPUT_AND_TYPE(split_k_flag, dl_int32);
++  CHECK_INPUT_AND_TYPE(k_scale, dl_float32);
++  CHECK_INPUT_AND_TYPE(v_scale, dl_float32);
++  CHECK_DEVICE(out_q, qkv);
++  CHECK_DEVICE(q_scale, qkv);
++  CHECK_DEVICE(split_k_flag, qkv);
++  CHECK_DEVICE(k_scale, qkv);
++  CHECK_DEVICE(v_scale, qkv);
++  TVM_FFI_ICHECK_EQ(key_cache.dtype(), dl_float8_e4m3fn);
++  TVM_FFI_ICHECK_EQ(value_cache.dtype(), dl_float8_e4m3fn);
++  TVM_FFI_ICHECK(quant_policy == 1 || quant_policy == 2);
++  TVM_FFI_ICHECK_EQ(k_scale.numel(), 1);
++  TVM_FFI_ICHECK_EQ(v_scale.numel(), 1);
++  check_supported_shape(key_cache, value_cache, qkv);
++  TVM_FFI_ICHECK(std::isfinite(upper_max) && upper_max > 0.0 && upper_max <= 448.0)
++      << "upper_max must be finite and in the interval (0, 448]";
++  const int64_t num_rows = qkv.size(0);
++  const int64_t num_requests = seq_lens.size(0);
++  const int64_t num_kv_heads = key_cache.size(2);
++  const int64_t head_dim = key_cache.size(3);
++  const int64_t num_q_heads =
++      (qkv.size(1) - num_kv_heads * (head_dim + value_cache.size(3))) / head_dim;
++  check_shape_3d(out_q, num_rows, num_q_heads, head_dim, "out_q");
++  check_shape_2d(split_k_flag, num_requests, num_kv_heads, "split_k_flag");
++  TVM_FFI_ICHECK_EQ(cos_sin.size(1), head_dim)
++      << "cos_sin second dimension must equal the Q/K head dimension";
++  if (quant_policy == 1) {
++    if (is_prefill) {
++      TVM_FFI_ICHECK_GT(max_seqlen, 0)
++          << "max_seqlen must be positive for dynamic prefill quantization";
++      TVM_FFI_ICHECK_GE(num_requests * max_seqlen, num_rows)
++          << "max_seqlen is too small for the packed Q row count";
++      const int64_t aligned_max_seqlen = (max_seqlen + 127) / 128 * 128;
++      check_shape_3d(q_scale, num_requests, num_q_heads, aligned_max_seqlen, "q_scale");
++    } else {
++      check_shape_2d(q_scale, num_rows, num_q_heads, "q_scale");
++    }
++  } else {
++    TVM_FFI_ICHECK_EQ(q_scale.numel(), 0) << "q_scale must be empty for static Q quantization";
++  }
++  if (qk_norm_policy != 0) {
++    TVM_FFI_ICHECK(q_norm_weight.has_value() && k_norm_weight.has_value());
++  }
++  if (quant_policy == 2) {
++    TVM_FFI_ICHECK(q_scale_inv.has_value()) << "q_scale_inv is required for static Q quantization";
++  }
++  check_optional_weight(q_norm_weight, qkv, key_cache.size(3), "q_norm_weight shape mismatch");
++  check_optional_weight(k_norm_weight, qkv, key_cache.size(3), "k_norm_weight shape mismatch");
++  if (q_scale_inv.has_value()) {
++    CHECK_INPUT_AND_TYPE(q_scale_inv.value(), dl_float32);
++    CHECK_DEVICE(q_scale_inv.value(), qkv);
++    TVM_FFI_ICHECK_EQ(q_scale_inv.value().numel(), 1);
++  }
++  if (out_k.has_value()) {
++    CHECK_INPUT_AND_TYPE(out_k.value(), dl_float8_e4m3fn);
++    CHECK_DEVICE(out_k.value(), qkv);
++    check_shape_3d(out_k.value(), num_rows, num_kv_heads, head_dim, "out_k");
++  }
++  if (out_v.has_value()) {
++    CHECK_INPUT_AND_TYPE(out_v.value(), dl_float8_e4m3fn);
++    CHECK_DEVICE(out_v.value(), qkv);
++    check_shape_3d(out_v.value(), num_rows, num_kv_heads, value_cache.size(3), "out_v");
++  }
++
++  ffi::CUDADeviceGuard device_guard(qkv.device().device_id);
++  hpc::rope::rope_norm_store_kv_fp8_async(
++      reinterpret_cast<__nv_fp8_e4m3*>(out_q.data_ptr()),
++      reinterpret_cast<__nv_fp8_e4m3*>(key_cache.data_ptr()),
++      reinterpret_cast<__nv_fp8_e4m3*>(value_cache.data_ptr()), optional_ptr<__nv_fp8_e4m3>(out_k),
++      optional_ptr<__nv_fp8_e4m3>(out_v), static_cast<int32_t*>(split_k_flag.data_ptr()),
++      q_scale.numel() ? static_cast<float*>(q_scale.data_ptr()) : nullptr,
++      reinterpret_cast<const __nv_bfloat16*>(qkv.data_ptr()),
++      static_cast<const float*>(cos_sin.data_ptr()), static_cast<const int*>(seq_lens.data_ptr()),
++      static_cast<const int*>(q_indptr.data_ptr()),
++      static_cast<const int*>(page_indices.data_ptr()), optional_ptr<float>(q_norm_weight),
++      optional_ptr<float>(k_norm_weight), static_cast<const float*>(k_scale.data_ptr()),
++      static_cast<const float*>(v_scale.data_ptr()), optional_ptr<float>(q_scale_inv),
++      static_cast<float>(upper_max), static_cast<int>(max_seqlen),
++      static_cast<int>(key_cache.stride(0)), static_cast<int>(value_cache.stride(0)),
++      static_cast<int>(seq_lens.size(0)), static_cast<int>(page_indices.size(1)),
++      static_cast<int>(key_cache.size(1)), static_cast<int>(qkv.size(0)),
++      static_cast<int>(out_q.size(1)), static_cast<int>(key_cache.size(2)),
++      static_cast<int>(key_cache.size(3)), static_cast<int>(value_cache.size(3)), is_prefill,
++      static_cast<int>(qk_norm_policy), static_cast<int>(quant_policy), get_stream(qkv.device()));
++  TVM_FFI_ICHECK_EQ(cudaGetLastError(), cudaSuccess);
++}
++
++TVM_FFI_DLL_EXPORT_TYPED_FUNC(hpc_rope_norm_store_kv, hpc_rope_norm_store_kv);
++TVM_FFI_DLL_EXPORT_TYPED_FUNC(hpc_rope_norm_store_kv_fp8, hpc_rope_norm_store_kv_fp8);
+diff --git a/flashinfer/experimental/fused_qk_rope_append/csrc/include/flashinfer/hpc_rope.h b/flashinfer/experimental/fused_qk_rope_append/csrc/include/flashinfer/hpc_rope.h
+new file mode 100644
+index 00000000000..3e8f625447b
+--- /dev/null
++++ b/flashinfer/experimental/fused_qk_rope_append/csrc/include/flashinfer/hpc_rope.h
+@@ -0,0 +1,41 @@
++// Copyright (C) 2026 Tencent.
++
++#ifndef FLASHINFER_HPC_ROPE_H_
++#define FLASHINFER_HPC_ROPE_H_
++
++#include <cuda_bf16.h>
++#include <cuda_fp8.h>
++#include <cuda_runtime_api.h>
++#include <stdint.h>
++
++#include <vector>
++
++namespace hpc {
++namespace rope {
++
++void rope_norm_store_kv_async(__nv_bfloat16* out_q_ptr, __nv_bfloat16* kcache_ptr,
++                              __nv_bfloat16* vcache_ptr, __nv_bfloat16* out_k_ptr,
++                              __nv_bfloat16* out_v_ptr, const __nv_bfloat16* in_qkv_ptr,
++                              const float* cos_sin_ptr, const int* num_seqlen_per_req_ptr,
++                              const int* q_index_ptr, const int* kvcache_indices_ptr,
++                              const float* q_norm_weight_ptr, const float* k_norm_weight_ptr,
++                              int kcache_block_offset, int vcache_block_offset, int num_batch,
++                              int max_num_kv_block_per_batch, int kv_block_size, int num_rows,
++                              int num_q_heads, int num_kv_heads, int qk_head_dim, int v_head_dim,
++                              bool is_prefill, int qk_norm_policy, cudaStream_t stream);
++
++void rope_norm_store_kv_fp8_async(
++    __nv_fp8_e4m3* out_q_ptr, __nv_fp8_e4m3* kcache_ptr, __nv_fp8_e4m3* vcache_ptr,
++    __nv_fp8_e4m3* out_k_ptr, __nv_fp8_e4m3* out_v_ptr, int32_t* split_k_flag_ptr,
++    float* q_scale_ptr, const __nv_bfloat16* in_qkv_ptr, const float* cos_sin_ptr,
++    const int* num_seqlen_per_req_ptr, const int* q_index_ptr, const int* kvcache_indices_ptr,
++    const float* q_norm_weight_ptr, const float* k_norm_weight_ptr, const float* k_scale_ptr,
++    const float* v_scale_ptr, const float* q_scale_inv_ptr, float upper_max, int max_seqlens,
++    int kcache_block_offset, int vcache_block_offset, int num_batch, int max_num_kv_block_per_batch,
++    int kv_block_size, int num_rows, int num_q_heads, int num_kv_heads, int qk_head_dim,
++    int v_head_dim, bool is_prefill, int qk_norm_policy, int quant_policy, cudaStream_t stream);
++
++}  // namespace rope
++}  // namespace hpc
++
++#endif  // FLASHINFER_HPC_ROPE_H_
+diff --git a/flashinfer/experimental/fused_qk_rope_append/csrc/include/flashinfer/hpc_utils.cuh b/flashinfer/experimental/fused_qk_rope_append/csrc/include/flashinfer/hpc_utils.cuh
+new file mode 100644
+index 00000000000..00fc8436604
+--- /dev/null
++++ b/flashinfer/experimental/fused_qk_rope_append/csrc/include/flashinfer/hpc_utils.cuh
+@@ -0,0 +1,724 @@
++// Copyright (C) 2026 Tencent.
++
++#ifndef FLASHINFER_HPC_UTILS_CUH_
++#define FLASHINFER_HPC_UTILS_CUH_
++
++#include <cuda.h>
++#include <cuda_bf16.h>
++#include <cuda_fp16.h>
++#include <cuda_fp8.h>
++
++namespace hpc {
++
++// ============================
++//    Debug Utility
++// ============================
++
++// print_type<T> _; // it will generate a compile time error with type T.
++template <typename T>
++struct print_type;
++
++__device__ __forceinline__ void brkpt() { asm volatile("brkpt;" ::); }
++
++// ============================
++//    Load/Store(vectorized)
++// ============================
++template <typename T, int N>
++struct vec_t {
++  T data[N];
++
++  using type = T;
++  static constexpr int num = N;
++  static constexpr int kNum = N;
++
++  __device__ __forceinline__ constexpr T& operator[](int idx) { return data[idx]; }
++
++  __device__ __forceinline__ constexpr const T& operator[](int idx) const { return data[idx]; }
++};
++
++template <typename T, int N, int... Dims>
++struct traits_vec_t;
++
++template <typename T, int N, int Dim>
++struct traits_vec_t<T, N, Dim> {
++  static_assert(N == Dim, "dimension mismatch");
++  using type = vec_t<T, Dim>;
++};
++
++template <typename T, int N, int First, int... Rest>
++struct traits_vec_t<T, N, First, Rest...> {
++  static_assert(N % First == 0, "first dimension must divide total size");
++  using inner_type = typename traits_vec_t<T, N / First, Rest...>::type;
++  using type = vec_t<inner_type, First>;
++};
++
++template <typename T, int N>
++__device__ __forceinline__ constexpr int size(vec_t<T, N>& v) {
++  return N;
++}
++
++template <int... Dims, typename T, int N>
++__device__ __forceinline__ constexpr auto& reshape(vec_t<T, N>& v) {
++  constexpr int num_elements = (Dims * ...);
++
++  using ResultType = typename traits_vec_t<T, N, Dims...>::type;
++  return *reinterpret_cast<ResultType*>(&v);
++}
++
++template <typename U, typename T, int N>
++__device__ __forceinline__ constexpr auto to(const vec_t<T, N>& v) {
++  if constexpr (std::is_same_v<T, float> && std::is_same_v<U, __nv_bfloat16>) {
++    using V = vec_t<__nv_bfloat16, N>;
++    V o;
++#pragma unroll
++    for (int i = 0; i < N; ++i) {
++      o[i] = __float2bfloat16(v[i]);
++    }
++    return o;
++  } else if constexpr (std::is_same_v<T, float> && std::is_same_v<U, __half2>) {
++    using V = vec_t<U, N / 2>;
++    V o;
++#pragma unroll
++    for (int i = 0; i < N / 2; ++i) {
++      o[i] = __float22half2_rn(*reinterpret_cast<const float2*>(&v[2 * i]));
++    }
++    return o;
++  } else if constexpr (std::is_same_v<T, __nv_bfloat16> && std::is_same_v<U, float>) {
++    using V = vec_t<float, N>;
++    V o;
++#pragma unroll
++    for (int i = 0; i < N; ++i) {
++      o[i] = __bfloat162float(v[i]);
++    }
++    return o;
++  } else if constexpr (std::is_same_v<T, __nv_bfloat162> && std::is_same_v<U, float>) {
++    using V = vec_t<float, N * 2>;
++    V o;
++#pragma unroll
++    for (int i = 0; i < N; ++i) {
++      auto y = __bfloat1622float2(v[i]);
++      o[i * 2 + 0] = y.x;
++      o[i * 2 + 1] = y.y;
++    }
++    return o;
++  } else if constexpr (std::is_same_v<T, __half2> && std::is_same_v<U, float>) {
++    using V = vec_t<float, N * 2>;
++    V o;
++#pragma unroll
++    for (int i = 0; i < N; ++i) {
++      auto y = __half22float2(v[i]);
++      o[i * 2 + 0] = y.x;
++      o[i * 2 + 1] = y.y;
++    }
++    return o;
++  } else if constexpr (std::is_same_v<T, float> && std::is_same_v<U, __nv_fp8x4_e4m3>) {
++    static_assert(N % 4 == 0, "N % 4 must be 0");
++    using V = vec_t<__nv_fp8x4_e4m3, N / 4>;
++    V o;
++#pragma unroll
++    for (int i = 0; i < N / 4; ++i) {
++      o[i] = __nv_fp8x4_e4m3(*reinterpret_cast<const float4*>(&v[4 * i]));
++    }
++    return o;
++  } else if constexpr (std::is_same_v<T, __nv_fp8x4_e4m3> && std::is_same_v<U, float>) {
++    using V = vec_t<float, N * 4>;
++    V o;
++#pragma unroll
++    for (int i = 0; i < N; ++i) {
++      auto y = static_cast<float4>(v[i]);
++      o[i * 4 + 0] = y.x;
++      o[i * 4 + 1] = y.y;
++      o[i * 4 + 2] = y.z;
++      o[i * 4 + 3] = y.w;
++    }
++    return o;
++  } else if constexpr (std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<U, float>) {
++    using V = vec_t<float, N>;
++    V o;
++#pragma unroll
++    for (int i = 0; i < N; ++i) {
++      o[i] = static_cast<float>(v[i]);
++    }
++    return o;
++  } else if constexpr (std::is_same_v<T, __nv_bfloat162> && std::is_same_v<U, __nv_fp8x4_e4m3>) {
++    static_assert(N % 2 == 0, "N % 2 must be 0");
++    using V = vec_t<__nv_fp8x4_e4m3, N / 2>;
++    V o;
++#pragma unroll
++    for (int i = 0; i < N / 2; ++i) {
++      o[i] = __nv_fp8x4_e4m3(*(reinterpret_cast<__nv_bfloat162*>(&v[2 * i])),
++                             *(reinterpret_cast<__nv_bfloat162*>(&v[2 * i + 1])));
++    }
++    return o;
++  } else if constexpr (std::is_same_v<T, float> && std::is_same_v<U, __nv_bfloat162>) {
++    static_assert(N % 2 == 0, "N % 2 must be 0");
++    using V = vec_t<__nv_bfloat162, N / 2>;
++    V o;
++#pragma unroll
++    for (int i = 0; i < N / 2; ++i) {
++      o[i] = __float22bfloat162_rn(*reinterpret_cast<const float2*>(&v[2 * i]));
++    }
++    return o;
++  } else if constexpr (std::is_same_v<T, U>) {
++    return v;
++  }
++}
++
++template <typename T, int N>
++__device__ __forceinline__ constexpr auto load(const void* ptr) {
++  using V = vec_t<T, N>;
++  V v;
++
++  constexpr int kBytes = sizeof(T) * N;
++
++  static_assert(kBytes == 1 || kBytes == 2 || kBytes == 4 || kBytes == 8 || kBytes == 16,
++                "not support for T x N");
++
++  if constexpr (kBytes == 1) {
++    using L = uint8_t;
++    *reinterpret_cast<L*>(&v) = *reinterpret_cast<const L*>(ptr);
++  } else if constexpr (kBytes == 2) {
++    using L = uint16_t;
++    *reinterpret_cast<L*>(&v) = *reinterpret_cast<const L*>(ptr);
++  } else if constexpr (kBytes == 4) {
++    using L = uint32_t;
++    *reinterpret_cast<L*>(&v) = *reinterpret_cast<const L*>(ptr);
++  } else if constexpr (kBytes == 8) {
++    using L = uint64_t;
++    *reinterpret_cast<L*>(&v) = *reinterpret_cast<const L*>(ptr);
++  } else if constexpr (kBytes == 16) {
++    using L = uint4;
++    *reinterpret_cast<L*>(&v) = *reinterpret_cast<const L*>(ptr);
++  }
++
++  return v;
++}
++
++template <typename T, int N>
++__device__ __forceinline__ constexpr void store(void* ptr, const vec_t<T, N>& v) {
++  using V = vec_t<T, N>;
++
++  constexpr int kBytes = sizeof(T) * N;
++
++  static_assert(kBytes == 1 || kBytes == 2 || kBytes == 4 || kBytes == 8 || kBytes == 16,
++                "not support for T x N");
++
++  if constexpr (kBytes == 1) {
++    using S = uint8_t;
++    *reinterpret_cast<S*>(ptr) = *reinterpret_cast<const S*>(&v);
++  } else if constexpr (kBytes == 2) {
++    using S = uint16_t;
++    *reinterpret_cast<S*>(ptr) = *reinterpret_cast<const S*>(&v);
++  } else if constexpr (kBytes == 4) {
++    using S = uint32_t;
++    *reinterpret_cast<S*>(ptr) = *reinterpret_cast<const S*>(&v);
++  } else if constexpr (kBytes == 8) {
++    using S = uint64_t;
++    *reinterpret_cast<S*>(ptr) = *reinterpret_cast<const S*>(&v);
++  } else if constexpr (kBytes == 16) {
++    using S = uint4;
++    *reinterpret_cast<S*>(ptr) = *reinterpret_cast<const S*>(&v);
++  }
++
++  return;
++}
++
++template <typename T, typename... Args>
++__device__ __forceinline__ constexpr void store(void* ptr, T val, Args... vals) {
++  constexpr int N = sizeof...(Args);
++  using V = vec_t<T, 1 + N>;
++
++  static_assert((std::is_same_v<Args, T> && ...), "all vals must be type of T");
++
++  V v;
++  int idx = 0;
++  (reinterpret_cast<T*>(&v))[idx++] = val;
++  (((reinterpret_cast<T*>(&v))[idx++] = vals), ...);
++
++  store(ptr, v);
++}
++
++// ============================
++//    Multimem Load/Store Ops
++// ============================
++
++template <typename T, int N>
++__device__ __forceinline__ auto multi_load_reduce_add(const void* ptr) {
++  if constexpr (std::is_same_v<T, __nv_bfloat162> && N == 4) {
++    using V = vec_t<T, N>;
++    V v;
++    auto* l = reinterpret_cast<uint4*>(&v);
++    asm volatile(
++        "multimem.ld_reduce.relaxed.sys.global.add.acc::f32.v4.bf16x2"
++        " {%0,%1,%2,%3}, [%4];"
++        : "=r"(l->x), "=r"(l->y), "=r"(l->z), "=r"(l->w)
++        : "l"(ptr)
++        : "memory");
++    return v;
++  }
++}
++
++template <typename T, int N>
++__device__ __forceinline__ void multi_store(void* mc_ptr, const vec_t<T, N>& v) {
++  constexpr int kBytes = sizeof(T) * N;
++  static_assert(kBytes == 8 || kBytes == 16, "not support for T x N");
++
++  if constexpr (kBytes == 8) {
++    const uint2* s = reinterpret_cast<const uint2*>(&v);
++    asm volatile("multimem.st.relaxed.sys.global.v2.f32 [%0], {%1,%2};"
++                 :
++                 : "l"(mc_ptr), "r"(s->x), "r"(s->y)
++                 : "memory");
++  } else if constexpr (kBytes == 16) {
++    const uint4* s = reinterpret_cast<const uint4*>(&v);
++    asm volatile("multimem.st.relaxed.sys.global.v4.f32 [%0], {%1,%2,%3,%4};"
++                 :
++                 : "l"(mc_ptr), "r"(s->x), "r"(s->y), "r"(s->z), "r"(s->w)
++                 : "memory");
++  }
++}
++
++// ============================
++//       Fast Math API
++// ============================
++
++__device__ __forceinline__ float expf_ftz(float x) {
++  // e^x = (2^m)^x
++  // e = 2^m
++  // m = lg2(e)
++  // m = 1.4426950408889634
++
++  const float m = 1.4426950408889634f;
++  float r;
++  asm volatile("ex2.approx.ftz.f32 %0, %1;\n" : "=f"(r) : "f"(x * m));
++  return r;
++}
++
++__device__ __forceinline__ float exp2f_ftz(float x) {
++  float r;
++  asm volatile("ex2.approx.ftz.f32 %0, %1;\n" : "=f"(r) : "f"(x));
++  return r;
++}
++
++__device__ __forceinline__ float log2f_ftz(float x) {
++  float r;
++  asm volatile("lg2.approx.ftz.f32 %0, %1;\n" : "=f"(r) : "f"(x));
++  return r;
++}
++
++__device__ __forceinline__ float logf_ftz(float x) {
++  // log(x) = lg2(x)log(2)
++  // m = log(2) = 0.6931471805599453
++
++  const float m = 0.6931471805599453f;
++  float r;
++  asm volatile("lg2.approx.ftz.f32 %0, %1;\n" : "=f"(r) : "f"(x));
++  return r * m;
++}
++
++__device__ __forceinline__ float rcpf_ftz(float x) {
++  float r;
++  asm volatile("rcp.approx.ftz.f32 %0, %1;\n" : "=f"(r) : "f"(x));
++  return r;
++}
++
++// y = 1 / (1 + e^(-x))
++__device__ __forceinline__ float sigmoid(float x) { return rcpf_ftz(1.f + expf_ftz(-x)); }
++__device__ __forceinline__ float sqrt_ftz(float x) {
++  float r;
++  asm volatile("sqrt.approx.ftz.f32 %0, %1;\n" : "=f"(r) : "f"(x));
++  return r;
++}
++
++// y = max(0, x)
++__device__ __forceinline__ float relu(float x) { return fmaxf(0, x); }
++
++// y = x / (1 + e^(-x))
++__device__ __forceinline__ float silu(float x) { return x * rcpf_ftz(1.f + expf_ftz(-x)); }
++
++// y = log(1 + exp(x))
++__device__ __forceinline__ float softplus(float x) { return logf_ftz(1.f + expf_ftz(x)); }
++
++__device__ __forceinline__ float rsqrtf_ftz(float in) {
++  float out;
++  asm volatile("rsqrt.approx.ftz.f32 %0, %1;\n" : "=f"(out) : "f"(in));
++  return out;
++}
++
++__device__ __forceinline__ float warp_reduce_sum_down(float x) {
++#pragma unroll
++  for (int ioffset = 16; ioffset >= 1; ioffset /= 2) {
++    x += __shfl_down_sync(0xFFFFFFFF, x, ioffset);
++  }
++
++  return x;
++}
++
++__device__ __forceinline__ float warp_reduce_max_down(float x) {
++#pragma unroll
++  for (int ioffset = 16; ioffset >= 1; ioffset /= 2) {
++    x = fmaxf(x, __shfl_down_sync(0xFFFFFFFF, x, ioffset));
++  }
++
++  return x;
++}
++
++__device__ __forceinline__ float half_warp_reduce_max_down(float x) {
++  const int width = 16;
++
++#pragma unroll
++  for (int ioffset = width / 2; ioffset >= 1; ioffset /= 2) {
++    x = fmaxf(x, __shfl_xor_sync(0xFFFFFFFF, x, ioffset, width));
++  }
++
++  return x;
++}
++
++__device__ __forceinline__ float warp_reduce_sum_xor(float x) {
++#pragma unroll
++  for (int ioffset = 16; ioffset >= 1; ioffset /= 2) {
++    x += __shfl_xor_sync(0xFFFFFFFF, x, ioffset);
++  }
++
++  return x;
++}
++
++__device__ __forceinline__ float warp_reduce_max_xor(float x) {
++#pragma unroll
++  for (int ioffset = 16; ioffset >= 1; ioffset /= 2) {
++    x = fmaxf(__shfl_xor_sync(0xFFFFFFFF, x, ioffset), x);
++  }
++
++  return x;
++}
++
++__device__ __forceinline__ float warp_4lane_reduce_max_xor(float x) {
++  x = fmaxf(__shfl_xor_sync(0xFFFFFFFF, x, 1), x);
++  x = fmaxf(__shfl_xor_sync(0xFFFFFFFF, x, 2), x);
++
++  return x;
++}
++
++__device__ __forceinline__ float warp_4lane_reduce_sum_xor(float x) {
++  x += __shfl_xor_sync(0xFFFFFFFF, x, 1);
++  x += __shfl_xor_sync(0xFFFFFFFF, x, 2);
++
++  return x;
++}
++
++__device__ __forceinline__ float warp_8lane_stride4_reduce_max_xor(float x) {
++  x = fmaxf(__shfl_xor_sync(0xFFFFFFFF, x, 4), x);
++  x = fmaxf(__shfl_xor_sync(0xFFFFFFFF, x, 8), x);
++  x = fmaxf(__shfl_xor_sync(0xFFFFFFFF, x, 16), x);
++
++  return x;
++}
++
++__device__ __forceinline__ float warp_8lane_stride4_reduce_sum_xor(float x) {
++  x += __shfl_xor_sync(0xFFFFFFFF, x, 4);
++  x += __shfl_xor_sync(0xFFFFFFFF, x, 8);
++  x += __shfl_xor_sync(0xFFFFFFFF, x, 16);
++
++  return x;
++}
++
++// ============================
++//      Attention Utility
++// ============================
++
++#if 0  // The fused RoPE port only needs the vector and warp helpers above.
++
++template <typename Tensor>
++__device__ __forceinline__ constexpr auto retile_fragment(Tensor &&tensor) {
++  using namespace cute;  // NOLINT
++
++  constexpr int R = decltype(tensor.layout())::rank;
++  static_assert(R >= 3, "rank must geater than or equal to 3");
++
++  auto thr_vmk = append<3>(flatten(select<0>(tensor.layout())));
++  auto tile_mk = take<1, R>(tensor.layout());
++
++  auto m_layout =
++      coalesce(make_layout(make_shape(get<1>(thr_vmk.shape()), get<0>(tile_mk.shape())),
++                           make_stride(get<1>(thr_vmk.stride()), get<0>(tile_mk.stride()))));
++  auto k_layout = coalesce(make_layout(
++      make_shape(get<0>(thr_vmk.shape()), get<2>(thr_vmk.shape()), get<1>(tile_mk.shape())),
++      make_stride(get<0>(thr_vmk.stride()), get<2>(thr_vmk.stride()), get<1>(tile_mk.stride()))));
++
++  if constexpr (R == Int<3>{}) {
++    return make_tensor(static_cast<Tensor &&>(tensor).data(), make_layout(m_layout, k_layout));
++  } else {
++    auto r_layout = take<3, R>(make_layout(tensor.shape(), tensor.stride()));
++    auto mkr_layout = make_layout(m_layout, k_layout, r_layout);
++    auto t = make_tensor(static_cast<Tensor &&>(tensor).data(), mkr_layout);
++    return t(_, _, repeat<R - Int<3>{}>(_));
++  }
++}
++
++// STensor shape is (M, N) and row major
++// Dtensor shape is (M, N) and column major
++template <typename STensor, typename DTensor>
++__device__ __forceinline__ constexpr void smem_trans_and_interleave0189_mn_mn(const STensor &sV,
++                                                                              DTensor &&sVt,
++                                                                              int ilane) {
++  using namespace cute;  // NOLINT
++  using T = typename STensor::value_type;
++  using Layout = typename STensor::layout_type;
++
++  static_assert(sizeof(T) == 1, "sV T must be 1 byte dtype");
++  static_assert(STensor::rank == 2, "sV rank support rank 2");
++  constexpr int kM = shape<0>(Layout{});
++  constexpr int kN = shape<1>(Layout{});
++
++  static_assert(((kM == 16) && (kN == 32)) || ((kM == 32) && (kN == 16)),
++                "sV shape must be 16x32 or 32x16");
++
++  auto tile = make_tile(Int<8>{}, Int<16>{});
++  auto vtile = make_tile(Int<16>{}, Int<16>{});
++  auto sV_tile = flat_divide(sV, tile);
++  auto sVt_tile = flat_divide(sVt, vtile);
++
++  auto m = size<2>(sV_tile);
++  auto n = size<3>(sV_tile);
++
++  auto mt = size<2>(sVt_tile);
++  auto nt = size<3>(sVt_tile);
++
++  auto s2r_tiled_copy =
++      make_tiled_copy(Copy_Atom<SM75_U16x8_LDSM_T, T>{},
++                      make_layout(make_shape(Int<4>{}, Int<8>{}, Int<1>{}, Int<1>{}),
++                                  make_stride(Int<1>{}, Int<4>{}, Int<0>{}, Int<0>{})),
++                      make_layout(make_shape(Int<2>{}, Int<2>{}, m, n),
++                                  make_stride(Int<2>{}, Int<1>{}, Int<4>{}, Int<4>{} * m)));
++
++  auto r2s_tiled_copy =
++      make_tiled_copy(Copy_Atom<SM90_U32x4_STSM_N, T>{},
++                      make_layout(make_shape(Int<4>{}, Int<8>{}, Int<1>{}, Int<1>{}),
++                                  make_stride(Int<1>{}, Int<4>{}, Int<0>{}, Int<0>{})),
++                      make_layout(make_shape(Int<4>{}, Int<2>{}, mt, nt),
++                                  make_stride(Int<1>{}, Int<4>{}, Int<8>{}, Int<8>{})));
++
++  auto s2r_thr_copy = s2r_tiled_copy.get_slice(ilane);
++  auto tVs4r = s2r_thr_copy.partition_S(sV_tile);
++  auto tVr4s = make_fragment_like(s2r_thr_copy.partition_D(sV_tile));
++  auto v = recast<uint32_t>(coalesce(tVr4s));
++
++  auto r2s_thr_copy = r2s_tiled_copy.get_slice(ilane);
++  auto tVtr4s = make_fragment_like(r2s_thr_copy.partition_S(sVt_tile));
++  auto tVts4r = r2s_thr_copy.partition_D(sVt_tile);
++  auto vt = recast<uint32_t>(coalesce(tVtr4s));
++
++  cute::copy(s2r_tiled_copy, tVs4r, tVr4s);
++
++  vt(0) = __byte_perm(v(0), v(1), 0x6420);
++  vt(1) = __byte_perm(v(0), v(1), 0x7531);
++
++  vt(2) = __byte_perm(v(2), v(3), 0x6420);
++  vt(3) = __byte_perm(v(2), v(3), 0x7531);
++
++  cute::copy(r2s_tiled_copy, tVtr4s, tVts4r);
++}
++
++template <typename STensor, typename DTensor>
++__device__ __forceinline__ constexpr void smem_trans_and_interleave0189_mn_nm(const STensor &sV,
++                                                                              DTensor &&sVtp,
++                                                                              int ilane) {
++  auto sVt = make_tensor(sVtp.data(), cute::select<1, 0>(sVtp.layout()));
++  smem_trans_and_interleave0189_mn_mn(sV, sVt, ilane);
++}
++
++template <typename STensor, typename DTensor>
++__device__ __forceinline__ constexpr void smem_trans_and_interleave0189_nm_nm(const STensor &sVp,
++                                                                              DTensor &&sVtp,
++                                                                              int ilane) {
++  auto sV = make_tensor(sVp.data(), cute::select<1, 0>(sVp.layout()));
++  auto sVt = make_tensor(sVtp.data(), cute::select<1, 0>(sVtp.layout()));
++  smem_trans_and_interleave0189_mn_mn(sV, sVt, ilane);
++}
++
++// ============================
++//    Atom CAS Primitives
++// ============================
++
++__device__ __forceinline__ int atom_cas_relaxed(uint32_t *addr, uint32_t compare, uint32_t value) {
++  uint32_t old_val;
++  asm volatile("atom.global.relaxed.sys.cas.b32 %0, [%1], %2, %3;"
++               : "=r"(old_val)
++               : "l"(addr), "r"(compare), "r"(value)
++               : "memory");
++  return old_val;
++}
++
++__device__ __forceinline__ int atom_cas_release(uint32_t *addr, uint32_t compare, uint32_t value) {
++  uint32_t old_val;
++  asm volatile("atom.global.release.sys.cas.b32 %0, [%1], %2, %3;"
++               : "=r"(old_val)
++               : "l"(addr), "r"(compare), "r"(value)
++               : "memory");
++  return old_val;
++}
++
++__device__ __forceinline__ int atom_cas_acquire(uint32_t *addr, uint32_t compare, uint32_t value) {
++  uint32_t old_val;
++  asm volatile("atom.global.acquire.sys.cas.b32 %0, [%1], %2, %3;"
++               : "=r"(old_val)
++               : "l"(addr), "r"(compare), "r"(value)
++               : "memory");
++  return old_val;
++}
++
++__device__ __forceinline__ void put_signal_relaxed(uint32_t *addr) {
++  while (atom_cas_relaxed(addr, 0, 1) != 0) {
++  }
++}
++
++__device__ __forceinline__ void put_signal_release(uint32_t *addr) {
++  while (atom_cas_release(addr, 0, 1) != 0) {
++  }
++}
++
++__device__ __forceinline__ void wait_signal_relaxed(uint32_t *addr) {
++  while (atom_cas_relaxed(addr, 1, 0) != 1) {
++  }
++}
++
++__device__ __forceinline__ void wait_signal_acquire(uint32_t *addr) {
++  while (atom_cas_acquire(addr, 1, 0) != 1) {
++  }
++}
++
++// ================================
++//    Memory-order-aware LD/ST Primitives
++// ================================
++
++__device__ int __forceinline__ load_global_volatile(int *ptr) {
++  int val;
++  asm volatile("ld.volatile.global.s32 {%0}, [%1];\n" : "=r"(val) : "l"(ptr));
++  return val;
++}
++
++// ================================
++//    Synchronization Primitives
++// ================================
++
++__device__ __forceinline__ void syncwarpgroup(int barrier_id) {
++  asm volatile("barrier.cta.sync %0, 128;\n" ::"r"(barrier_id) : "memory");
++}
++
++template <int N>
++__device__ __forceinline__ void bar_sync(int barrier_id) {
++  asm volatile("barrier.cta.sync %0, %1;\n" ::"r"(barrier_id), "n"(N) : "memory");
++}
++
++__device__ __forceinline__ void fence_async_global() {
++  asm volatile("fence.proxy.async.global;\n");
++}
++
++__device__ __forceinline__ void set_barrier_transaction_bytes_cluster(uint64_t &smem_bar,
++                                                                      uint32_t transaction_bytes,
++                                                                      uint32_t cta_id = 0) {
++  uint32_t smem_addr = cute::cast_smem_ptr_to_uint(&smem_bar);
++  asm volatile(
++      "{\n\t"
++      ".reg .b32 remAddr32;\n\t"
++      "mapa.shared::cluster.u32  remAddr32, %0, %1;\n\t"
++      "mbarrier.arrive.expect_tx.shared::cluster.b64  _, [remAddr32], %2;\n\t"
++      "}"
++      :
++      : "r"(smem_addr), "r"(cta_id), "r"(transaction_bytes));
++}
++
++__device__ __forceinline__ void arrive_cluster_barrier(uint64_t &smem_bar, uint32_t cta_id = 0) {
++  uint32_t smem_addr = cute::cast_smem_ptr_to_uint(&smem_bar);
++  asm volatile(
++      "{\n\t"
++      ".reg .b32 remAddr32;\n\t"
++      "mapa.shared::cluster.u32  remAddr32, %0, %1;\n\t"
++      "mbarrier.arrive.shared::cluster.b64  _, [remAddr32];\n\t"
++      "}"
++      :
++      : "r"(smem_addr), "r"(cta_id));
++}
++
++__device__ __forceinline__ void cluster_relaxed_sync() {
++  asm volatile("barrier.cluster.arrive.relaxed.aligned;\n" : :);
++  asm volatile("barrier.cluster.wait.aligned;\n" : :);
++}
++
++__device__ __forceinline__ uint32_t test_barrier(uint64_t &bar, int phase) {
++  uint32_t addr = cute::cast_smem_ptr_to_uint(&bar);
++  uint32_t ok;
++  asm volatile(
++      "{\n\t.reg .pred p;\n\t"
++      "mbarrier.test_wait.parity.shared::cta.b64 p, [%1], %2;\n\t"
++      "selp.u32 %0, 1, 0, p;\n\t"
++      "}\n"
++      : "=r"(ok)
++      : "r"(addr), "r"(phase));
++  return ok;
++}
++
++__device__ __forceinline__ void cp_async_16b(void *smem_dst, const void *gmem_src, int src_size) {
++  uint32_t smem_addr = cute::cast_smem_ptr_to_uint(smem_dst);
++  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(smem_addr), "l"(gmem_src),
++               "r"(src_size));
++}
++
++__device__ __forceinline__ void find_next_block(uint4 *clc_response, uint64_t *mbar) {
++  uint32_t mbar_ptr = cute::cast_smem_ptr_to_uint(reinterpret_cast<const void *>(mbar));
++  uint32_t clc_resp_ptr = cute::cast_smem_ptr_to_uint(reinterpret_cast<const void *>(clc_response));
++  asm volatile(
++      "{\n\t"
++      "clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.multicast::"
++      "cluster::all.b128 [%0], [%1];\n\t"
++      "}\n"
++      :
++      : "r"(clc_resp_ptr), "r"(mbar_ptr));
++}
++
++__device__ __forceinline__ auto get_next_block(uint4 *clc_response) {
++  uint32_t clc_resp_ptr = cute::cast_smem_ptr_to_uint(reinterpret_cast<const void *>(clc_response));
++  uint32_t iblock;
++  uint32_t valid;
++  asm volatile(
++      "{\n"
++      ".reg .pred p1;\n\t"
++      ".reg .b128 clc_result;\n\t"
++      "ld.shared.b128 clc_result, [%2];\n\t"
++      "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_result;\n\t"
++      "selp.u32 %1, 1, 0, p1;\n\t"
++      "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, clc_result;\n\t"
++      "fence.proxy.async.shared::cta;\n\t"
++      "}\n"
++      : "=r"(iblock), "=r"(valid)
++      : "r"(clc_resp_ptr)
++      : "memory");
++
++  return cute::make_tuple(iblock, valid);
++}
++
++#endif
++
++}  // namespace hpc
++
++#if 0
++namespace cute {
++
++template <class... Args, class ThrLayout, class ValLayout, class Tiler>
++CUTE_HOST_DEVICE auto make_tiled_copy(Copy_Atom<Args...> const &copy_atom,
++                                      ThrLayout const &thr_layout, ValLayout const &val_layout,
++                                      Tiler const &tiler) {
++  // Take the raked_products to compute the Layout_MN
++  // (M,N) -> (thr_idx, val_idx)
++  auto layout_mn = raked_product(thr_layout, val_layout);
++  // (thr_idx, val_idx) -> (M,N)
++  auto layout_tv =
++      right_inverse(layout_mn).with_shape(make_shape(size(thr_layout), size(val_layout)));
++
++  return make_tiled_copy_impl(copy_atom, layout_tv, tiler);
++}
++
++}  // namespace cute
++#endif
++
++#endif  // FLASHINFER_HPC_UTILS_CUH_
+diff --git a/flashinfer/experimental/fused_qk_rope_append/jit.py b/flashinfer/experimental/fused_qk_rope_append/jit.py
+new file mode 100644
+index 00000000000..4139e6cf2bd
+--- /dev/null
++++ b/flashinfer/experimental/fused_qk_rope_append/jit.py
+@@ -0,0 +1,44 @@
++"""JIT loader for fused QK RMSNorm/RoPE/paged-append kernels."""
++
++from __future__ import annotations
++
++import functools
++from pathlib import Path
++
++from ...jit import current_compilation_context
++from ...jit import env as jit_env
++from ...jit.core import JitSpec, gen_jit_spec
++
++
++def _flashinfer_csrc_path() -> Path:
++    if (jit_env.FLASHINFER_CSRC_DIR / "tvm_ffi_utils.h").is_file():
++        return jit_env.FLASHINFER_CSRC_DIR
++    checkout = Path(__file__).resolve().parents[3] / "csrc"
++    if (checkout / "tvm_ffi_utils.h").is_file():
++        return checkout
++    raise FileNotFoundError("FlashInfer TVM-FFI JIT headers were not found")
++
++
++@functools.cache
++def gen_fused_qk_rope_append_module() -> JitSpec:
++    source_dir = Path(__file__).resolve().parent / "csrc"
++    sources = [source_dir / "hpc_rope.cu", source_dir / "hpc_rope_jit_binding.cu"]
++    if not all(path.is_file() for path in sources):
++        raise FileNotFoundError("fused QK/RoPE CUDA sources were not found")
++    flags = current_compilation_context.get_nvcc_flags_list(
++        supported_major_versions=[9, 10]
++    )
++    return gen_jit_spec(
++        "fused_qk_rope_append",
++        sources,
++        extra_cuda_cflags=["-lineinfo", *flags],
++        extra_include_paths=[source_dir / "include", _flashinfer_csrc_path()],
++    )
++
++
++@functools.cache
++def load_fused_qk_rope_append_module():
++    return gen_fused_qk_rope_append_module().build_and_load()
++
++
++__all__ = ["gen_fused_qk_rope_append_module", "load_fused_qk_rope_append_module"]
+diff --git a/flashinfer/rope.py b/flashinfer/rope.py
+index 3e9f9526f38..8e184c3843f 100644
+--- a/flashinfer/rope.py
++++ b/flashinfer/rope.py
+@@ -19,7 +19,7 @@
+ 
+ import torch
+ 
+-from .api_logging import flashinfer_api
++from .api_logging import flashinfer_api, flashinfer_experimental_api
+ from .trace.templates.rope import (
+     apply_llama31_rope_inplace_trace,
+     apply_llama31_rope_pos_ids_inplace_trace,
+@@ -1790,3 +1790,108 @@ def rope_quantize_fp8_append_paged_kv_cache(
+     )
+ 
+     return q_rope_out, q_nope_out
++
++
++@flashinfer_experimental_api(feature="fused QK RMSNorm/RoPE/paged KV append")
++def fused_qk_rmsnorm_rope_append_paged_kv_cache(
++    qkv: torch.Tensor,
++    cos_sin_cache: torch.Tensor,
++    seq_lens: torch.Tensor,
++    q_indptr: torch.Tensor,
++    page_indices: torch.Tensor,
++    paged_kv_cache: Tuple[torch.Tensor, torch.Tensor],
++    is_prefill: bool,
++    q_norm_weight: Optional[torch.Tensor] = None,
++    k_norm_weight: Optional[torch.Tensor] = None,
++    qk_norm_policy: int = 0,
++    out_q: Optional[torch.Tensor] = None,
++    out_k: Optional[torch.Tensor] = None,
++    out_v: Optional[torch.Tensor] = None,
++) -> torch.Tensor:
++    r"""Fuse packed-QKV unpacking, Q/K RMSNorm, NeoX RoPE, and BF16 paged append.
++
++    ``qk_norm_policy`` is 0 (disabled), 1 (RoPE then RMSNorm), or 2
++    (RMSNorm then RoPE). The experimental backend supports head dimension 128,
++    NHD paged caches, and head geometries ``(Hq, Hkv)=(8,1)`` or ``(64,8)``.
++    """
++    from .experimental.fused_qk_rope_append import (
++        fused_qk_norm_rope_append_paged_kv_cache,
++    )
++
++    return fused_qk_norm_rope_append_paged_kv_cache(
++        qkv,
++        cos_sin_cache,
++        seq_lens,
++        q_indptr,
++        page_indices,
++        paged_kv_cache,
++        is_prefill,
++        q_norm_weight,
++        k_norm_weight,
++        qk_norm_policy,
++        out_q,
++        out_k,
++        out_v,
++    )
++
++
++@flashinfer_experimental_api(
++    feature="fused QK RMSNorm/RoPE/FP8 quantize paged KV append"
++)
++def fused_qk_rmsnorm_rope_quantize_fp8_append_paged_kv_cache(
++    qkv: torch.Tensor,
++    cos_sin_cache: torch.Tensor,
++    seq_lens: torch.Tensor,
++    q_indptr: torch.Tensor,
++    page_indices: torch.Tensor,
++    paged_kv_cache: Tuple[torch.Tensor, torch.Tensor],
++    is_prefill: bool,
++    k_scale: torch.Tensor,
++    v_scale: torch.Tensor,
++    quant_policy: int,
++    max_seqlen: int = 0,
++    upper_max: float = 448.0,
++    q_scale_inv: Optional[torch.Tensor] = None,
++    q_norm_weight: Optional[torch.Tensor] = None,
++    k_norm_weight: Optional[torch.Tensor] = None,
++    qk_norm_policy: int = 0,
++    out_q: Optional[torch.Tensor] = None,
++    out_k: Optional[torch.Tensor] = None,
++    out_v: Optional[torch.Tensor] = None,
++    q_scale: Optional[torch.Tensor] = None,
++    split_k_flag: Optional[torch.Tensor] = None,
++) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    r"""Fuse QK-Norm/RoPE, FP8 quantization, and paged K/V append.
++
++    ``quant_policy=1`` produces dynamic per-token/per-Q-head scales;
++    ``quant_policy=2`` consumes scalar ``q_scale_inv``. Malformed packed-row
++    metadata is reported asynchronously by filling ``split_k_flag`` with -1.
++    See the experimental backend README for the complete shape contract.
++    """
++    from .experimental.fused_qk_rope_append import (
++        fused_qk_norm_rope_quantize_fp8_append_paged_kv_cache,
++    )
++
++    return fused_qk_norm_rope_quantize_fp8_append_paged_kv_cache(
++        qkv,
++        cos_sin_cache,
++        seq_lens,
++        q_indptr,
++        page_indices,
++        paged_kv_cache,
++        is_prefill,
++        k_scale,
++        v_scale,
++        quant_policy,
++        max_seqlen,
++        upper_max,
++        q_scale_inv,
++        q_norm_weight,
++        k_norm_weight,
++        qk_norm_policy,
++        out_q,
++        out_k,
++        out_v,
++        q_scale,
++        split_k_flag,
++    )
+diff --git a/licenses/LICENSE.hpc-ops.txt b/licenses/LICENSE.hpc-ops.txt
+new file mode 100644
+index 00000000000..b614169b42c
+--- /dev/null
++++ b/licenses/LICENSE.hpc-ops.txt
+@@ -0,0 +1,24 @@
++Tencent is pleased to support the open source community by making hpc-ops available.
++
++Copyright (C) 2026 Tencent. All rights reserved.
++
++hpc-ops is licensed under MIT, except for third-party components which remain
++licensed under their respective original terms.
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in all
++copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++SOFTWARE.
+diff --git a/pyproject.toml b/pyproject.toml
+index 00d13c423dc..5a29ba39c8b 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -71,6 +71,7 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
+ 
+ [tool.setuptools.package-data]
+ "flashinfer.experimental.nvfp4_attention" = ["csrc/**"]
++"flashinfer.experimental.fused_qk_rope_append" = ["csrc/**"]
+ "flashinfer" = ["_build_meta.py"]
+ "flashinfer.prims_ts.moe" = ["prims_ts_moe_configs.json"]
+ # Capability surface of the NVFP4 MSA decode and prefill kernels, loaded at runtime via
+diff --git a/tests/experimental/test_fused_qk_rope_append.py b/tests/experimental/test_fused_qk_rope_append.py
+new file mode 100644
+index 00000000000..f316a336775
+--- /dev/null
++++ b/tests/experimental/test_fused_qk_rope_append.py
+@@ -0,0 +1,353 @@
++"""Correctness tests for experimental attention preprocessing ported from Tencent hpc-ops."""
++
++import pytest
++import torch
++
++import flashinfer
++
++
++def _requires_hpc_rope():
++    if not torch.cuda.is_available():
++        pytest.skip("hpc fused RoPE requires CUDA")
++    if torch.cuda.get_device_capability()[0] not in (9, 10):
++        pytest.skip("hpc fused RoPE supports SM90 and SM100 only")
++
++
++def _case(q_heads=8, kv_heads=1):
++    torch.manual_seed(3)
++    head_dim = page_size = 128
++    page_size = 4
++    q_indptr = torch.tensor([0, 3, 5], device="cuda", dtype=torch.int32)
++    seq_lens = torch.tensor([5, 4], device="cuda", dtype=torch.int32)
++    page_indices = torch.tensor([[0, 1], [2, 3]], device="cuda", dtype=torch.int32)
++    rows = int(q_indptr[-1])
++    width = (q_heads + 2 * kv_heads) * head_dim
++    qkv = torch.randn(rows, width, device="cuda", dtype=torch.bfloat16)
++    positions = torch.tensor([2, 3, 4, 2, 3], device="cuda", dtype=torch.long)
++    angles = torch.randn(16, head_dim // 2, device="cuda")
++    cos_sin = torch.cat([angles.cos(), angles.sin()], dim=1).float()
++    q_weight = torch.rand(head_dim, device="cuda") + 0.5
++    k_weight = torch.rand(head_dim, device="cuda") + 0.5
++    key_cache = torch.randn(
++        4,
++        page_size,
++        kv_heads,
++        head_dim,
++        device="cuda",
++        dtype=torch.bfloat16,
++    )
++    value_cache = torch.randn_like(key_cache)
++    return {
++        "qkv": qkv,
++        "cos_sin": cos_sin,
++        "seq_lens": seq_lens,
++        "q_indptr": q_indptr,
++        "page_indices": page_indices,
++        "positions": positions,
++        "q_weight": q_weight,
++        "k_weight": k_weight,
++        "key_cache": key_cache,
++        "value_cache": value_cache,
++        "q_heads": q_heads,
++        "kv_heads": kv_heads,
++        "head_dim": head_dim,
++        "page_size": page_size,
++    }
++
++
++def _rmsnorm(x, weight):
++    x = x.float()
++    return x * torch.rsqrt(x.square().mean(dim=-1, keepdim=True) + 1e-6) * weight
++
++
++def _rope(x, cos_sin, positions):
++    x = x.float()
++    half = x.shape[-1] // 2
++    cos = cos_sin[positions, :half]
++    sin = cos_sin[positions, half:]
++    while cos.ndim < x.ndim:
++        cos = cos.unsqueeze(1)
++        sin = sin.unsqueeze(1)
++    left, right = x[..., :half], x[..., half:]
++    return torch.cat([left * cos - right * sin, right * cos + left * sin], dim=-1)
++
++
++def _reference(case, policy):
++    qh, kvh, d = case["q_heads"], case["kv_heads"], case["head_dim"]
++    qkv = case["qkv"]
++    q = qkv[:, : qh * d].view(-1, qh, d)
++    k = qkv[:, qh * d : (qh + kvh) * d].view(-1, kvh, d)
++    v = qkv[:, (qh + kvh) * d :].view(-1, kvh, d)
++    if policy == 2:
++        q, k = _rmsnorm(q, case["q_weight"]), _rmsnorm(k, case["k_weight"])
++    q = _rope(q, case["cos_sin"], case["positions"])
++    k = _rope(k, case["cos_sin"], case["positions"])
++    if policy == 1:
++        q, k = _rmsnorm(q, case["q_weight"]), _rmsnorm(k, case["k_weight"])
++    return q, k, v
++
++
++def _assert_cache(case, key_cache, value_cache, key_ref, value_ref, *, fp8=False):
++    mapping = [(0, 2), (0, 3), (0, 4), (1, 2), (1, 3)]
++    for row, (batch, position) in enumerate(mapping):
++        page = int(case["page_indices"][batch, position // case["page_size"]])
++        offset = position % case["page_size"]
++        if fp8:
++            torch.testing.assert_close(
++                key_cache[page, offset].float(), key_ref[row], rtol=0.15, atol=0.03
++            )
++            torch.testing.assert_close(
++                value_cache[page, offset].float(),
++                value_ref[row],
++                rtol=0.15,
++                atol=0.03,
++            )
++        else:
++            torch.testing.assert_close(
++                key_cache[page, offset].float(), key_ref[row], rtol=0.02, atol=0.02
++            )
++            torch.testing.assert_close(
++                value_cache[page, offset].float(),
++                value_ref[row].float(),
++                rtol=0,
++                atol=0,
++            )
++
++
++@pytest.mark.parametrize("policy", [0, 1, 2])
++def test_fused_qk_norm_rope_append_bf16(policy):
++    _requires_hpc_rope()
++    case = _case()
++    out = flashinfer.rope.fused_qk_rmsnorm_rope_append_paged_kv_cache(
++        case["qkv"],
++        case["cos_sin"],
++        case["seq_lens"],
++        case["q_indptr"],
++        case["page_indices"],
++        (case["key_cache"], case["value_cache"]),
++        True,
++        case["q_weight"] if policy else None,
++        case["k_weight"] if policy else None,
++        policy,
++    )
++    q_ref, k_ref, v_ref = _reference(case, policy)
++    torch.cuda.synchronize()
++    torch.testing.assert_close(out.float(), q_ref, rtol=0.02, atol=0.02)
++    _assert_cache(case, case["key_cache"], case["value_cache"], k_ref, v_ref)
++    # The kernel clears unused rows in the final cache page for deterministic
++    # downstream loads.
++    assert (case["key_cache"][1, 1:] == 0).all()
++    assert (case["value_cache"][1, 1:] == 0).all()
++
++
++@pytest.mark.parametrize("quant_policy", [1, 2])
++def test_fused_qk_norm_rope_append_fp8(quant_policy):
++    _requires_hpc_rope()
++    case = _case()
++    key_cache = torch.empty_like(case["key_cache"], dtype=torch.float8_e4m3fn)
++    value_cache = torch.empty_like(key_cache)
++    k_scale = torch.tensor([0.02], device="cuda")
++    v_scale = torch.tensor([0.02], device="cuda")
++    q_static_scale = torch.tensor([0.02], device="cuda")
++    out, q_scale, flags = (
++        flashinfer.rope.fused_qk_rmsnorm_rope_quantize_fp8_append_paged_kv_cache(
++            case["qkv"],
++            case["cos_sin"],
++            case["seq_lens"],
++            case["q_indptr"],
++            case["page_indices"],
++            (key_cache, value_cache),
++            True,
++            k_scale,
++            v_scale,
++            quant_policy,
++            max_seqlen=3,
++            q_scale_inv=(1 / q_static_scale if quant_policy == 2 else None),
++            q_norm_weight=case["q_weight"],
++            k_norm_weight=case["k_weight"],
++            qk_norm_policy=2,
++        )
++    )
++    q_ref, k_ref, v_ref = _reference(case, 2)
++    if quant_policy == 1:
++        token_in_request = [0, 1, 2, 0, 1]
++        for row, (batch, token) in enumerate(
++            zip([0, 0, 0, 1, 1], token_in_request, strict=True)
++        ):
++            scale = q_scale[batch, :, token]
++            torch.testing.assert_close(
++                scale, q_ref[row].abs().amax(dim=-1) / 448, rtol=1e-5, atol=1e-6
++            )
++            torch.testing.assert_close(
++                out[row].float() * scale[:, None], q_ref[row], rtol=0.15, atol=0.03
++            )
++    else:
++        assert q_scale.numel() == 0
++        torch.testing.assert_close(
++            out.float() * q_static_scale, q_ref, rtol=0.15, atol=0.03
++        )
++    assert (flags == 0).all()
++    _assert_cache(
++        case,
++        key_cache,
++        value_cache,
++        k_ref / k_scale,
++        v_ref.float() / v_scale,
++        fp8=True,
++    )
++
++
++def test_fused_qk_norm_rope_64q_8kv_dispatch():
++    _requires_hpc_rope()
++    case = _case(q_heads=64, kv_heads=8)
++    out_k = torch.empty(5, 8, 128, device="cuda", dtype=torch.bfloat16)
++    out_v = torch.empty_like(out_k)
++    out = flashinfer.rope.fused_qk_rmsnorm_rope_append_paged_kv_cache(
++        case["qkv"],
++        case["cos_sin"],
++        case["seq_lens"],
++        case["q_indptr"],
++        case["page_indices"],
++        (case["key_cache"], case["value_cache"]),
++        True,
++        case["q_weight"],
++        case["k_weight"],
++        2,
++        out_k=out_k,
++        out_v=out_v,
++    )
++    q_ref, k_ref, v_ref = _reference(case, 2)
++    torch.cuda.synchronize()
++    torch.testing.assert_close(out.float(), q_ref, rtol=0.02, atol=0.02)
++    torch.testing.assert_close(out_k.float(), k_ref, rtol=0.02, atol=0.02)
++    torch.testing.assert_close(out_v.float(), v_ref.float(), rtol=0, atol=0)
++
++
++@pytest.mark.parametrize("upper_max", [0.0, -1.0, 448.01, float("inf"), float("nan")])
++def test_fused_qk_norm_rope_fp8_rejects_invalid_upper_max(upper_max):
++    _requires_hpc_rope()
++    case = _case()
++    key_cache = torch.empty_like(case["key_cache"], dtype=torch.float8_e4m3fn)
++    value_cache = torch.empty_like(key_cache)
++    scale = torch.tensor([0.02], device="cuda")
++    with pytest.raises(ValueError, match="upper_max"):
++        flashinfer.rope.fused_qk_rmsnorm_rope_quantize_fp8_append_paged_kv_cache(
++            case["qkv"],
++            case["cos_sin"],
++            case["seq_lens"],
++            case["q_indptr"],
++            case["page_indices"],
++            (key_cache, value_cache),
++            True,
++            scale,
++            scale,
++            1,
++            max_seqlen=3,
++            upper_max=upper_max,
++        )
++
++
++def test_fused_qk_norm_rope_rejects_misshapen_output_buffers():
++    _requires_hpc_rope()
++    case = _case()
++    bad_out_q = torch.empty(1, device="cuda", dtype=torch.bfloat16)
++    with pytest.raises(RuntimeError, match="out_q"):
++        flashinfer.rope.fused_qk_rmsnorm_rope_append_paged_kv_cache(
++            case["qkv"],
++            case["cos_sin"],
++            case["seq_lens"],
++            case["q_indptr"],
++            case["page_indices"],
++            (case["key_cache"], case["value_cache"]),
++            True,
++            out_q=bad_out_q,
++        )
++
++    key_cache = torch.empty_like(case["key_cache"], dtype=torch.float8_e4m3fn)
++    value_cache = torch.empty_like(key_cache)
++    scale = torch.tensor([0.02], device="cuda")
++    bad_q_scale = torch.empty(1, device="cuda", dtype=torch.float32)
++    with pytest.raises(RuntimeError, match="q_scale"):
++        flashinfer.rope.fused_qk_rmsnorm_rope_quantize_fp8_append_paged_kv_cache(
++            case["qkv"],
++            case["cos_sin"],
++            case["seq_lens"],
++            case["q_indptr"],
++            case["page_indices"],
++            (key_cache, value_cache),
++            True,
++            scale,
++            scale,
++            1,
++            max_seqlen=3,
++            q_scale=bad_q_scale,
++        )
++
++
++def test_fused_qk_norm_rope_fp8_zeroes_flags_for_empty_q_request():
++    _requires_hpc_rope()
++    case = _case()
++    qkv = case["qkv"][:1]
++    q_indptr = torch.tensor([0, 0, 1], device="cuda", dtype=torch.int32)
++    seq_lens = torch.tensor([4, 1], device="cuda", dtype=torch.int32)
++    key_cache = torch.empty_like(case["key_cache"], dtype=torch.float8_e4m3fn)
++    value_cache = torch.empty_like(key_cache)
++    scale = torch.tensor([0.02], device="cuda")
++    flags = torch.full((2, 1), 7, device="cuda", dtype=torch.int32)
++
++    _, _, actual_flags = (
++        flashinfer.rope.fused_qk_rmsnorm_rope_quantize_fp8_append_paged_kv_cache(
++            qkv,
++            case["cos_sin"],
++            seq_lens,
++            q_indptr,
++            case["page_indices"],
++            (key_cache, value_cache),
++            True,
++            scale,
++            scale,
++            1,
++            max_seqlen=1,
++            split_k_flag=flags,
++        )
++    )
++    torch.testing.assert_close(actual_flags, torch.zeros_like(actual_flags))
++
++
++def test_fused_qk_norm_rope_fp8_flags_per_request_max_seqlen_overflow():
++    """A long individual request must not silently omit its Q scale writes."""
++    _requires_hpc_rope()
++    case = _case()
++    # Total rows (5) still fit num_requests * max_seqlen (6), but request 0
++    # individually exceeds max_seqlen. This was the previously missed case.
++    q_indptr = torch.tensor([0, 4, 5], device="cuda", dtype=torch.int32)
++    key_cache = torch.zeros_like(case["key_cache"], dtype=torch.float8_e4m3fn)
++    value_cache = torch.zeros_like(key_cache)
++    scale = torch.tensor([0.02], device="cuda")
++    flags = torch.zeros((2, 1), device="cuda", dtype=torch.int32)
++    out_q = torch.zeros(
++        case["qkv"].shape[0], 8, 128, device="cuda", dtype=torch.float8_e4m3fn
++    )
++
++    actual_out, _, actual_flags = (
++        flashinfer.rope.fused_qk_rmsnorm_rope_quantize_fp8_append_paged_kv_cache(
++            case["qkv"],
++            case["cos_sin"],
++            case["seq_lens"],
++            q_indptr,
++            case["page_indices"],
++            (key_cache, value_cache),
++            True,
++            scale,
++            scale,
++            1,
++            max_seqlen=3,
++            split_k_flag=flags,
++            out_q=out_q,
++        )
++    )
++    torch.cuda.synchronize()
++    assert (actual_flags == -1).all()
++    assert (actual_out.float() == 0).all()
++    assert (key_cache.float() == 0).all()
++    assert (value_cache.float() == 0).all()

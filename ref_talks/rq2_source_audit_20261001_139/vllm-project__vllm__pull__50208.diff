@@ -1,0 +1,590 @@
+diff --git a/tests/v1/kv_connector/unit/test_mooncake_store_worker.py b/tests/v1/kv_connector/unit/test_mooncake_store_worker.py
+index 034297100a7a..b05f820b65a6 100644
+--- a/tests/v1/kv_connector/unit/test_mooncake_store_worker.py
++++ b/tests/v1/kv_connector/unit/test_mooncake_store_worker.py
+@@ -2221,7 +2221,9 @@ def _make_bare_worker(
+     # path; everything flows through the coordinator).
+     from vllm.v1.kv_cache_interface import (
+         FullAttentionSpec,
++        KVCacheConfig,
+         KVCacheGroupSpec,
++        KVCacheTensor,
+     )
+ 
+     worker.disk_offload_buffer_budget_bytes = None
+@@ -2236,6 +2238,16 @@ def _make_bare_worker(
+     )
+     group = KVCacheGroupSpec(["layer0", "__cross_layer__"], spec)
+     worker._kv_cache_groups = [group]
++    worker._kv_cache_config = KVCacheConfig(
++        num_blocks=num_gpu_blocks,
++        kv_cache_tensors=[
++            KVCacheTensor(
++                size=spec.page_size_bytes * num_gpu_blocks,
++                shared_by=["layer0"],
++            )
++        ],
++        kv_cache_groups=[group],
++    )
+     worker.pcp_size = 1
+     worker.dcp_size = 1
+     worker.hash_block_size = block_size
+@@ -2257,6 +2269,35 @@ def _make_bare_worker(
+     return worker
+ 
+ 
++def _configure_bare_worker_groups(
++    worker: mooncake_store_worker.MooncakeStoreWorker,
++    groups,
++    kv_cache_tensors,
++) -> None:
++    from vllm.v1.kv_cache_interface import KVCacheConfig
++
++    worker._kv_cache_groups = groups
++    worker._kv_cache_config = KVCacheConfig(
++        num_blocks=worker.cache_config.num_gpu_blocks,
++        kv_cache_tensors=kv_cache_tensors,
++        kv_cache_groups=groups,
++    )
++    worker.token_dbs = [
++        ChunkedTokenDatabase(
++            KeyMetadata("test-model", 0, 0, 0, 0, group_id=g_idx),
++            block_size=group.kv_cache_spec.block_size,
++            hash_block_size=worker.hash_block_size,
++        )
++        for g_idx, group in enumerate(groups)
++    ]
++    worker.coord = mooncake_store_worker.MooncakeStoreCoordinator(
++        groups,
++        scheduler_block_size=worker.block_size,
++        hash_block_size=worker.hash_block_size,
++    )
++    _refresh_group_tp_replication_factors(worker)
++
++
+ def test_lookup_key_prefixes_cover_dcp_rank_namespaces():
+     worker = _make_bare_worker()
+     worker.tp_size = 4
+@@ -2766,6 +2807,241 @@ def test_register_kv_caches_kv_first_two_segments():
+     assert db.block_len == [seg_stride // num_blocks] * 2
+ 
+ 
++def test_register_kv_caches_isolates_k3_shaped_groups():
++    """K3-shaped HMA layout: one storage per column, one layer per group in it.
++
++    The hybrid allocator emits ``group_size`` column tensors; column ``i`` is
++    shared by ``layer_names[i]`` of every group that reaches that slot, and an
++    uneven layer split leaves the last group short of the final column. Each
++    group must describe only the columns its own layers occupy, and only its
++    own spec's unpadded page bytes within them.
++    """
++    from vllm.v1.kv_cache_interface import (
++        KVCacheGroupSpec,
++        KVCacheTensor,
++        MambaSpec,
++        MLAAttentionSpec,
++    )
++
++    num_blocks = 8
++    worker = _make_bare_worker(num_gpu_blocks=num_blocks, block_size=1)
++    mla_spec = MLAAttentionSpec(
++        block_size=1,
++        num_kv_heads=1,
++        head_size=32,
++        dtype=torch.float16,
++    )
++    column_bytes = mla_spec.page_size_bytes
++    # Live KDA state per block: conv (4) + recurrent (8) fp16 elements = 24B,
++    # padded up to the 64B attention page the column is sized for.
++    kda_shapes = ((4,), (8,))
++    kda_spec = MambaSpec(
++        block_size=1,
++        shapes=kda_shapes,
++        dtypes=(torch.float16, torch.float16),
++        page_size_padded=column_bytes,
++    )
++    kda_state_bytes = sum(shape[0] * 2 for shape in kda_shapes)
++    groups = [
++        KVCacheGroupSpec(["mla.0", "mla.1", "mla.2"], mla_spec),
++        KVCacheGroupSpec(["kda_a.0", "kda_a.1", "kda_a.2"], kda_spec),
++        KVCacheGroupSpec(["kda_b.0", "kda_b.1", "kda_b.2"], kda_spec),
++        # 8 KDA layers over 3 groups: this one has no layer in column 2.
++        KVCacheGroupSpec(["kda_c.0", "kda_c.1"], kda_spec),
++    ]
++
++    columns = [
++        torch.zeros(num_blocks * column_bytes, dtype=torch.uint8) for _ in range(3)
++    ]
++    tensor_configs = [
++        KVCacheTensor(
++            size=column.untyped_storage().nbytes(),
++            shared_by=[
++                group.layer_names[col]
++                for group in groups
++                if col < len(group.layer_names)
++            ],
++        )
++        for col, column in enumerate(columns)
++    ]
++    _configure_bare_worker_groups(worker, groups, tensor_configs)
++
++    def _layer_view(layer_name: str, column: torch.Tensor):
++        elems = column.view(torch.float16)
++        if layer_name.startswith("mla"):
++            return elems.view(num_blocks, column_bytes // 2)
++        # Each state is a strided view over the front of the padded column
++        # page; the tail of the page is padding no layer reads.
++        offsets = [0, kda_shapes[0][0]]
++        return [
++            torch.as_strided(
++                elems,
++                size=(num_blocks, shape[0]),
++                stride=(column_bytes // 2, 1),
++                storage_offset=offset,
++            )
++            for shape, offset in zip(kda_shapes, offsets, strict=True)
++        ]
++
++    kv_caches: dict[str, torch.Tensor | list[torch.Tensor]] = {
++        layer_name: _layer_view(layer_name, column)
++        for config, column in zip(tensor_configs, columns, strict=True)
++        for layer_name in config.shared_by
++    }
++    _register_with_mocked_threads(worker, kv_caches)
++
++    bases = [column.untyped_storage().data_ptr() for column in columns]
++    assert [db.kv_caches_base_addr for db in worker.token_dbs] == [
++        bases,
++        bases,
++        bases,
++        bases[:2],
++    ]
++    assert [db.block_len for db in worker.token_dbs] == [
++        [column_bytes] * 3,
++        [kda_state_bytes] * 3,
++        [kda_state_bytes] * 3,
++        [kda_state_bytes] * 2,
++    ]
++    assert [db.block_stride for db in worker.token_dbs] == [
++        [column_bytes] * 3,
++        [column_bytes] * 3,
++        [column_bytes] * 3,
++        [column_bytes] * 2,
++    ]
++    # Pre-fix every group carried the union of all columns at full column
++    # width, storing the whole per-block footprint once per group.
++    assert [sum(db.block_len) for db in worker.token_dbs] == [
++        3 * column_bytes,
++        3 * kda_state_bytes,
++        3 * kda_state_bytes,
++        2 * kda_state_bytes,
++    ]
++
++    block_hash = BlockHash(b"same-hash")
++    assert len({db.key_for(block_hash) for db in worker.token_dbs}) == len(groups)
++    addrs, sizes = worker.token_dbs[3].prepare_value_for_block(5)
++    assert addrs == [base + 5 * column_bytes for base in bases[:2]]
++    assert sizes == [kda_state_bytes] * 2
++
++    registered_addrs = {
++        call.args[0] for call in worker.store.register_buffer.call_args_list
++    }
++    assert registered_addrs == set(bases)
++
++
++def test_register_kv_caches_uses_unpadded_length_and_physical_stride():
++    from vllm.v1.kv_cache_interface import (
++        KVCacheGroupSpec,
++        KVCacheTensor,
++        MLAAttentionSpec,
++    )
++
++    num_blocks = 10
++    physical_page_size = 16
++    transferred_page_size = 8
++    worker = _make_bare_worker(num_gpu_blocks=num_blocks, block_size=1)
++    spec = MLAAttentionSpec(
++        block_size=1,
++        num_kv_heads=1,
++        head_size=4,
++        dtype=torch.float16,
++        page_size_padded=physical_page_size,
++    )
++    group = KVCacheGroupSpec(["mla.0"], spec)
++    backing = torch.zeros(num_blocks * physical_page_size, dtype=torch.uint8)
++    view = torch.as_strided(
++        backing.view(torch.float16),
++        size=(num_blocks, transferred_page_size // 2),
++        stride=(physical_page_size // 2, 1),
++    )
++    _configure_bare_worker_groups(
++        worker,
++        [group],
++        [
++            KVCacheTensor(
++                size=backing.untyped_storage().nbytes(),
++                shared_by=["mla.0"],
++            )
++        ],
++    )
++
++    _register_with_mocked_threads(worker, {"mla.0": view})
++
++    db = worker.token_dbs[0]
++    assert db.block_len == [transferred_page_size]
++    assert db.block_stride == [physical_page_size]
++    addrs, sizes = db.prepare_value_for_block(3)
++    assert addrs == [backing.untyped_storage().data_ptr() + 3 * physical_page_size]
++    assert sizes == [transferred_page_size]
++    addrs, sizes, block_id = db.prepare_value(3, 4, [0, 1, 2, 3])
++    assert block_id == 3
++    assert addrs == [backing.untyped_storage().data_ptr() + 3 * physical_page_size]
++    assert sizes == [transferred_page_size]
++
++
++def test_register_kv_caches_isolates_packed_group_offsets():
++    from vllm.v1.kv_cache_interface import (
++        KVCacheGroupSpec,
++        KVCacheTensor,
++        MLAAttentionSpec,
++    )
++
++    num_blocks = 10
++    page_size = 8
++    block_stride = 2 * page_size
++    worker = _make_bare_worker(num_gpu_blocks=num_blocks, block_size=1)
++    spec = MLAAttentionSpec(
++        block_size=1,
++        num_kv_heads=1,
++        head_size=4,
++        dtype=torch.float16,
++    )
++    groups = [
++        KVCacheGroupSpec(["mla.0"], spec),
++        KVCacheGroupSpec(["mla.1"], spec),
++    ]
++    backing = torch.zeros(num_blocks * block_stride, dtype=torch.uint8)
++    views = [
++        torch.as_strided(
++            backing.view(torch.float16),
++            size=(num_blocks, page_size // 2),
++            stride=(block_stride // 2, 1),
++            storage_offset=offset // 2,
++        )
++        for offset in (0, page_size)
++    ]
++    tensor_configs = [
++        KVCacheTensor(
++            size=backing.untyped_storage().nbytes(),
++            shared_by=[f"mla.{g_idx}"],
++            offset=g_idx * page_size,
++            block_stride=block_stride,
++        )
++        for g_idx in range(2)
++    ]
++    _configure_bare_worker_groups(worker, groups, tensor_configs)
++
++    _register_with_mocked_threads(
++        worker,
++        {"mla.0": views[0], "mla.1": views[1]},
++    )
++
++    base_addr = backing.untyped_storage().data_ptr()
++    assert [db.kv_caches_base_addr for db in worker.token_dbs] == [
++        [base_addr],
++        [base_addr + page_size],
++    ]
++    assert [db.block_len for db in worker.token_dbs] == [[page_size], [page_size]]
++    assert [db.block_stride for db in worker.token_dbs] == [
++        [block_stride],
++        [block_stride],
++    ]
++    worker.store.register_buffer.assert_called_once_with(
++        base_addr, backing.untyped_storage().nbytes()
++    )
++
++
+ def test_register_kv_caches_cross_layer_single_segment():
+     """Cross-layer tensor: single segment with block_len = page_size * num_layers."""
+     num_blocks = 10
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py
+index 6daa1e82ea6d..800dd3c2779d 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py
+@@ -183,6 +183,7 @@ def __init__(
+             )
+         self.kv_caches_base_addr: list[int] = []
+         self.block_len: list[int] = []
++        self.block_stride: list[int] = []
+         self._key_prefix = PoolKey.build_prefix(metadata)
+ 
+     def key_for(self, chunk_hash: BlockHash) -> str:
+@@ -194,6 +195,18 @@ def set_kv_caches_base_addr(self, kv_caches_base_addr: list[int]):
+     def set_block_len(self, block_len: list[int]):
+         self.block_len = block_len
+ 
++    def set_block_stride(self, block_stride: list[int]):
++        self.block_stride = block_stride
++
++    def _region_strides(self) -> list[int]:
++        strides = self.block_stride or self.block_len
++        if not (len(self.kv_caches_base_addr) == len(self.block_len) == len(strides)):
++            raise ValueError(
++                "KV cache region metadata must have matching address, length, "
++                "and stride counts"
++            )
++        return strides
++
+     def prepare_value(
+         self, start: int, end: int, block_ids: list[int]
+     ) -> tuple[list[int], list[int], int]:
+@@ -220,11 +233,8 @@ def prepare_values(
+         if not chunks:
+             return [], [], []
+         base = np.asarray(self.kv_caches_base_addr, dtype=np.int64)
+-        length = len(self.block_len)
+-        blen = np.asarray(
+-            [self.block_len[i % length] for i in range(base.shape[0])],
+-            dtype=np.int64,
+-        )
++        blen = np.asarray(self.block_len, dtype=np.int64)
++        strides = np.asarray(self._region_strides(), dtype=np.int64)
+         n = len(chunks)
+         starts = np.fromiter((c[0] for c in chunks), dtype=np.int64, count=n)
+         spans = np.fromiter((c[1] for c in chunks), dtype=np.int64, count=n) - starts
+@@ -234,7 +244,7 @@ def prepare_values(
+             dtype=np.int64,
+             count=n,
+         )
+-        addrs = base[None, :] + bids[:, None] * blen[None, :]
++        addrs = base[None, :] + bids[:, None] * strides[None, :]
+         block_counts = (spans + self.block_size - 1) // self.block_size
+         sizes = blen[None, :] * block_counts[:, None]
+         return addrs.tolist(), sizes.tolist(), bids.tolist()
+@@ -243,11 +253,13 @@ def prepare_value_for_block(self, block_id: int) -> tuple[list[int], list[int]]:
+         """Return addresses and sizes for one physical block slot."""
+         addr_list = []
+         size_list = []
+-        length = len(self.block_len)
+-        for index, base_addr in enumerate(self.kv_caches_base_addr):
+-            addr = base_addr + block_id * self.block_len[index % length]
++        strides = self._region_strides()
++        for base_addr, block_len, block_stride in zip(
++            self.kv_caches_base_addr, self.block_len, strides, strict=True
++        ):
++            addr = base_addr + block_id * block_stride
+             addr_list.append(addr)
+-            size_list.append(self.block_len[index % length])
++            size_list.append(block_len)
+         return addr_list, size_list
+ 
+     def process_tokens(
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+index 762e5eba9263..f809eac14d57 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+@@ -65,6 +65,7 @@
+     resolve_kv_cache_block_sizes,
+ )
+ from vllm.v1.kv_cache_interface import (
++    AttentionSpec,
+     KVCacheConfig,
+     KVCacheGroupSpec,
+     KVCacheSpec,
+@@ -1521,9 +1522,6 @@ def _repr_tensor(v: torch.Tensor | list[torch.Tensor]) -> torch.Tensor:
+         self.num_blocks = self.cache_config.num_gpu_blocks
+ 
+         seen_ptrs: set[int] = set()
+-        addrs: list[int] = []
+-        block_lens: list[int] = []
+-
+         for value in kv_caches.values():
+             cache = _repr_tensor(value)
+             cache_storage = cache.untyped_storage()
+@@ -1542,36 +1540,171 @@ def _repr_tensor(v: torch.Tensor | list[torch.Tensor]) -> torch.Tensor:
+                     ret,
+                 )
+ 
++        tensor_config_by_layer = {
++            layer_name: tensor_config
++            for tensor_config in self._kv_cache_config.kv_cache_tensors
++            for layer_name in tensor_config.shared_by
++        }
++
++        def _layer_spec(group: KVCacheGroupSpec, layer_name: str) -> KVCacheSpec:
++            spec = group.kv_cache_spec
++            if isinstance(spec, UniformTypeKVCacheSpecs):
++                return spec.kv_cache_specs[layer_name]
++            return spec
++
++        def _unpadded_page_size(spec: KVCacheSpec) -> int:
++            if isinstance(spec, (AttentionSpec, MambaSpec)):
++                spec = dataclasses.replace(spec, page_size_padded=None)
++            return spec.page_size_bytes
++
++        def _regions_for_layer(
++            layer_name: str,
++            value: torch.Tensor | list[torch.Tensor],
++            group: KVCacheGroupSpec,
++        ) -> tuple[list[int], list[int], list[int]]:
++            cache = _repr_tensor(value)
++            cache_storage = cache.untyped_storage()
++            storage_base_addr = cache_storage.data_ptr()
++            tensor_config = tensor_config_by_layer.get(layer_name)
++            layer_spec = _layer_spec(group, layer_name)
++            unpadded_page_size = _unpadded_page_size(layer_spec)
++
++            if tensor_config is not None and tensor_config.block_stride > 0:
++                return (
++                    [storage_base_addr + tensor_config.offset],
++                    [unpadded_page_size],
++                    [tensor_config.block_stride],
++                )
++
++            region_len = cache_storage.nbytes()
++            page_stride_bytes = region_len // self.num_blocks
++            transfer_page_size = (
++                unpadded_page_size
++                if getattr(layer_spec, "page_size_padded", None) is not None
++                else page_stride_bytes
++            )
+             # Detect layout via stride: a dim whose byte-stride exceeds
+-            # page_size_bytes is an outer segment dim (e.g. the K/V dim of
++            # page_stride_bytes is an outer segment dim (e.g. the K/V dim of
+             # FlashAttn's (2, num_blocks, ...)). FlashInfer/MLA's blocks-
+             # outermost layout has no such dim and yields a single segment.
+             el = cache.element_size()
+-            page_size_bytes = region_len // self.num_blocks
+             outer_dims = [
+-                d for d in range(cache.ndim) if cache.stride(d) * el > page_size_bytes
++                d for d in range(cache.ndim) if cache.stride(d) * el > page_stride_bytes
+             ]
+             if not outer_dims:
+-                # Blocks-first layout (FlashInfer / MLA): one segment.
+-                addrs.append(base_addr)
+-                block_lens.append(page_size_bytes)
+-            else:
+-                # K/V-first layout (FlashAttn / ROCm): split segments.
+-                seg_stride = cache.stride(outer_dims[0]) * el
+-                for idx in range(cache.shape[outer_dims[0]]):
+-                    addrs.append(base_addr + idx * seg_stride)
+-                    block_lens.append(seg_stride // self.num_blocks)
++                return (
++                    [storage_base_addr],
++                    [transfer_page_size],
++                    [page_stride_bytes],
++                )
++
++            # K/V-first layout (FlashAttn / ROCm): split segments.
++            outer_dim = outer_dims[0]
++            num_segments = cache.shape[outer_dim]
++            seg_stride = cache.stride(outer_dim) * el
++            block_stride = seg_stride // self.num_blocks
++            if transfer_page_size != num_segments * block_stride:
++                raise ValueError(
++                    f"Layer {layer_name} has an unsupported segmented KV cache "
++                    f"layout: transfer page size {transfer_page_size}, "
++                    f"segments {num_segments}, block stride {block_stride}"
++                )
++            return (
++                [storage_base_addr + idx * seg_stride for idx in range(num_segments)],
++                [block_stride] * num_segments,
++                [block_stride] * num_segments,
++            )
++
++        addrs_per_group: list[list[int]] = []
++        block_lens_per_group: list[list[int]] = []
++        block_strides_per_group: list[list[int]] = []
++
++        if set(kv_caches) == {"__cross_layer__"}:
++            if len(self.token_dbs) != 1:
++                raise ValueError(
++                    "Cross-layer KV cache requires exactly one cache group"
++                )
++            cache = _repr_tensor(kv_caches["__cross_layer__"])
++            storage = cache.untyped_storage()
++            addrs_per_group.append([storage.data_ptr()])
++            block_lens_per_group.append([storage.nbytes() // self.num_blocks])
++            block_strides_per_group.append([storage.nbytes() // self.num_blocks])
++        else:
++            allocated_layers = set(tensor_config_by_layer)
++            for g_idx, group in enumerate(self._kv_cache_groups):
++                addrs: list[int] = []
++                block_lens: list[int] = []
++                block_strides: list[int] = []
++                seen_regions: set[tuple[int, int]] = set()
++                expected_layers = [
++                    layer_name
++                    for layer_name in group.layer_names
++                    if not allocated_layers or layer_name in allocated_layers
++                ]
++                missing_layers = [
++                    layer_name
++                    for layer_name in expected_layers
++                    if layer_name not in kv_caches
++                ]
++                if missing_layers:
++                    raise ValueError(
++                        f"KV cache group {g_idx} is missing tensors for layers "
++                        f"{missing_layers}"
++                    )
++
++                for layer_name in expected_layers:
++                    value = kv_caches[layer_name]
++                    cache = _repr_tensor(value)
++                    tensor_config = tensor_config_by_layer.get(layer_name)
++                    offset = (
++                        tensor_config.offset
++                        if tensor_config is not None and tensor_config.block_stride > 0
++                        else 0
++                    )
++                    region_key = (cache.untyped_storage().data_ptr(), offset)
++                    if region_key in seen_regions:
++                        continue
++                    seen_regions.add(region_key)
++                    layer_addrs, layer_lens, layer_strides = _regions_for_layer(
++                        layer_name, value, group
++                    )
++                    addrs.extend(layer_addrs)
++                    block_lens.extend(layer_lens)
++                    block_strides.extend(layer_strides)
++
++                if not addrs:
++                    raise ValueError(f"KV cache group {g_idx} has no cache regions")
++                addrs_per_group.append(addrs)
++                block_lens_per_group.append(block_lens)
++                block_strides_per_group.append(block_strides)
++
++        if not (
++            len(self.token_dbs)
++            == len(addrs_per_group)
++            == len(block_lens_per_group)
++            == len(block_strides_per_group)
++        ):
++            raise ValueError("KV cache group metadata count mismatch")
+ 
+         logger.info(
+-            "Registered KV caches: num_groups=%d, num_segments=%d, num_blocks=%d",
++            "Registered KV caches: num_groups=%d, segments_per_group=%s, "
++            "bytes_per_group=%s, num_blocks=%d",
+             len(self.token_dbs),
+-            len(addrs),
++            [len(addrs) for addrs in addrs_per_group],
++            [sum(block_lens) for block_lens in block_lens_per_group],
+             self.num_blocks,
+         )
+ 
+-        for db in self.token_dbs:
++        for db, addrs, block_lens, block_strides in zip(
++            self.token_dbs,
++            addrs_per_group,
++            block_lens_per_group,
++            block_strides_per_group,
++            strict=True,
++        ):
+             db.set_kv_caches_base_addr(addrs)
+             db.set_block_len(block_lens)
++            db.set_block_stride(block_strides)
+ 
+         # Start transfer threads
+         if self.kv_role in ["kv_producer", "kv_both"]:

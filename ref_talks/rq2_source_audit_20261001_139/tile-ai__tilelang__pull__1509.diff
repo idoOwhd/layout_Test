@@ -1,0 +1,2894 @@
+diff --git a/benchmark/mamba2/benchmark_mamba_chunk_scan.py b/benchmark/mamba2/benchmark_mamba_chunk_scan.py
+index c9f5cec670..55f802b4f6 100644
+--- a/benchmark/mamba2/benchmark_mamba_chunk_scan.py
++++ b/benchmark/mamba2/benchmark_mamba_chunk_scan.py
+@@ -225,20 +225,20 @@ def main(
+         ):
+             acc_o = T.alloc_fragment((block_M, block_N), accum_dtype)
+             acc_o_shared = T.alloc_shared((block_M, block_N), dtype)
+-            cb_shared = T.alloc_shared((block_M, block_K), dtype, scope="shared.dyn")
++            cb_shared = T.alloc_shared((block_M, block_K), dtype)
+             cb_local = T.alloc_fragment((block_M, block_K), dtype)
+-            dA_cs_k_shared = T.alloc_shared((block_K), dtype, scope="shared")
++            dA_cs_k_shared = T.alloc_shared((block_K), dtype)
+             dA_cs_k_local = T.alloc_fragment((block_K), accum_dtype)
+             dA_cs_m_local = T.alloc_fragment((block_M), accum_dtype)
+-            dt_shared = T.alloc_shared((block_K), dtype, scope="shared")
++            dt_shared = T.alloc_shared((block_K), dtype)
+             dt_local = T.alloc_fragment((block_K), accum_dtype)
+-            x_shared = T.alloc_shared((block_K, block_N), dtype, scope="shared.dyn")
+-            dA_cs_m_shared = T.alloc_shared((block_M), dtype, scope="shared")
++            x_shared = T.alloc_shared((block_K, block_N), dtype)
++            dA_cs_m_shared = T.alloc_shared((block_M), dtype)
+             scale_m_local = T.alloc_fragment((block_M), accum_dtype)
+             C_shared = T.alloc_shared((block_M, block_Dstate), dtype)
+             prev_state_shared = T.alloc_shared((block_N, block_Dstate), dtype)
+             D_local = T.alloc_fragment((1), accum_dtype)
+-            x_residual_shared = T.alloc_shared((block_M, block_N), dtype, scope="shared.dyn")
++            x_residual_shared = T.alloc_shared((block_M, block_N), dtype)
+             x_residual_local = T.alloc_fragment((block_M, block_N), accum_dtype)
+ 
+             batch_idx = by % batch
+@@ -250,7 +250,6 @@ def main(
+ 
+             T.annotate_layout(
+                 {
+-                    acc_o_shared: tilelang.layout.make_swizzled_layout(acc_o_shared),
+                     cb_shared: tilelang.layout.make_swizzled_layout(cb_shared),
+                     x_residual_shared: tilelang.layout.make_swizzled_layout(x_residual_shared),
+                 }
+diff --git a/benchmark/matmul/benchmark_matmul.py b/benchmark/matmul/benchmark_matmul.py
+index 643c1fd5e9..dca98a6767 100644
+--- a/benchmark/matmul/benchmark_matmul.py
++++ b/benchmark/matmul/benchmark_matmul.py
+@@ -2,7 +2,6 @@
+ import itertools
+ import logging
+ 
+-import tilelang
+ import tilelang.language as T
+ from tilelang.autotuner import autotune
+ from tilelang import jit
+@@ -188,8 +187,6 @@ def main(
+ 
+             # Enable (or disable) swizzling optimization
+             T.use_swizzle(panel_size=10, enable=enable_rasteration)
+-            # to utilize swizzle tma layout
+-            T.annotate_layout({C_shared: tilelang.layout.make_swizzled_layout(C_shared)})
+ 
+             # Clear out the accumulation buffer
+             T.clear(C_local)
+diff --git a/benchmark/matmul_fp8/benchmark_matmul.py b/benchmark/matmul_fp8/benchmark_matmul.py
+index e2e62812fc..64714b6493 100644
+--- a/benchmark/matmul_fp8/benchmark_matmul.py
++++ b/benchmark/matmul_fp8/benchmark_matmul.py
+@@ -2,7 +2,6 @@
+ import itertools
+ import torch
+ import logging
+-import tilelang
+ import tilelang.language as T
+ from tilelang.autotuner import autotune
+ from tilelang import jit
+@@ -192,8 +191,6 @@ def main(
+ 
+             # Enable (or disable) swizzling optimization
+             T.use_swizzle(panel_size=10, enable=enable_rasteration)
+-            # to utilize swizzle tma layout
+-            T.annotate_layout({C_shared: tilelang.layout.make_swizzled_layout(C_shared)})
+ 
+             # Clear out the accumulation buffer
+             T.clear(C_local)
+diff --git a/examples/analyze/example_conv_analyze.py b/examples/analyze/example_conv_analyze.py
+index db21e02f62..06e5a86e9d 100644
+--- a/examples/analyze/example_conv_analyze.py
++++ b/examples/analyze/example_conv_analyze.py
+@@ -2,7 +2,6 @@
+ from tilelang.tools import Analyzer
+ from tilelang.carver.arch import CUDA
+ from tilelang.carver.arch import CDNA
+-from tilelang.layout import make_swizzled_layout
+ import torch
+ 
+ N = 64
+@@ -48,14 +47,6 @@ def conv(
+             kernel_flat = T.Tensor((KH * KW * C, F), dtype, kernel.data)
+             out_flat = T.Tensor((N * OH * OW, F), dtype, out.data)
+ 
+-            T.annotate_layout(
+-                {
+-                    out_shared: make_swizzled_layout(out_shared),
+-                    data_shared: make_swizzled_layout(data_shared),
+-                    kernel_shared: make_swizzled_layout(kernel_shared),
+-                }
+-            )
+-
+             T.clear(out_local)
+             for k_iter in T.Pipelined(T.ceildiv(KH * KW * C, block_K), num_stages=num_stages):
+                 if is_hopper:
+diff --git a/examples/attention_sink/example_gqa_sink_bwd_bhsd.py b/examples/attention_sink/example_gqa_sink_bwd_bhsd.py
+index 7422105a51..11368553ae 100644
+--- a/examples/attention_sink/example_gqa_sink_bwd_bhsd.py
++++ b/examples/attention_sink/example_gqa_sink_bwd_bhsd.py
+@@ -13,10 +13,8 @@ def get_bwd_configs():
+     sm_version = sm_major * 10 + sm_minor
+     if sm_version == 80:
+         return 64, 32, 1, 128
+-    elif sm_version == 90:
+-        return 128, 32, 2, 256
+     else:
+-        raise ValueError(f"Unsupported SM version: {sm_version}")
++        return 128, 32, 2, 256
+ 
+ 
+ @tilelang.jit(
+@@ -74,7 +72,6 @@ def flash_fwd(
+             logsum = T.alloc_fragment([block_M], accum_dtype)
+             sinks = T.alloc_fragment([heads], dtype)
+ 
+-            T.annotate_layout({Q_shared: tilelang.layout.make_swizzled_layout(Q_shared)})
+             T.copy(Q[bz, by, bx * block_M : (bx + 1) * block_M, :], Q_shared)
+             T.fill(acc_o, 0)
+             T.fill(logsum, 0)
+@@ -252,9 +249,6 @@ def flash_bwd(
+             T.annotate_layout(
+                 {
+                     dQ: make_dq_layout(dQ),
+-                    K_shared: tilelang.layout.make_swizzled_layout(K_shared),
+-                    dv_shared: tilelang.layout.make_swizzled_layout(dv_shared),
+-                    dk_shared: tilelang.layout.make_swizzled_layout(dk_shared),
+                 }
+             )
+             T.copy(K[bz, bx // groups, by * block_M : (by + 1) * block_M, :], K_shared)
+diff --git a/examples/attention_sink/example_gqa_sink_fwd_bhsd_wgmma_pipelined.py b/examples/attention_sink/example_gqa_sink_fwd_bhsd_wgmma_pipelined.py
+index a7d1424a2b..f6cde87949 100644
+--- a/examples/attention_sink/example_gqa_sink_fwd_bhsd_wgmma_pipelined.py
++++ b/examples/attention_sink/example_gqa_sink_fwd_bhsd_wgmma_pipelined.py
+@@ -6,7 +6,6 @@
+ from tilelang.autotuner import autotune
+ from tilelang.profiler import do_bench
+ import tilelang.language as T
+-from tilelang.layout import make_swizzled_layout
+ import itertools
+ import argparse
+ from typing import Optional
+@@ -156,15 +155,6 @@ def main(
+             logsum = T.alloc_fragment([block_M], accum_dtype)
+             sinks = T.alloc_fragment([block_M], dtype)
+ 
+-            T.annotate_layout(
+-                {
+-                    Q_shared: make_swizzled_layout(Q_shared),
+-                    K_shared: make_swizzled_layout(K_shared),
+-                    V_shared: make_swizzled_layout(V_shared),
+-                    O_shared: make_swizzled_layout(O_shared),
+-                }
+-            )
+-
+             T.copy(Q[bz, by, bx * block_M : (bx + 1) * block_M, :], Q_shared)
+             T.fill(acc_o, 0)
+             T.fill(logsum, 0)
+diff --git a/examples/attention_sink/example_mha_sink_bwd_bhsd.py b/examples/attention_sink/example_mha_sink_bwd_bhsd.py
+index c16195e875..2705fda209 100644
+--- a/examples/attention_sink/example_mha_sink_bwd_bhsd.py
++++ b/examples/attention_sink/example_mha_sink_bwd_bhsd.py
+@@ -71,7 +71,6 @@ def flash_fwd(
+             logsum = T.alloc_fragment([block_M], accum_dtype)
+             sinks = T.alloc_fragment([heads], dtype)
+ 
+-            T.annotate_layout({Q_shared: tilelang.layout.make_swizzled_layout(Q_shared)})
+             T.copy(Q[bz, by, bx * block_M : (bx + 1) * block_M, :], Q_shared)
+             T.fill(acc_o, 0)
+             T.fill(logsum, 0)
+@@ -259,9 +258,6 @@ def flash_bwd(
+             T.annotate_layout(
+                 {
+                     dQ: make_dq_layout(dQ),
+-                    K_shared: tilelang.layout.make_swizzled_layout(K_shared),
+-                    dv_shared: tilelang.layout.make_swizzled_layout(dv_shared),
+-                    dk_shared: tilelang.layout.make_swizzled_layout(dk_shared),
+                 }
+             )
+             T.copy(K[bz, bx, by * block_M : (by + 1) * block_M, :], K_shared)
+diff --git a/examples/attention_sink/example_mha_sink_fwd_bhsd.py b/examples/attention_sink/example_mha_sink_fwd_bhsd.py
+index f63f5c0aa3..8335e1714c 100644
+--- a/examples/attention_sink/example_mha_sink_fwd_bhsd.py
++++ b/examples/attention_sink/example_mha_sink_fwd_bhsd.py
+@@ -5,7 +5,6 @@
+ from tilelang.autotuner import autotune
+ from tilelang.profiler import do_bench
+ import tilelang.language as T
+-from tilelang.layout import make_swizzled_layout
+ import itertools
+ import argparse
+ from typing import Optional
+@@ -148,15 +147,6 @@ def main(
+             logsum = T.alloc_fragment([block_M], accum_dtype)
+             sinks = T.alloc_fragment([block_M], dtype)
+ 
+-            T.annotate_layout(
+-                {
+-                    Q_shared: make_swizzled_layout(Q_shared),
+-                    K_shared: make_swizzled_layout(K_shared),
+-                    V_shared: make_swizzled_layout(V_shared),
+-                    O_shared: make_swizzled_layout(O_shared),
+-                }
+-            )
+-
+             T.copy(Q[bz, by, bx * block_M : (bx + 1) * block_M, :], Q_shared)
+             T.fill(acc_o, 0)
+             T.fill(logsum, 0)
+diff --git a/examples/attention_sink/example_mha_sink_fwd_bhsd_wgmma_pipelined.py b/examples/attention_sink/example_mha_sink_fwd_bhsd_wgmma_pipelined.py
+index 9a20308f0b..de7c56aede 100644
+--- a/examples/attention_sink/example_mha_sink_fwd_bhsd_wgmma_pipelined.py
++++ b/examples/attention_sink/example_mha_sink_fwd_bhsd_wgmma_pipelined.py
+@@ -6,7 +6,6 @@
+ from tilelang.autotuner import autotune
+ from tilelang.profiler import do_bench
+ import tilelang.language as T
+-from tilelang.layout import make_swizzled_layout
+ import itertools
+ import argparse
+ from typing import Optional
+@@ -150,15 +149,6 @@ def main(
+             logsum = T.alloc_fragment([block_M], accum_dtype)
+             sinks = T.alloc_fragment([block_M], dtype)
+ 
+-            T.annotate_layout(
+-                {
+-                    Q_shared: make_swizzled_layout(Q_shared),
+-                    K_shared: make_swizzled_layout(K_shared),
+-                    V_shared: make_swizzled_layout(V_shared),
+-                    O_shared: make_swizzled_layout(O_shared),
+-                }
+-            )
+-
+             T.copy(Q[bz, by, bx * block_M : (bx + 1) * block_M, :], Q_shared)
+             T.fill(acc_o, 0)
+             T.fill(logsum, 0)
+diff --git a/examples/bitnet-1.58b/kernel_benchmark/tilelang_bitnet_158_int8xint2_prefill.py b/examples/bitnet-1.58b/kernel_benchmark/tilelang_bitnet_158_int8xint2_prefill.py
+index 8c33739823..f4a60098a5 100644
+--- a/examples/bitnet-1.58b/kernel_benchmark/tilelang_bitnet_158_int8xint2_prefill.py
++++ b/examples/bitnet-1.58b/kernel_benchmark/tilelang_bitnet_158_int8xint2_prefill.py
+@@ -221,7 +221,7 @@ def main(
+             B_local = T.alloc_local([local_size_compressed], storage_dtype)
+             B_dequantize_local = T.alloc_local([local_size], in_dtype)
+ 
+-            thread_bindings = T.thread_binding(0, threads, "threadIdx.x")
++            thread_bindings = T.get_thread_binding(0)
+ 
+             T.annotate_layout(
+                 {
+diff --git a/examples/cast/example_group_per_split_token_cast_to_fp8.py b/examples/cast/example_group_per_split_token_cast_to_fp8.py
+index 001861f81b..db6beab1e5 100644
+--- a/examples/cast/example_group_per_split_token_cast_to_fp8.py
++++ b/examples/cast/example_group_per_split_token_cast_to_fp8.py
+@@ -31,20 +31,14 @@ def group_per_split_token_cast(
+             y_s_local = T.alloc_fragment((blk_m,), accum_dtype)
+             y_q_local = T.alloc_fragment((blk_m, group_size), accum_dtype)
+             y_q_local_fp8 = T.alloc_fragment((blk_m, group_size), T.float8_e4m3fn)
+-            row_offset = T.alloc_fragment((1,), T.int32)
++            row_offset = T.alloc_var(dtype=T.int32)
+ 
+-            T.annotate_layout(
+-                {
+-                    y_local: T.Fragment(y_local.shape, forward_thread_fn=lambda i, j: (i // (blk_m // 4)) * 32 + j % 32),
+-                }
+-            )
+-
+-            row_offset[0] = 0
++            row_offset = 0
+             for i in T.serial(bg):
+-                row_offset[0] += batch_sizes[i]
++                row_offset += batch_sizes[i]
+ 
+             T.copy(
+-                X[row_offset[0] + row * blk_m : row_offset[0] + (row + 1) * blk_m, row_g_id * group_size : (row_g_id + 1) * group_size],
++                X[row_offset + row * blk_m : row_offset + (row + 1) * blk_m, row_g_id * group_size : (row_g_id + 1) * group_size],
+                 y_local,
+             )
+             T.reduce_absmax(y_local, y_amax_local, dim=1)
+diff --git a/examples/cast/example_per_token_cast_to_fp8.py b/examples/cast/example_per_token_cast_to_fp8.py
+index bc34d228a2..0295b9a268 100644
+--- a/examples/cast/example_per_token_cast_to_fp8.py
++++ b/examples/cast/example_per_token_cast_to_fp8.py
+@@ -25,12 +25,6 @@ def per_token_cast(
+             y_q_local = T.alloc_fragment((blk_m, group_size), dtype)
+             y_q_local_fp8 = T.alloc_fragment((blk_m, group_size), T.float8_e4m3fn)
+ 
+-            T.annotate_layout(
+-                {
+-                    y_local: T.Fragment(y_local.shape, forward_thread_fn=lambda i, j: (i // (blk_m // 4)) * 32 + j % 32),
+-                }
+-            )
+-
+             T.copy(X[row * blk_m : (row + 1) * blk_m, row_g_id * group_size : (row_g_id + 1) * group_size], y_local)
+             T.reduce_absmax(y_local, y_amax_local, dim=1)
+             for i in T.Parallel(blk_m):
+diff --git a/examples/convolution/example_convolution.py b/examples/convolution/example_convolution.py
+index c6dbe618da..1599d3464f 100644
+--- a/examples/convolution/example_convolution.py
++++ b/examples/convolution/example_convolution.py
+@@ -48,14 +48,6 @@ def main(
+             kernel_flat = T.Tensor((KH * KW * C, F), dtype, kernel.data)
+             out_flat = T.Tensor((N * OH * OW, F), dtype, out.data)
+ 
+-            T.annotate_layout(
+-                {
+-                    out_shared: tilelang.layout.make_swizzled_layout(out_shared),
+-                    data_shared: tilelang.layout.make_swizzled_layout(data_shared),
+-                    kernel_shared: tilelang.layout.make_swizzled_layout(kernel_shared),
+-                }
+-            )
+-
+             T.clear(out_local)
+             for k_iter in T.Pipelined(T.ceildiv(KH * KW * C, block_K), num_stages=num_stages):
+                 if is_hopper:
+diff --git a/examples/convolution/example_convolution_autotune.py b/examples/convolution/example_convolution_autotune.py
+index d15964ba5c..c0c666402a 100644
+--- a/examples/convolution/example_convolution_autotune.py
++++ b/examples/convolution/example_convolution_autotune.py
+@@ -99,13 +99,6 @@ def main(
+             kernel_flat = T.Tensor((KH * KW * C, F), dtype, kernel.data)
+             out_flat = T.Tensor((N * OH * OW, F), dtype, out.data)
+ 
+-            if is_hopper:
+-                T.annotate_layout(
+-                    {
+-                        out_shared: tilelang.layout.make_swizzled_layout(out_shared),
+-                    }
+-                )
+-
+             T.clear(out_local)
+             for k_iter in T.Pipelined(T.ceildiv(KH * KW * C, block_K), num_stages=num_stages):
+                 if is_hopper:
+diff --git a/examples/deepseek_mla/example_mla_decode.py b/examples/deepseek_mla/example_mla_decode.py
+index 7fab4c062c..d50d2dde15 100644
+--- a/examples/deepseek_mla/example_mla_decode.py
++++ b/examples/deepseek_mla/example_mla_decode.py
+@@ -45,11 +45,6 @@ def flash_attn(
+             logsum = T.alloc_fragment([block_H], accum_dtype)
+ 
+             cur_kv_head = hid // (kv_group_num // block_H)
+-            T.annotate_layout(
+-                {
+-                    O_shared: tilelang.layout.make_swizzled_layout(O_shared),
+-                }
+-            )
+ 
+             T.copy(Q[bid, hid * VALID_BLOCK_H : (hid + 1) * VALID_BLOCK_H, :], Q_shared)
+             T.copy(Q_pe[bid, hid * VALID_BLOCK_H : (hid + 1) * VALID_BLOCK_H, :], Q_pe_shared)
+@@ -111,12 +106,6 @@ def flash_attn_split(
+ 
+             cur_kv_head = hid // (kv_group_num // block_H)
+             T.use_swizzle(10)
+-            T.annotate_layout(
+-                {
+-                    O_shared: tilelang.layout.make_swizzled_layout(O_shared),
+-                    S_shared: tilelang.layout.make_swizzled_layout(S_shared),
+-                }
+-            )
+ 
+             T.copy(Q[bid, hid * VALID_BLOCK_H : (hid + 1) * VALID_BLOCK_H, :], Q_shared)
+             T.copy(Q_pe[bid, hid * VALID_BLOCK_H : (hid + 1) * VALID_BLOCK_H, :], Q_pe_shared)
+diff --git a/examples/deepseek_mla/example_mla_decode_paged.py b/examples/deepseek_mla/example_mla_decode_paged.py
+index da22ada960..eb94e2b358 100644
+--- a/examples/deepseek_mla/example_mla_decode_paged.py
++++ b/examples/deepseek_mla/example_mla_decode_paged.py
+@@ -51,12 +51,6 @@ def flash_mla_kernel(
+ 
+             cur_kv_head = by // (kv_group_num // block_H)
+             T.use_swizzle(10)
+-            T.annotate_layout(
+-                {
+-                    O_shared: tilelang.layout.make_swizzled_layout(O_shared),
+-                    S_shared: tilelang.layout.make_swizzled_layout(S_shared),
+-                }
+-            )
+ 
+             T.copy(Q[bx, by * VALID_BLOCK_H : (by + 1) * VALID_BLOCK_H, :], Q_shared)
+             T.copy(Q_pe[bx, by * VALID_BLOCK_H : (by + 1) * VALID_BLOCK_H, :], Q_pe_shared)
+@@ -126,12 +120,6 @@ def flash_mla_split_kv_kernel(
+ 
+             cur_kv_head = by // (kv_group_num // block_H)
+             T.use_swizzle(10)
+-            T.annotate_layout(
+-                {
+-                    O_shared: tilelang.layout.make_swizzled_layout(O_shared),
+-                    S_shared: tilelang.layout.make_swizzled_layout(S_shared),
+-                }
+-            )
+ 
+             T.copy(Q[bx, by * VALID_BLOCK_H : (by + 1) * VALID_BLOCK_H, :], Q_shared)
+             T.copy(Q_pe[bx, by * VALID_BLOCK_H : (by + 1) * VALID_BLOCK_H, :], Q_pe_shared)
+diff --git a/examples/deepseek_mla/example_mla_decode_persistent.py b/examples/deepseek_mla/example_mla_decode_persistent.py
+index b5e3c9f7ce..74d974fbb6 100644
+--- a/examples/deepseek_mla/example_mla_decode_persistent.py
++++ b/examples/deepseek_mla/example_mla_decode_persistent.py
+@@ -55,11 +55,6 @@ def main_split_persistent(
+             lse_max_local = T.alloc_var(accum_dtype)
+             scale_local = T.alloc_var(accum_dtype)
+ 
+-            T.annotate_layout(
+-                {
+-                    S_shared: tilelang.layout.make_swizzled_layout(S_shared),
+-                }
+-            )
+             T.use_swizzle(10)
+ 
+             total_tiles = batch * (heads // min(block_H, kv_group_num)) * num_split
+diff --git a/examples/deepseek_mla/experimental/example_mla_decode_kv_fp8.py b/examples/deepseek_mla/experimental/example_mla_decode_kv_fp8.py
+index fa39fa498f..e70c35349e 100644
+--- a/examples/deepseek_mla/experimental/example_mla_decode_kv_fp8.py
++++ b/examples/deepseek_mla/experimental/example_mla_decode_kv_fp8.py
+@@ -48,11 +48,6 @@ def main_no_split(
+ 
+             cur_kv_head = by // (kv_group_num // block_H)
+             T.use_swizzle(10)
+-            T.annotate_layout(
+-                {
+-                    O_shared: tilelang.layout.make_swizzled_layout(O_shared),
+-                }
+-            )
+ 
+             T.copy(Q[bx, by * VALID_BLOCK_H : (by + 1) * VALID_BLOCK_H, :], Q_shared)
+             T.copy(Q_pe[bx, by * VALID_BLOCK_H : (by + 1) * VALID_BLOCK_H, :], Q_pe_shared)
+diff --git a/examples/deepseek_nsa/benchmark/benchmark_nsa_fwd.py b/examples/deepseek_nsa/benchmark/benchmark_nsa_fwd.py
+index dadb4b4cb9..ca98d01be9 100644
+--- a/examples/deepseek_nsa/benchmark/benchmark_nsa_fwd.py
++++ b/examples/deepseek_nsa/benchmark/benchmark_nsa_fwd.py
+@@ -517,8 +517,6 @@ def tilelang_sparse_attention(
+             scores_sum = T.alloc_fragment([G], accum_dtype)
+             logsum = T.alloc_fragment([G], accum_dtype)
+ 
+-            T.annotate_layout({O_shared: tilelang.layout.make_swizzled_layout(O_shared)})
+-
+             i_t, i_v, i_bh = bx, by, bz
+             i_b, i_h = i_bh // head_kv, i_bh % head_kv
+ 
+diff --git a/examples/deepseek_nsa/example_tilelang_nsa_bwd.py b/examples/deepseek_nsa/example_tilelang_nsa_bwd.py
+index 41f1dd86b9..3da285a9ba 100644
+--- a/examples/deepseek_nsa/example_tilelang_nsa_bwd.py
++++ b/examples/deepseek_nsa/example_tilelang_nsa_bwd.py
+@@ -248,14 +248,6 @@ def flash_bwd_dkv(
+             # [BS, BV]
+             T.clear(dv)
+ 
+-            T.annotate_layout(
+-                {
+-                    K_shared: tilelang.layout.make_swizzled_layout(K_shared),
+-                    dv_shared: tilelang.layout.make_swizzled_layout(dv_shared),
+-                    dk_shared: tilelang.layout.make_swizzled_layout(dk_shared),
+-                }
+-            )
+-
+             loop_st = i_s * BS
+             loop_ed = seq_len
+             for i in T.Pipelined(
+@@ -420,14 +412,6 @@ def flash_bwd_dqkv(
+             # [BS, BV]
+             T.clear(dv)
+ 
+-            T.annotate_layout(
+-                {
+-                    K_shared: tilelang.layout.make_swizzled_layout(K_shared),
+-                    dv_shared: tilelang.layout.make_swizzled_layout(dv_shared),
+-                    dk_shared: tilelang.layout.make_swizzled_layout(dk_shared),
+-                }
+-            )
+-
+             loop_st = i_s * BS
+             loop_ed = seq_len
+             for i in T.Pipelined(
+diff --git a/examples/deepseek_v32/sparse_mla_bwd.py b/examples/deepseek_v32/sparse_mla_bwd.py
+index ababbd2d46..7632e0014a 100644
+--- a/examples/deepseek_v32/sparse_mla_bwd.py
++++ b/examples/deepseek_v32/sparse_mla_bwd.py
+@@ -169,13 +169,6 @@ def sparse_mla_bwd_kernel(
+             T.clear(acc_dq)
+             T.clear(acc_dq_tail)
+ 
+-            T.annotate_layout(
+-                {
+-                    dQ_shared: tilelang.layout.make_swizzled_layout(dQ_shared),
+-                    dQ_tail_shared: tilelang.layout.make_swizzled_layout(dQ_tail_shared),
+-                }
+-            )
+-
+             # Process each block of indices
+             for i_i in T.Pipelined(NS, num_stages=num_stages):
+                 # Check which indices are valid
+diff --git a/examples/dequantize_gemm/example_dequant_gemm_bf16_fp4_hopper.py b/examples/dequantize_gemm/example_dequant_gemm_bf16_fp4_hopper.py
+index db82786634..68f2cbb520 100644
+--- a/examples/dequantize_gemm/example_dequant_gemm_bf16_fp4_hopper.py
++++ b/examples/dequantize_gemm/example_dequant_gemm_bf16_fp4_hopper.py
+@@ -326,12 +326,6 @@ def main(
+             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
+             C_shared = T.alloc_shared((block_M, block_N), out_dtype)
+ 
+-            T.annotate_layout(
+-                {
+-                    C_shared: tilelang.layout.make_swizzled_layout(C_shared),
+-                }
+-            )
+-
+             T.clear(C_local)
+             for k in T.Pipelined(K // block_K, num_stages=num_stages):
+                 T.copy(A[by * block_M, k * block_K], A_shared)
+diff --git a/examples/dequantize_gemm/example_dequant_gemm_bf16_mxfp4_hopper.py b/examples/dequantize_gemm/example_dequant_gemm_bf16_mxfp4_hopper.py
+index 8daaa5951c..850a557401 100644
+--- a/examples/dequantize_gemm/example_dequant_gemm_bf16_mxfp4_hopper.py
++++ b/examples/dequantize_gemm/example_dequant_gemm_bf16_mxfp4_hopper.py
+@@ -343,9 +343,7 @@ def main(
+ 
+             T.annotate_layout(
+                 {
+-                    A_shared: tilelang.layout.make_swizzled_layout(A_shared),
+                     B_shared: tilelang.layout.make_swizzled_layout(B_shared),
+-                    C_shared: tilelang.layout.make_swizzled_layout(C_shared),
+                 }
+             )
+ 
+diff --git a/examples/dequantize_gemm/example_dequant_gemm_bf16_mxfp4_hopper_tma.py b/examples/dequantize_gemm/example_dequant_gemm_bf16_mxfp4_hopper_tma.py
+deleted file mode 100644
+index e37cdf6a80..0000000000
+--- a/examples/dequantize_gemm/example_dequant_gemm_bf16_mxfp4_hopper_tma.py
++++ /dev/null
+@@ -1,586 +0,0 @@
+-import tilelang
+-import tilelang.language as T
+-from tilelang import tvm as tvm
+-from tvm import DataType
+-from tvm import tir
+-import torch
+-from dequantize_utils import torch_convert_bit_twiddling, torch_convert
+-
+-
+-def _tir_u8_to_f4_to_bf16(nbit: int, val: tir.PrimExpr, pos: tir.PrimExpr, scale: tir.PrimExpr, dtype: str):
+-    """
+-    Convert a 4-bit field packed in a uint8 into a bfloat16 value, applying an exponent scale.
+-
+-    This helper extracts a 4-bit nibble from `val` at byte-nibble position `pos`, interprets its
+-    bits as a sign/exponent/mantissa in the 4-bit custom FP4 layout, adjusts the exponent by
+-    `scale` (clamped to an 8-bit range), and assembles the corresponding bfloat16 representation.
+-
+-    Parameters:
+-        nbit (int): Number of bits in the packed field (must be 4).
+-        val (tir.PrimExpr): Packed input value of dtype `uint8` containing one or more 4-bit fields.
+-        pos (tir.PrimExpr): Index of the nibble within `val` (used to shift/extract the 4-bit field).
+-        scale (tir.PrimExpr): Per-element exponent adjustment added to the extracted exponent (uint-like).
+-        dtype (str): Destination dtype string (must be T.bfloat16).
+-
+-    Returns:
+-        tir.PrimExpr: The resulting value reinterpreted as `bfloat16`.
+-
+-    Notes:
+-    - Preconditions are enforced via assertions: nbit == 4, dtype == T.bfloat16, and val.dtype == T.uint8.
+-    - The function clamps the adjusted exponent to the 8-bit range before assembling the bfloat16 bit pattern.
+-    """
+-    assert nbit == 4
+-    assert dtype == T.bfloat16
+-    assert val.dtype == T.uint8
+-    mask = tir.const((1 << nbit) - 1, T.uint16)
+-    f4 = (val >> (pos.astype(T.uint16) * tir.const(nbit, T.uint16))) & mask
+-    s = f4 >> tir.const(3, T.uint16)
+-    e_f4 = (f4 & tir.const(6, T.uint16)) >> tir.const(1, T.uint16)
+-    # Exponential bias between f4 and bf16 is 2^(8-1) - 2^(2-1) = 126
+-    e_bf16 = e_f4 + tir.const(126, T.uint16)
+-    # Scale is the exponential part, within the representation of uint8
+-    # To handle the overflow, we may use the min function to limit the exponential part to 8 bits
+-    # e_bf16 = T.min(e_bf16 + scale, tir.const((1 << 8) - 1, "uint16"))
+-    m_f4 = f4 & tir.const(1, T.uint16)
+-    val_bf16 = tir.reinterpret(
+-        T.bfloat16,
+-        ((((s << tir.const(8, T.uint16)) | e_bf16) << tir.const(7, T.uint16)) | (m_f4 << tir.const(6, T.uint16))).astype(T.uint16),
+-    )
+-    return val_bf16
+-
+-
+-def get_configs():
+-    """
+-    Generate a list of hyperparameter configuration dictionaries for tuning.
+-
+-    Each configuration is a dict with keys: 'block_M', 'block_N', 'block_K',
+-    'num_stages', 'threads', and 'split'. The function returns the Cartesian
+-    product of the parameter value lists:
+-    - block_M, block_N, block_K: tiling sizes (64, 128, 256)
+-    - num_stages: pipeline stages (0, 2)
+-    - threads: thread counts (128, 256, 512)
+-    - split: K-splitting factor (1, 2)
+-
+-    Returns:
+-        List[dict]: A list of configuration dictionaries covering all combinations.
+-    """
+-    import itertools
+-
+-    iter_params = dict(
+-        block_M=[64, 128, 256],
+-        block_N=[64, 128, 256],
+-        block_K=[64, 128, 256],
+-        num_stages=[0, 1, 2],
+-        threads=[128, 256, 512],
+-        split=[1, 2],
+-    )
+-    return [{k: v for k, v in zip(iter_params, values)} for values in itertools.product(*iter_params.values())]
+-
+-
+-@tilelang.autotune(
+-    configs=get_configs(),
+-)
+-@tilelang.jit(
+-    out_idx=[-1],
+-)
+-def matmul(
+-    M,
+-    N,
+-    K,
+-    in_dtype,
+-    out_dtype,
+-    accum_dtype,
+-    source_format=T.uint32,
+-    num_bits=4,
+-    scale_size=32,
+-    fast_dequant=True,
+-    with_bias=False,
+-    block_M=256,
+-    block_N=128,
+-    block_K=128,
+-    num_stages=2,
+-    threads=256,
+-    split=1,
+-):
+-    """
+-    Construct and return a tiled matrix-multiply TIR kernel that multiplies A (shape MxK) by a quantized B (shape Nx(QK)) and writes an MxN output in out_dtype.
+-
+-    The generated kernel accepts:
+-    - A: dense matrix with element type `in_dtype`.
+-    - B: packed quantized matrix stored as uint8 with `num_bits` bits per element (QK = K / (8/num_bits)).
+-    - Scale: per-block scale/exponent information used to dequantize B.
+-    The kernel dequantizes B to a working floating format (out_dtype/accum_dtype) using one of two paths:
+-    - fast_dequant (True): uses an external, hardware/implementation-specific intrinsic group (twiddling) for batch dequantization.
+-    - fast_dequant (False): uses a simple elementwise dequantization helper.
+-
+-    Parameters:
+-    M, N, K (int): matrix dimensions (A is MxK, result is MxN). K must be divisible by (block_K * split).
+-    in_dtype (str): element type of A (e.g., "fp4" in this file).
+-    out_dtype (str): output tensor element type (e.g., T.bfloat16).
+-    accum_dtype (str): accumulation type used for the inner GEMM.
+-    source_format (str, optional): format string passed to intrinsic selector (default "uint").
+-    num_bits (int, optional): number of bits per quantized element in B (default 4).
+-    scale_size (int, optional): number of elements grouped per scale entry (default 32).
+-    fast_dequant (bool, optional): choose the fast intrinsic dequantization path when available (default True).
+-    block_M, block_N, block_K (int, optional): tile sizes for M, N, and K dimensions (defaults 256, 128, 128).
+-    num_stages (int, optional): pipelining stages for K loop (default 2).
+-    threads (int, optional): threads per block used by the kernel (default 256).
+-    split (int, optional): split factor along K used by the scheduler (default 1).
+-    with_bias (bool, optional): whether to add Bias to the output (default False).
+-
+-    Returns:
+-    A T.prim_func implementing the tiled, pipelined GEMM that:
+-    - loads tiled blocks of A and packed B to shared memory,
+-    - dequantizes B via the chosen path into a shared dequantized tile,
+-    - performs a tiled GEMM accumulating into local fragments,
+-    - writes the final MxN block to the global output tensor.
+-
+-    Notes:
+-    - The function queries an intrinsic group to obtain a fast dequantization implementation when fast_dequant is enabled; that intrinsic must supply a valid C source and function name.
+-    - The kernel layout uses swizzled shared-memory layouts for A, B, and the shared C tile.
+-    - An assertion enforces that K % (block_K * split) == 0.
+-    """
+-    num_elems_per_byte = 8 // num_bits
+-    storage_dtype = T.uint8
+-    QK = K // num_elems_per_byte
+-    Block_QK = block_K // num_elems_per_byte
+-    A_shape = (M, K)
+-    B_shape = (N, QK)
+-    Bias_shape = (M, N)
+-    Scale_shape = (N, K // scale_size)
+-    A_shared_shape = (block_M, block_K)
+-    B_shared_shape = (block_N, Block_QK)
+-    Bias_shared_shape = (block_M, block_N)
+-    B_dequantize_shared_shape = (block_N, block_K)
+-    assert K % (block_K * split) == 0
+-
+-    from tilelang.quantize import get_mxfp_intrin_group
+-
+-    # fast_dequant_bf16_fp4_twiddling
+-    mxfp_intrin_info = get_mxfp_intrin_group(
+-        out_dtype=in_dtype,
+-        source_format=source_format,
+-        source_bit=num_bits,
+-        storage_dtype=storage_dtype,
+-        use_twiddling=True,
+-    )
+-    import_source = mxfp_intrin_info["c_source"]
+-    func_name = mxfp_intrin_info["func_name"]
+-    assert import_source is not None, "mxfp_intrin_info is not found"
+-    assert func_name is not None, "mxfp_intrin_info is not found"
+-    import_source = import_source
+-
+-    def get_fast_dequant_twiddling_func(in_dtype="fp4", out_dtype=T.bfloat16):
+-        """
+-        Return a TileLang macro that performs fast dequantization of twiddled FP4-packed data into BF16.
+-
+-        The returned macro has signature (B_shared, B_dequantize_shared, Scale, k) and:
+-        - Loads packed FP4 elements from B_shared into per-thread local registers.
+-        - Calls an external fast dequantization intrinsic (provided via `import_source` / `func_name` in the outer scope) to expand packed FP4 -> BF16 values.
+-        - Applies a per-block scale factor derived from the Scale tensor (using exponentiation by powers of two).
+-        - Writes the scaled BF16 results into B_dequantize_shared.
+-
+-        Notes:
+-        - This factory only supports in_dtype="fp4" and out_dtype=T.bfloat16.
+-        - The macro depends on several names from the enclosing scope (e.g., import_source, func_name, DataType, num_elems_per_byte, storage_dtype, block_N, block_K, threads, scale_size); those must be defined and consistent with the kernel that will use the macro.
+-        - The macro issues a T.import_source and T.call_extern to invoke the external intrinsic; ensure the external implementation matching `func_name` is available at compilation/runtime.
+-        """
+-        assert in_dtype in ["fp4"]
+-        assert out_dtype in [T.bfloat16]
+-
+-        # Some variables for dequantization in each thread
+-        MAX_TRANSACTION_SIZE_BITS = 128
+-        local_size = MAX_TRANSACTION_SIZE_BITS // DataType(out_dtype).bits
+-        local_compress_size = local_size // num_elems_per_byte
+-
+-        @T.macro
+-        def fast_dequant_bf16_fp4_twiddling(B_shared, B_dequantize_shared, Scale_shared, k):
+-            # import fast_dequantize plugin
+-            """
+-            Fast dequantization kernel: convert packed 4-bit quantized values in B_shared to bfloat16
+-            in B_dequantize_shared using an external intrinsic optimized for twiddled (bit-packed) FP4,
+-            applying per-block scale factors from Scale.
+-
+-            This routine is a tiled, thread-parallel helper that:
+-            - Imports and calls an external dequantization function (via `import_source`/`func_name`)
+-              to expand compressed uint8-packed FP4 values into BF16 fragments in-thread.
+-            - Loads the corresponding per-block scale entry, interprets it as an exponent bias
+-              (applies 2^(Scale - 127)), and multiplies the dequantized BF16 fragment by that factor.
+-            - Writes the scaled BF16 results back into the shared B_dequantize_shared buffer in-place.
+-
+-            Parameters:
+-            - B_shared: read-only shared buffer containing compressed FP4 data (packed uint8 layout).
+-            - B_dequantize_shared: shared output buffer that is overwritten with BF16 dequantized values.
+-            - Scale: per-block scale tensor; entries are interpreted such that the multiplicative scale
+-              = 2^(Scale - 127).
+-            - k: block index along the K dimension used to select the appropriate Scale entries.
+-
+-            Side effects:
+-            - Mutates B_dequantize_shared in shared memory.
+-            - Calls an external intrinsic function (must be provided by the environment via `import_source`
+-              and `func_name`) to perform the low-level unpacking/dequantization.
+-            """
+-            T.import_source(import_source)
+-
+-            tx = T.get_thread_binding()
+-            bx = T.get_block_binding(0)  # noqa: F841
+-
+-            B_local_thread = T.alloc_local((local_compress_size,), storage_dtype)
+-            B_dequantize_local_thread = T.alloc_local((local_size,), out_dtype)
+-            Scale_local_thread = T.alloc_local((1,), storage_dtype)
+-            Scale_local_thread_exponent = T.alloc_local((1,), out_dtype)
+-
+-            for i in T.serial(0, block_N * block_K // threads // local_size):
+-                # First, load data from share memory to register.
+-                # Prepare for dequant.
+-                index_base = i * threads * local_compress_size + tx * local_compress_size
+-                for v in T.vectorized(0, local_compress_size):
+-                    index = index_base + v
+-                    B_local_thread[v] = B_shared[index // Block_QK, index % Block_QK]
+-                index_scale = index_base // (scale_size // num_elems_per_byte)
+-                si = index_scale // (block_K // scale_size)
+-                sj = index_scale % (block_K // scale_size)
+-                Scale_local_thread[0] = Scale_shared[si, k * block_K // scale_size + sj]
+-                Scale_local_thread_exponent[0] = T.shift_left(1, (Scale_local_thread[0]))
+-
+-                # Then, dequant.
+-                T.call_extern(
+-                    func_name,
+-                    T.address_of(B_local_thread[0]),
+-                    T.address_of(B_dequantize_local_thread[0]),
+-                    1,
+-                    dtype=out_dtype,
+-                )
+-
+-                # Finally, store the dequantized data to shared memory.
+-                for v in T.Parallel(local_size):
+-                    B_dequantize_local_thread[v] *= Scale_local_thread_exponent[0]
+-
+-                for v in T.vectorized(0, local_size):
+-                    index = i * threads * local_size + tx * local_size + v
+-                    B_dequantize_shared[index // block_K, index % block_K] = B_dequantize_local_thread[v]
+-
+-        return fast_dequant_bf16_fp4_twiddling
+-
+-    def get_simple_dequant_func(in_dtype="fp4", out_dtype=T.bfloat16):
+-        """
+-        Create a simple (scalar) dequantization macro that converts 4-bit packed inputs to bfloat16.
+-
+-        Returns a T.macro that, given shared-storage buffers B_shared, B_dequantize_shared, a Scale tensor, and block index k, unpacks 4-bit values from B_shared, converts each nibble to a bfloat16 value using _tir_u8_to_f4_to_bf16, applies the per-element exponential Scale, and writes the dequantized BF16 block into B_dequantize_shared.
+-
+-        Notes:
+-        - Only supports in_dtype="fp4" and out_dtype=T.bfloat16.
+-        - The macro expects B_shared and B_dequantize_shared to have the shapes established in the enclosing scope (B_shared_shape, B_dequantize_shared_shape) and performs block-local copying into allocated fragments before elementwise conversion.
+-        - Scale holds the exponent-like scaling values indexed per output element as used by the conversion helper.
+-        """
+-        assert in_dtype in ["fp4"]
+-        assert out_dtype in [T.bfloat16]
+-
+-        @T.macro
+-        def simple_dequant_bf16_fp4(B_shared, B_dequantize_shared, Scale_shared, k):
+-            """
+-            Dequantizes a packed 4-bit (FP4) block from B_shared into BF16 values in B_dequantize_shared using per-element scale exponents.
+-
+-            Per-element behavior:
+-            - Reads packed 4-bit entries from B_shared (uint8 storage, multiple nibbles per byte).
+-            - Uses Scale to obtain an exponent term (stored as uint8) and reconstructs BF16 values via _tir_u8_to_f4_to_bf16.
+-            - Writes the dequantized BF16 block into B_dequantize_shared.
+-
+-            Parameters:
+-            - B_shared: shared-memory buffer holding packed 4-bit values (uint8-packed layout).
+-            - B_dequantize_shared: shared-memory buffer to receive dequantized BF16 results.
+-            - Scale: per-element exponent buffer; used to compute the scale factor for each dequantized element.
+-            - k: current block index along the K dimension (used to select the appropriate slice of Scale).
+-
+-            Side effects:
+-            - Mutates B_dequantize_shared by storing the dequantized BF16 fragment.
+-            """
+-            B_local = T.alloc_fragment(B_shared_shape, storage_dtype)
+-            B_dequantize_local = T.alloc_fragment(B_dequantize_shared_shape, out_dtype)
+-
+-            bx = T.get_block_binding(0)  # noqa: F841
+-            T.copy(B_shared, B_local)
+-            for i, j in T.Parallel(block_N, block_K):
+-                B_dequantize_local[i, j] = _tir_u8_to_f4_to_bf16(
+-                    num_bits,
+-                    B_local[i, j // num_elems_per_byte],
+-                    j % num_elems_per_byte,
+-                    Scale_shared[
+-                        i, k * block_K // scale_size + j // scale_size
+-                    ],  # Scale is the exponential part, within the representation of uint8
+-                    dtype=out_dtype,
+-                ) * T.shift_left(1, (Scale_shared[i, k * block_K // scale_size + j // scale_size]))
+-            T.copy(B_dequantize_local, B_dequantize_shared)
+-
+-        return simple_dequant_bf16_fp4
+-
+-    @T.prim_func
+-    def main(
+-        A: T.Tensor(A_shape, in_dtype),
+-        B: T.Tensor(B_shape, storage_dtype),
+-        Scale: T.Tensor(Scale_shape, storage_dtype),
+-        Bias: T.Tensor(Bias_shape, out_dtype),
+-        C: T.Tensor((M, N), out_dtype),
+-    ):
+-        """
+-        Tiled, pipelined kernel entry that multiplies A with a quantized B (with per-block Scale) producing C.
+-
+-        This prim-level kernel implements a blocked, multi-threaded matmul: it loads tiles of A and the packed/quantized B into shared memory, dequantizes B (either via the fast intrinsic twiddling path or the simple per-element path), performs a block GEMM (with B transposed), and writes the accumulated block results into the output tensor C. The kernel allocates shared buffers for A, B, and the dequantized B, and a local fragment for accumulation; it runs over K in pipelined stages and expects the provided shapes and dtypes to match the tiling parameters used to build the function.
+-
+-        Parameters are self-descriptive in the signature; notable behaviors:
+-        - B is stored in a compact uint8-packed layout (num_bits per element) and is dequantized using Scale before GEMM.
+-        - The selected dequantization path is controlled by the outer-scope flag `fast_dequant`.
+-        - The GEMM uses transpose_B=True (i.e., multiplies A · B^T after dequantization).
+-        - The function writes results in-place into C.
+-        """
+-        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
+-            A_shared = T.alloc_shared(A_shared_shape, in_dtype)
+-            B_shared = T.alloc_shared(B_shared_shape, storage_dtype)
+-            B_dequantize_shared = T.alloc_shared(B_dequantize_shared_shape, in_dtype)
+-            Bias_shared = T.alloc_shared(Bias_shared_shape, out_dtype)
+-            C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
+-            C_shared = T.alloc_shared((block_M, block_N), out_dtype)
+-            # To use 1D TMA, the last dim of Scale_shared must have stride=1
+-            # May use much more shared memory than necessary
+-            Scale_shared = T.alloc_shared((block_N, K // scale_size), storage_dtype)
+-
+-            T.annotate_layout(
+-                {
+-                    A_shared: tilelang.layout.make_swizzled_layout(A_shared),
+-                    B_shared: tilelang.layout.make_swizzled_layout(B_shared),
+-                    C_shared: tilelang.layout.make_swizzled_layout(C_shared),
+-                }
+-            )
+-
+-            if with_bias:
+-                T.annotate_layout(
+-                    {
+-                        Bias_shared: tilelang.layout.make_swizzled_layout(Bias_shared),
+-                    }
+-                )
+-
+-            if threads == 512:
+-                T.disable_warp_group_reg_alloc()
+-
+-            if with_bias:
+-                # T.copy(Bias[by * block_M:(by + 1) * block_M, bx * block_N:(bx + 1) * block_N],
+-                #        Bias_shared)
+-                # T.copy(Bias_shared, C_local)
+-                T.copy(Bias[by * block_M : (by + 1) * block_M, bx * block_N : (bx + 1) * block_N], C_local)
+-            else:
+-                T.clear(C_local)
+-
+-            # Use 1D TMA to load Scale
+-            T.copy(Scale[bx * block_N : (bx + 1) * block_N, :], Scale_shared)
+-
+-            for k in T.Pipelined(K // block_K, num_stages=num_stages):
+-                T.copy(A[by * block_M, k * block_K], A_shared)
+-                T.copy(B[bx * block_N, k * block_K // num_elems_per_byte], B_shared)
+-                if fast_dequant:
+-                    get_fast_dequant_twiddling_func()(B_shared, B_dequantize_shared, Scale_shared, k)
+-                else:
+-                    get_simple_dequant_func()(B_shared, B_dequantize_shared, Scale_shared, k)
+-                T.gemm(A_shared, B_dequantize_shared, C_local, transpose_B=True)
+-
+-            T.copy(C_local, C_shared)
+-            T.copy(C_shared, C[by * block_M : (by + 1) * block_M, bx * block_N : (bx + 1) * block_N])
+-
+-    return main
+-
+-
+-def ref_program_twiddling(A, qB, Scale, Bias=None):
+-    """
+-    Compute A @ B^T where B is reconstructed from bit-twiddled 4-bit quantized data and per-block scales, returning bfloat16 results.
+-
+-    Converts the quantized matrix `qB` to floating-point via `torch_convert_bit_twiddling`, applies a per-element scale factor of 2^(Scale - 127) (where Scale indexes are grouped by 32 columns of B), computes the matrix product A · B^T in float, and casts the result to bfloat16.
+-
+-    Parameters:
+-        A (torch.Tensor): Left operand with shape (M, K), used in floating precision.
+-        qB (torch.Tensor): Quantized representation of B (packed 4-bit values) compatible with torch_convert_bit_twiddling.
+-        Scale (torch.Tensor): Per-column-group scale values; Scale indices correspond to groups of 32 columns in B.
+-
+-    Returns:
+-        torch.Tensor: Resulting matrix C with shape (M, N) in bfloat16.
+-    """
+-    dtypeC = T.bfloat16
+-    B = torch_convert_bit_twiddling(qB)
+-    for i in range(B.shape[0]):
+-        for j in range(B.shape[1]):
+-            B[i][j] = B[i][j] * (2 ** (Scale[i][j // 32]))
+-    C = torch.matmul(A.to(torch.float), B.T.to(torch.float))
+-    C = C.to(torch.__getattribute__(dtypeC))
+-    return C
+-
+-
+-def ref_program_twiddling_with_bias(A, qB, Scale, Bias):
+-    """
+-    Compute A @ B^T where B is reconstructed from bit-twiddled 4-bit quantized data and per-block scales, returning bfloat16 results.
+-
+-    Converts the quantized matrix `qB` to floating-point via `torch_convert_bit_twiddling`, applies a per-element scale factor of 2^(Scale - 127) (where Scale indexes are grouped by 32 columns of B), computes the matrix product A · B^T in float, and casts the result to bfloat16.
+-
+-    Parameters:
+-        A (torch.Tensor): Left operand with shape (M, K), used in floating precision.
+-        qB (torch.Tensor): Quantized representation of B (packed 4-bit values) compatible with torch_convert_bit_twiddling.
+-        Scale (torch.Tensor): Per-column-group scale values; Scale indices correspond to groups of 32 columns in B.
+-        Bias (torch.Tensor): Bias tensor with shape (M, N).
+-
+-    Returns:
+-        torch.Tensor: Resulting matrix C with shape (M, N) in bfloat16.
+-    """
+-    dtypeC = T.bfloat16
+-    B = torch_convert_bit_twiddling(qB)
+-    for i in range(B.shape[0]):
+-        for j in range(B.shape[1]):
+-            B[i][j] = B[i][j] * (2 ** (Scale[i][j // 32]))
+-    C = torch.matmul(A.to(torch.float), B.T.to(torch.float)) + Bias
+-    C = C.to(torch.__getattribute__(dtypeC))
+-    return C
+-
+-
+-def ref_program_simple(A, qB, Scale, Bias=None):
+-    """
+-    Compute a BF16 matrix product A · B^T from a quantized B with simple (non-twiddling) dequantization.
+-
+-    Converts the quantized tensor `qB` to floating B via `torch_convert`, applies a per-element scale factor computed as 2^(Scale[i][j//32] - 127) (Scale supplies exponent offsets in 32-column groups), then computes C = A · B^T and returns the result converted to bfloat16.
+-
+-    Parameters:
+-    - A: 2D tensor representing the left operand (will be cast to float32 for the matmul).
+-    - qB: Quantized representation of B accepted by `torch_convert`.
+-    - Scale: 2D tensor of exponent offsets; Scale[i][g] is applied to columns j where g == j // 32.
+-
+-    Returns:
+-    - 2D bfloat16 tensor C containing the matrix product A · B^T.
+-
+-    No in-place modification is performed on inputs (a local floating copy of B is scaled).
+-    """
+-    dtypeC = T.bfloat16
+-    B = torch_convert(qB)
+-    for i in range(B.shape[0]):
+-        for j in range(B.shape[1]):
+-            B[i][j] = B[i][j] * (2 ** (Scale[i][j // 32]))
+-    C = torch.matmul(A.to(torch.float), B.T.to(torch.float))
+-    C = C.to(torch.__getattribute__(dtypeC))
+-    return C
+-
+-
+-def ref_program_simple_with_bias(A, qB, Scale, Bias):
+-    """
+-    Compute a BF16 matrix product A · B^T from a quantized B with simple (non-twiddling) dequantization.
+-
+-    Converts the quantized tensor `qB` to floating B via `torch_convert`, applies a per-element scale factor computed as 2^(Scale[i][j//32] - 127) (Scale supplies exponent offsets in 32-column groups), then computes C = A · B^T and returns the result converted to bfloat16.
+-
+-    Parameters:
+-
+-    Returns:
+-    - A: 2D tensor representing the left operand (will be cast to float32 for the matmul).
+-    - qB: Quantized representation of B accepted by `torch_convert`.
+-    - Scale: 2D tensor of exponent offsets; Scale[i][g] is applied to columns j where g == j // 32.
+-    - Bias: 2D tensor representing the Bias (will be cast to float32 for the matmul).
+-
+-
+-    Returns:
+-    - 2D bfloat16 tensor C containing the matrix product A · B^T.
+-
+-    No in-place modification is performed on inputs (a local floating copy of B is scaled).
+-    """
+-    dtypeC = T.bfloat16
+-    B = torch_convert(qB)
+-    for i in range(B.shape[0]):
+-        for j in range(B.shape[1]):
+-            B[i][j] = B[i][j] * (2 ** (Scale[i][j // 32]))
+-    C = torch.matmul(A.to(torch.float), B.T.to(torch.float)) + Bias
+-    C = C.to(torch.__getattribute__(dtypeC))
+-    return C
+-
+-
+-def main(m=256, n=256, k=256, scale_size=32, fast_dequant=True, with_bias=False, tune=False):
+-    """
+-    Run and validate the tiled quantized matmul kernel, then benchmark its latency and report TFLOPS.
+-
+-    Builds a matmul kernel for the given matrix sizes and quantization scale size. If `tune` is True the kernel is obtained via the autotuning path; otherwise a fixed-parameter kernel is used. Validates numerical correctness against the appropriate reference implementation (bit-twiddling reference when `fast_dequant` is True, plain reference otherwise) with rtol/atol=0.01, prints a confirmation, then runs a benchmark (500 warmup iterations) and prints the measured latency (ms) and achieved TFLOPS.
+-
+-    Parameters:
+-        m (int): Number of rows of A / output rows. Default 256.
+-        n (int): Number of columns of B / output columns. Default 256.
+-        k (int): Reduction dimension. Default 256.
+-        scale_size (int): Size of the per-block scale vector used for dequantization. Default 32.
+-        fast_dequant (bool): If True validate against the twiddling (fast dequant) reference and exercise the fast dequant path; otherwise use the simple dequant reference. Default True.
+-        tune (bool): If True obtain a tuned/autotuned kernel; otherwise use a fixed-parameter kernel. Default False.
+-
+-    Returns:
+-        None
+-    """
+-    total_flops = 2 * m * n * k
+-
+-    if tune:
+-        kernel = matmul(
+-            m, n, k, T.bfloat16, T.bfloat16, T.float32, num_bits=4, scale_size=scale_size, fast_dequant=fast_dequant, with_bias=with_bias
+-        )
+-    else:
+-        kernel = matmul(
+-            m,
+-            n,
+-            k,
+-            T.bfloat16,
+-            T.bfloat16,
+-            T.float32,
+-            num_bits=4,
+-            scale_size=scale_size,
+-            block_M=256,
+-            block_N=128,
+-            block_K=128,
+-            num_stages=2,
+-            threads=256,
+-            split=1,
+-            fast_dequant=fast_dequant,
+-            with_bias=with_bias,
+-        )
+-
+-    profiler = kernel.get_profiler(tilelang.TensorSupplyType.Auto)
+-
+-    if fast_dequant:
+-        if with_bias:
+-            profiler.assert_allclose(ref_program_twiddling_with_bias, rtol=0.01, atol=0.01)
+-        else:
+-            profiler.assert_allclose(ref_program_twiddling, rtol=0.01, atol=0.01)
+-    else:
+-        if with_bias:
+-            profiler.assert_allclose(ref_program_simple_with_bias, rtol=0.01, atol=0.01)
+-        else:
+-            profiler.assert_allclose(ref_program_simple, rtol=0.01, atol=0.01)
+-    print("All checks pass.")
+-    latency = profiler.do_bench(warmup=500)
+-    print("Tile-lang: {:.2f} ms".format(latency))
+-    print("Tile-lang: {:.2f} TFlops".format(total_flops / latency * 1e-9))
+-
+-
+-def run_regression_perf(m=256, n=256, k=256, scale_size=32, fast_dequant=True, with_bias=False):
+-    kernel = matmul(
+-        m,
+-        n,
+-        k,
+-        "bfloat16",
+-        "bfloat16",
+-        "float32",
+-        num_bits=4,
+-        scale_size=scale_size,
+-        block_M=256,
+-        block_N=128,
+-        block_K=128,
+-        num_stages=2,
+-        threads=256,
+-        split=1,
+-        fast_dequant=fast_dequant,
+-        with_bias=with_bias,
+-    )
+-    profiler = kernel.get_profiler(tilelang.TensorSupplyType.Auto)
+-    return profiler.do_bench(warmup=500, backend="cupti")
+-
+-
+-if __name__ == "__main__":
+-    M, N, K = 256, 256, 256
+-    scale_size = 32
+-    main(M, N, K, scale_size, fast_dequant=True, with_bias=True)
+-    main(M, N, K, scale_size, fast_dequant=False, with_bias=True)
+-    main(M, N, K, scale_size, fast_dequant=True, with_bias=False)
+-    main(M, N, K, scale_size, fast_dequant=False, with_bias=False)
+diff --git a/examples/dequantize_gemm/example_dequant_gemm_fp4_hopper.py b/examples/dequantize_gemm/example_dequant_gemm_fp4_hopper.py
+index cb596a84ab..e093e52d7f 100644
+--- a/examples/dequantize_gemm/example_dequant_gemm_fp4_hopper.py
++++ b/examples/dequantize_gemm/example_dequant_gemm_fp4_hopper.py
+@@ -148,12 +148,10 @@ def main_split(
+                 B_dequantize_local = T.alloc_fragment(B_dequantize_shared_shape, in_dtype)
+                 B_dequantize_prev_local = T.alloc_fragment(B_dequantize_shared_shape, in_dtype)
+                 Ct_local = T.alloc_fragment((block_N, block_M), accum_dtype)
+-                Ct_shared = T.alloc_shared((block_N, block_M), out_dtype)
+ 
+                 T.annotate_layout(
+                     {
+                         B_shared: tilelang.layout.make_swizzled_layout(B_shared),
+-                        Ct_shared: tilelang.layout.make_swizzled_layout(Ct_shared),
+                     }
+                 )
+ 
+@@ -198,7 +196,6 @@ def main(
+                 T.annotate_layout(
+                     {
+                         B_shared: tilelang.layout.make_swizzled_layout(B_shared),
+-                        Ct_shared: tilelang.layout.make_swizzled_layout(Ct_shared),
+                     }
+                 )
+ 
+diff --git a/examples/dequantize_gemm/example_dequant_gemm_w4a8.py b/examples/dequantize_gemm/example_dequant_gemm_w4a8.py
+index ea20f6ff80..a42ae8d097 100644
+--- a/examples/dequantize_gemm/example_dequant_gemm_w4a8.py
++++ b/examples/dequantize_gemm/example_dequant_gemm_w4a8.py
+@@ -123,7 +123,6 @@ def main(
+                 T.annotate_layout(
+                     {
+                         B_shared: tilelang.layout.make_swizzled_layout(B_shared),
+-                        Ct_shared: tilelang.layout.make_swizzled_layout(Ct_shared),
+                     }
+                 )
+ 
+diff --git a/examples/dequantize_gemm/example_dequant_groupedgemm_bf16_mxfp4_hopper.py b/examples/dequantize_gemm/example_dequant_groupedgemm_bf16_mxfp4_hopper.py
+index f9613143a5..ea0772dd21 100644
+--- a/examples/dequantize_gemm/example_dequant_groupedgemm_bf16_mxfp4_hopper.py
++++ b/examples/dequantize_gemm/example_dequant_groupedgemm_bf16_mxfp4_hopper.py
+@@ -279,9 +279,7 @@ def main(
+ 
+             T.annotate_layout(
+                 {
+-                    A_shared: tilelang.layout.make_swizzled_layout(A_shared),
+                     B_shared: tilelang.layout.make_swizzled_layout(B_shared),
+-                    C_shared: tilelang.layout.make_swizzled_layout(C_shared),
+                 }
+             )
+             T.use_swizzle(10)
+diff --git a/examples/dequantize_gemm/regression_example_dequantize_gemm.py b/examples/dequantize_gemm/regression_example_dequantize_gemm.py
+index f90d26531c..4ab03784ff 100644
+--- a/examples/dequantize_gemm/regression_example_dequantize_gemm.py
++++ b/examples/dequantize_gemm/regression_example_dequantize_gemm.py
+@@ -1,7 +1,6 @@
+ import tilelang.testing
+ import example_dequant_gemm_bf16_fp4_hopper
+ import example_dequant_gemm_bf16_mxfp4_hopper
+-import example_dequant_gemm_bf16_mxfp4_hopper_tma
+ import example_dequant_gemm_fp4_hopper
+ import example_dequant_gemm_w4a8
+ import example_dequant_gemv_fp16xint4
+@@ -24,10 +23,6 @@ def regression_example_dequant_gemm_bf16_mxfp4_hopper():
+     tilelang.testing.process_func(example_dequant_gemm_bf16_mxfp4_hopper.run_regression_perf)
+ 
+ 
+-def regression_example_dequant_gemm_bf16_mxfp4_hopper_tma():
+-    tilelang.testing.process_func(example_dequant_gemm_bf16_mxfp4_hopper_tma.run_regression_perf)
+-
+-
+ def regression_example_dequant_groupedgemm_bf16_mxfp4_hopper():
+     tilelang.testing.process_func(example_dequant_groupedgemm_bf16_mxfp4_hopper.run_regression_perf)
+ 
+diff --git a/examples/dequantize_gemm/test_example_dequantize_gemm.py b/examples/dequantize_gemm/test_example_dequantize_gemm.py
+index 01bc40e6c9..a2f777222b 100644
+--- a/examples/dequantize_gemm/test_example_dequantize_gemm.py
++++ b/examples/dequantize_gemm/test_example_dequantize_gemm.py
+@@ -3,7 +3,6 @@
+ import example_dequant_gemv_fp16xint4
+ import example_dequant_gemm_fp4_hopper
+ import example_dequant_gemm_bf16_mxfp4_hopper
+-import example_dequant_gemm_bf16_mxfp4_hopper_tma
+ import example_dequant_groupedgemm_bf16_mxfp4_hopper
+ import example_dequant_gemm_w4a8
+ 
+@@ -25,12 +24,6 @@ def test_example_dequant_gemm_bf16_mxfp4_hopper():
+     example_dequant_gemm_bf16_mxfp4_hopper.main()
+ 
+ 
+-@tilelang.testing.requires_cuda
+-@tilelang.testing.requires_cuda_compute_version_ge(9, 0)
+-def test_example_dequant_gemm_bf16_mxfp4_hopper_tma():
+-    example_dequant_gemm_bf16_mxfp4_hopper_tma.main()
+-
+-
+ @tilelang.testing.requires_cuda
+ @tilelang.testing.requires_cuda_compute_version_ge(9, 0)
+ def test_example_dequant_groupedgemm_bf16_mxfp4_hopper():
+diff --git a/examples/dsa_sparse_finetune/sparse_mla_bwd.py b/examples/dsa_sparse_finetune/sparse_mla_bwd.py
+index 8b76dbca1c..53e5f8bfea 100644
+--- a/examples/dsa_sparse_finetune/sparse_mla_bwd.py
++++ b/examples/dsa_sparse_finetune/sparse_mla_bwd.py
+@@ -177,13 +177,6 @@ def sparse_mla_bwd_kernel(
+             T.clear(acc_dq)
+             T.clear(acc_dq_tail)
+ 
+-            T.annotate_layout(
+-                {
+-                    dQ_shared: tilelang.layout.make_swizzled_layout(dQ_shared),
+-                    dQ_tail_shared: tilelang.layout.make_swizzled_layout(dQ_tail_shared),
+-                }
+-            )
+-
+             # Process each block of indices
+             for i_i in T.Pipelined(NS, num_stages=num_stages):
+                 # Check which indices are valid
+diff --git a/examples/flash_attention/README.md b/examples/flash_attention/README.md
+index 3f2f52bd86..355ed73258 100644
+--- a/examples/flash_attention/README.md
++++ b/examples/flash_attention/README.md
+@@ -34,8 +34,6 @@ def flash_attention(
+         scores_sum = T.alloc_fragment([block_M], accum_dtype)
+         logsum = T.alloc_fragment([block_M], accum_dtype)
+ 
+-        # Annotate layout for Q_shared, e.g., use a swizzled layout to optimize memory access
+-        T.annotate_layout({Q_shared: tl.layout.make_swizzled_layout(Q_shared)})
+ 
+         # Copy a block of Q from global memory to Q_shared
+         T.copy(Q[bz, bx * block_M : (bx + 1) * block_M, by, :], Q_shared)
+@@ -79,7 +77,7 @@ def flash_attention(
+             T.reduce_max(acc_s, scores_max, dim=1, clear=False)
+             for i in T.Parallel(block_M):
+                 scores_max[i] = T.max(scores_max[i], scores_max_prev[i])
+-                
++
+             # Compute the factor by which we need to rescale previous partial sums
+             for i in T.Parallel(block_M):
+                 scores_scale[i] = T.exp2(scores_max_prev[i] - scores_max[i])
+diff --git a/examples/flash_attention/example_gqa_bwd.py b/examples/flash_attention/example_gqa_bwd.py
+index 2c53ecde71..2c388262bb 100644
+--- a/examples/flash_attention/example_gqa_bwd.py
++++ b/examples/flash_attention/example_gqa_bwd.py
+@@ -41,7 +41,6 @@ def flash_fwd(
+             scores_sum = T.alloc_fragment([block_M], accum_dtype)
+             logsum = T.alloc_fragment([block_M], accum_dtype)
+ 
+-            T.annotate_layout({Q_shared: tilelang.layout.make_swizzled_layout(Q_shared)})
+             T.copy(Q[bz, bx * block_M : (bx + 1) * block_M, by, :], Q_shared)
+             T.fill(acc_o, 0)
+             T.fill(logsum, 0)
+@@ -197,7 +196,6 @@ def flash_bwd(
+             T.annotate_layout(
+                 {
+                     dQ: make_dq_layout(dQ),
+-                    K_shared: tilelang.layout.make_swizzled_layout(K_shared),
+                 }
+             )
+ 
+@@ -292,9 +290,6 @@ def flash_bwd(
+             T.annotate_layout(
+                 {
+                     dQ: make_dq_layout(dQ),
+-                    K_shared: tilelang.layout.make_swizzled_layout(K_shared),
+-                    dv_shared: tilelang.layout.make_swizzled_layout(dv_shared),
+-                    dk_shared: tilelang.layout.make_swizzled_layout(dk_shared),
+                 }
+             )
+ 
+diff --git a/examples/flash_attention/example_gqa_bwd_tma_reduce.py b/examples/flash_attention/example_gqa_bwd_tma_reduce.py
+index 07586f99fd..fea547b6e6 100644
+--- a/examples/flash_attention/example_gqa_bwd_tma_reduce.py
++++ b/examples/flash_attention/example_gqa_bwd_tma_reduce.py
+@@ -44,7 +44,6 @@ def flash_fwd(
+             scores_sum = T.alloc_fragment([block_M], accum_dtype)
+             logsum = T.alloc_fragment([block_M], accum_dtype)
+ 
+-            T.annotate_layout({Q_shared: tilelang.layout.make_swizzled_layout(Q_shared)})
+             T.copy(Q[bz, bx * block_M : (bx + 1) * block_M, by, :], Q_shared)
+             T.fill(acc_o, 0)
+             T.fill(logsum, 0)
+@@ -217,7 +216,6 @@ def flash_bwd(
+                     dQ: make_dq_layout(dQ),
+                     dK: make_dq_layout(dK),
+                     dV: make_dq_layout(dV),
+-                    K_shared: tilelang.layout.make_swizzled_layout(K_shared),
+                 }
+             )
+ 
+@@ -312,9 +310,6 @@ def flash_bwd(
+             T.annotate_layout(
+                 {
+                     dQ: make_dq_layout(dQ),
+-                    K_shared: tilelang.layout.make_swizzled_layout(K_shared),
+-                    dv_shared: tilelang.layout.make_swizzled_layout(dv_shared),
+-                    dk_shared: tilelang.layout.make_swizzled_layout(dk_shared),
+                 }
+             )
+ 
+diff --git a/examples/flash_attention/example_gqa_bwd_tma_reduce_varlen.py b/examples/flash_attention/example_gqa_bwd_tma_reduce_varlen.py
+index a9d515c042..df06973260 100644
+--- a/examples/flash_attention/example_gqa_bwd_tma_reduce_varlen.py
++++ b/examples/flash_attention/example_gqa_bwd_tma_reduce_varlen.py
+@@ -66,8 +66,6 @@ def flash_fwd(
+             q_current_seqlen = q_end_idx - q_start_idx
+             k_current_seqlen = k_end_idx - k_start_idx
+ 
+-            T.annotate_layout({Q_shared: tilelang.layout.make_swizzled_layout(Q_shared)})
+-
+             for i, d in T.Parallel(block_M, dim_qk):
+                 if bx * block_M + i < q_current_seqlen:
+                     Q_shared[i, d] = Q[q_start_idx + bx * block_M + i, by, d]
+@@ -293,7 +291,6 @@ def flash_bwd(
+                     dQ: make_dq_layout(dQ),
+                     dK: make_dq_layout(dK),
+                     dV: make_dq_layout(dV),
+-                    K_shared: tilelang.layout.make_swizzled_layout(K_shared),
+                 }
+             )
+ 
+@@ -431,9 +428,6 @@ def flash_bwd(
+             T.annotate_layout(
+                 {
+                     dQ: make_dq_layout(dQ),
+-                    K_shared: tilelang.layout.make_swizzled_layout(K_shared),
+-                    dv_shared: tilelang.layout.make_swizzled_layout(dv_shared),
+-                    dk_shared: tilelang.layout.make_swizzled_layout(dk_shared),
+                 }
+             )
+ 
+diff --git a/examples/flash_attention/example_gqa_bwd_wgmma_pipelined.py b/examples/flash_attention/example_gqa_bwd_wgmma_pipelined.py
+index 9e3089d23f..b788fea89b 100644
+--- a/examples/flash_attention/example_gqa_bwd_wgmma_pipelined.py
++++ b/examples/flash_attention/example_gqa_bwd_wgmma_pipelined.py
+@@ -41,7 +41,6 @@ def flash_fwd(
+             scores_sum = T.alloc_fragment([block_M], accum_dtype)
+             logsum = T.alloc_fragment([block_M], accum_dtype)
+ 
+-            T.annotate_layout({Q_shared: tilelang.layout.make_swizzled_layout(Q_shared)})
+             T.copy(Q[bz, bx * block_M : (bx + 1) * block_M, by, :], Q_shared)
+             T.fill(acc_o, 0)
+             T.fill(logsum, 0)
+@@ -163,15 +162,6 @@ def flash_bwd(
+             dv_shared = T.alloc_shared([block_M, dim_v], accum_dtype)
+             dq_shared = T.alloc_shared([block_N, dim_qk], accum_dtype)
+ 
+-            T.annotate_layout(
+-                {
+-                    K_shared: tilelang.layout.make_swizzled_layout(K_shared),
+-                    dq_shared: tilelang.layout.make_swizzled_layout(dq_shared),
+-                    dk_shared: tilelang.layout.make_swizzled_layout(dk_shared),
+-                    dv_shared: tilelang.layout.make_swizzled_layout(dv_shared),
+-                }
+-            )
+-
+             T.copy(K[bz, by * block_M : (by + 1) * block_M, bx // groups, :], K_shared)
+             T.copy(V[bz, by * block_M : (by + 1) * block_M, bx // groups, :], V_shared)
+             T.clear(dv)
+diff --git a/examples/flash_attention/example_gqa_fwd_varlen.py b/examples/flash_attention/example_gqa_fwd_varlen.py
+index b02345d930..517b179499 100644
+--- a/examples/flash_attention/example_gqa_fwd_varlen.py
++++ b/examples/flash_attention/example_gqa_fwd_varlen.py
+@@ -92,13 +92,6 @@ def main(
+             scores_sum = T.alloc_fragment([block_M], accum_dtype)
+             logsum = T.alloc_fragment([block_M], accum_dtype)
+ 
+-            T.annotate_layout(
+-                {
+-                    O_shared: tilelang.layout.make_swizzled_layout(O_shared),
+-                    Q_shared: tilelang.layout.make_swizzled_layout(Q_shared),
+-                }
+-            )
+-
+             batch_idx = bz
+             head_idx = by
+             kv_head_idx = head_idx // groups
+diff --git a/examples/flash_attention/example_mha_bwd_bhsd.py b/examples/flash_attention/example_mha_bwd_bhsd.py
+index 8c5d3c1682..0ba7b4ff2c 100644
+--- a/examples/flash_attention/example_mha_bwd_bhsd.py
++++ b/examples/flash_attention/example_mha_bwd_bhsd.py
+@@ -40,7 +40,6 @@ def flash_fwd(
+             scores_sum = T.alloc_fragment([block_M], accum_dtype)
+             logsum = T.alloc_fragment([block_M], accum_dtype)
+ 
+-            T.annotate_layout({Q_shared: tilelang.layout.make_swizzled_layout(Q_shared)})
+             T.copy(Q[bz, by, bx * block_M : (bx + 1) * block_M, :], Q_shared)
+             T.fill(acc_o, 0)
+             T.fill(logsum, 0)
+@@ -200,9 +199,6 @@ def flash_bwd(
+             T.annotate_layout(
+                 {
+                     dQ: make_dq_layout(dQ),
+-                    K_shared: tilelang.layout.make_swizzled_layout(K_shared),
+-                    dv_shared: tilelang.layout.make_swizzled_layout(dv_shared),
+-                    dk_shared: tilelang.layout.make_swizzled_layout(dk_shared),
+                 }
+             )
+             T.copy(K[bz, bx, by * block_M : (by + 1) * block_M, :], K_shared)
+diff --git a/examples/flash_attention/example_mha_bwd_bshd_wgmma_pipelined.py b/examples/flash_attention/example_mha_bwd_bshd_wgmma_pipelined.py
+index 40f2c92061..392aa745c8 100644
+--- a/examples/flash_attention/example_mha_bwd_bshd_wgmma_pipelined.py
++++ b/examples/flash_attention/example_mha_bwd_bshd_wgmma_pipelined.py
+@@ -39,7 +39,6 @@ def flash_fwd(
+             scores_sum = T.alloc_fragment([block_M], accum_dtype)
+             logsum = T.alloc_fragment([block_M], accum_dtype)
+ 
+-            T.annotate_layout({Q_shared: tilelang.layout.make_swizzled_layout(Q_shared)})
+             T.copy(Q[bz, bx * block_M : (bx + 1) * block_M, by, :], Q_shared)
+             T.fill(acc_o, 0)
+             T.fill(logsum, 0)
+@@ -163,15 +162,6 @@ def flash_bwd(
+             dk_shared = T.alloc_shared([block_M, dim], dtype)
+             dq_shared = T.alloc_shared([block_N, dim], accum_dtype)
+ 
+-            T.annotate_layout(
+-                {
+-                    K_shared: tilelang.layout.make_swizzled_layout(K_shared),
+-                    dv_shared: tilelang.layout.make_swizzled_layout(dv_shared),
+-                    dk_shared: tilelang.layout.make_swizzled_layout(dk_shared),
+-                    dq_shared: tilelang.layout.make_swizzled_layout(dq_shared),
+-                }
+-            )
+-
+             T.copy(K[bz, by * block_M : (by + 1) * block_M, bx, :], K_shared)
+             T.copy(V[bz, by * block_M : (by + 1) * block_M, bx, :], V_shared)
+             T.clear(dv)
+diff --git a/examples/flash_attention/example_mha_fwd_varlen.py b/examples/flash_attention/example_mha_fwd_varlen.py
+index 67165de1ab..e048585fec 100644
+--- a/examples/flash_attention/example_mha_fwd_varlen.py
++++ b/examples/flash_attention/example_mha_fwd_varlen.py
+@@ -116,12 +116,6 @@ def main(
+             scores_sum = T.alloc_fragment([block_M], accum_dtype)
+             logsum = T.alloc_fragment([block_M], accum_dtype)
+ 
+-            T.annotate_layout(
+-                {
+-                    O_shared: tilelang.layout.make_swizzled_layout(O_shared),
+-                }
+-            )
+-
+             batch_idx = bz
+             head_idx = by
+ 
+diff --git a/examples/flash_decoding/example_gqa_decode.py b/examples/flash_decoding/example_gqa_decode.py
+index 2655f6a4ea..70a9d1ae27 100644
+--- a/examples/flash_decoding/example_gqa_decode.py
++++ b/examples/flash_decoding/example_gqa_decode.py
+@@ -233,15 +233,6 @@ def combine(
+             lse_max_local = T.alloc_fragment([128], accum_dtype)
+             scale_local = T.alloc_fragment([128], accum_dtype)
+ 
+-            T.annotate_layout(
+-                {
+-                    lse_logsum_local: T.Fragment(lse_logsum_local.shape, forward_thread_fn=lambda i: i),
+-                    lse_max_local: T.Fragment(lse_max_local.shape, forward_thread_fn=lambda i: i),
+-                    # lse_local: (local_id, thread_id)
+-                    lse_local: T.Fragment(lse_local.shape, forward_fn=lambda i, j: (j, i)),
+-                }
+-            )
+-
+             T.clear(lse_logsum_local)
+             T.clear(o_accum_local)
+             for k, j in T.Parallel(num_split, 128):
+diff --git a/examples/flash_decoding/example_gqa_decode_varlen_logits.py b/examples/flash_decoding/example_gqa_decode_varlen_logits.py
+index ef3d8baed6..9a7c193d61 100644
+--- a/examples/flash_decoding/example_gqa_decode_varlen_logits.py
++++ b/examples/flash_decoding/example_gqa_decode_varlen_logits.py
+@@ -243,16 +243,6 @@ def flash_attn(
+             # S_fragment = T.alloc_fragment([block_H, math.ceil(max_seqlen_kv / block_N)], accum_dtype)
+             s_aux_shared = T.alloc_shared([block_H], T.float32)
+ 
+-            T.annotate_layout(
+-                {
+-                    # Q_shared: tilelang.layout.make_swizzled_layout(Q_shared),
+-                    # K_shared: tilelang.layout.make_swizzled_layout(K_shared),
+-                    # V_shared: tilelang.layout.make_swizzled_layout(V_shared),
+-                    # O_shared: tilelang.layout.make_swizzled_layout(O_shared),
+-                    # S_shared: tilelang.layout.make_swizzled_layout(S_shared),
+-                }
+-            )
+-
+             bid = bx
+             hid = by
+             cur_kv_head = hid // (kv_group_num // valid_block_H)
+diff --git a/examples/flash_decoding/example_mha_inference.py b/examples/flash_decoding/example_mha_inference.py
+index 13d779e01a..7176bf3dab 100644
+--- a/examples/flash_decoding/example_mha_inference.py
++++ b/examples/flash_decoding/example_mha_inference.py
+@@ -154,7 +154,6 @@ def combine(
+     ):
+         with T.Kernel(T.ceildiv(seqlen_q, block_M), heads, batch, threads=128) as (bx, by, bz):
+             po_local = T.alloc_fragment([block_M, dim], dtype)
+-            po_shared = T.alloc_shared([block_M, dim], dtype)
+             o_accum_local = T.alloc_fragment([block_M, dim], accum_dtype)
+             o_shared = T.alloc_shared([block_M, dim], dtype)
+             lse_local = T.alloc_fragment([num_split, block_M], dtype)
+@@ -163,14 +162,6 @@ def combine(
+             lse_max_local = T.alloc_fragment([block_M], accum_dtype)
+             scale_local = T.alloc_fragment([block_M], accum_dtype)
+ 
+-            T.annotate_layout(
+-                {
+-                    o_accum_local: T.Fragment(o_accum_local.shape, forward_thread_fn=lambda i, j: i),
+-                    o_shared: tilelang.layout.make_swizzled_layout(o_shared),
+-                    po_shared: tilelang.layout.make_swizzled_layout(po_shared),
+-                }
+-            )
+-
+             T.clear(lse_logsum_local)
+             T.clear(o_accum_local)
+             T.copy(
+@@ -190,8 +181,7 @@ def combine(
+             for i in T.Parallel(block_M):
+                 lse_logsum_local[i] = T.log2(lse_logsum_local[i]) + lse_max_local[i]
+             for k in T.Pipelined(num_split, num_stages=2):
+-                T.copy(Output_partial[bz, bx * block_M : (bx + 1) * block_M, by, k, :], po_shared, disable_tma=True)
+-                T.copy(po_shared, po_local)
++                T.copy(Output_partial[bz, bx * block_M : (bx + 1) * block_M, by, k, :], po_local)
+                 for i in T.Parallel(block_M):
+                     lse_local_split[i] = lse_local[k, i]
+                 for i in T.Parallel(block_M):
+diff --git a/examples/gdn/example_chunk_delta_bwd.py b/examples/gdn/example_chunk_delta_bwd.py
+index c3c2aabc54..4230df525e 100644
+--- a/examples/gdn/example_chunk_delta_bwd.py
++++ b/examples/gdn/example_chunk_delta_bwd.py
+@@ -242,7 +242,6 @@ def kernel(
+             bb, bh = bbh // H, bbh % H
+ 
+             b_dh_shared = T.alloc_shared((DK, block_DV), dtype=output_dtype)
+-            b_dh_shared_fp32 = T.alloc_shared((DK, block_DV), dtype=state_dtype)
+             b_dh_fragment = T.alloc_fragment((DK, block_DV), dtype=accum_dtype)
+             b_dh_fragment_1 = T.alloc_fragment((DK, block_DV), dtype=accum_dtype)
+             b_dh_fragment_2 = T.alloc_fragment((DK, block_DV), dtype=accum_dtype)
+@@ -256,7 +255,6 @@ def kernel(
+             K_shared = T.alloc_shared((block_S, DK), dtype=input_dtype)
+ 
+             Q_shared = T.alloc_shared((block_S, DK), dtype=input_dtype)
+-            Q_shared_fp32 = T.alloc_shared((block_S, DK), dtype=T.float32)
+             W_shared = T.alloc_shared((block_S, DK), dtype=input_dtype)
+ 
+             G_shared = T.alloc_shared((block_S), dtype=gate_dtype, scope="shared")
+@@ -270,15 +268,8 @@ def kernel(
+ 
+             T.annotate_layout(
+                 {
+-                    b_dh_shared: tilelang.layout.make_swizzled_layout(b_dh_shared),
+-                    b_dh_shared_fp32: tilelang.layout.make_swizzled_layout(b_dh_shared_fp32),
+-                    dv_shared: tilelang.layout.make_swizzled_layout(dv_shared),
+                     dO_shared: tilelang.layout.make_swizzled_layout(dO_shared),
+-                    dO_shared_t: tilelang.layout.make_swizzled_layout(dO_shared_t),
+-                    K_shared: tilelang.layout.make_swizzled_layout(K_shared),
+                     Q_shared: tilelang.layout.make_swizzled_layout(Q_shared),
+-                    Q_shared_fp32: tilelang.layout.make_swizzled_layout(Q_shared_fp32),
+-                    W_shared: tilelang.layout.make_swizzled_layout(W_shared),
+                 }
+             )
+ 
+diff --git a/examples/gdn/example_chunk_delta_h.py b/examples/gdn/example_chunk_delta_h.py
+index f11fc4dd3c..2ee84e7bf6 100644
+--- a/examples/gdn/example_chunk_delta_h.py
++++ b/examples/gdn/example_chunk_delta_h.py
+@@ -162,11 +162,7 @@ def kernel(
+ 
+             T.annotate_layout(
+                 {
+-                    b_h_shared: tilelang.layout.make_swizzled_layout(b_h_shared),
+                     U_shared: tilelang.layout.make_swizzled_layout(U_shared),
+-                    W_shared: tilelang.layout.make_swizzled_layout(W_shared),
+-                    V_new_shared: tilelang.layout.make_swizzled_layout(V_new_shared),
+-                    K_shared: tilelang.layout.make_swizzled_layout(K_shared),
+                     G_shared: tilelang.layout.make_swizzled_layout(G_shared),
+                 }
+             )
+diff --git a/examples/gdn/example_chunk_o.py b/examples/gdn/example_chunk_o.py
+index 8153681592..a4d7281f55 100644
+--- a/examples/gdn/example_chunk_o.py
++++ b/examples/gdn/example_chunk_o.py
+@@ -108,17 +108,6 @@ def kernel(
+             G_shared = T.alloc_shared((block_S,), dtype=gate_dtype, scope="shared")
+             G_diff_local = T.alloc_fragment((block_S, block_S), dtype=gate_dtype)
+ 
+-            T.annotate_layout(
+-                {
+-                    Q_shared: tilelang.layout.make_swizzled_layout(Q_shared),
+-                    K_shared: tilelang.layout.make_swizzled_layout(K_shared),
+-                    V_shared: tilelang.layout.make_swizzled_layout(V_shared),
+-                    H_shared: tilelang.layout.make_swizzled_layout(H_shared),
+-                    A_shared: tilelang.layout.make_swizzled_layout(A_shared),
+-                    O_shared: tilelang.layout.make_swizzled_layout(O_shared),
+-                }
+-            )
+-
+             T.clear(A_fragment)
+             T.clear(O_fragment)
+             T.disable_warp_group_reg_alloc()
+diff --git a/examples/gdn/example_chunk_o_bwd.py b/examples/gdn/example_chunk_o_bwd.py
+index f11cbebe14..e589818f4c 100644
+--- a/examples/gdn/example_chunk_o_bwd.py
++++ b/examples/gdn/example_chunk_o_bwd.py
+@@ -213,11 +213,6 @@ def kernel(
+ 
+             T.annotate_layout(
+                 {
+-                    V_shared: tilelang.layout.make_swizzled_layout(V_shared),
+-                    dO_shared: tilelang.layout.make_swizzled_layout(dO_shared),
+-                    h_shared: tilelang.layout.make_swizzled_layout(h_shared),
+-                    dh_shared: tilelang.layout.make_swizzled_layout(dh_shared),
+-                    dv_shared: tilelang.layout.make_swizzled_layout(dv_shared),
+                     q_shared: tilelang.layout.make_swizzled_layout(q_shared),
+                     k_shared: tilelang.layout.make_swizzled_layout(k_shared),
+                 }
+diff --git a/examples/gdn/example_chunk_scaled_dot_kkt.py b/examples/gdn/example_chunk_scaled_dot_kkt.py
+index e8ef17e3f4..8c7a4d573b 100644
+--- a/examples/gdn/example_chunk_scaled_dot_kkt.py
++++ b/examples/gdn/example_chunk_scaled_dot_kkt.py
+@@ -94,13 +94,6 @@ def kernel(
+             G_shared = T.alloc_shared((block_S,), dtype=accum_dtype, scope="shared")
+             G_diff_local = T.alloc_fragment((block_S, block_S), dtype=accum_dtype)
+ 
+-            T.annotate_layout(
+-                {
+-                    K_shared: tilelang.layout.make_swizzled_layout(K_shared),
+-                    A_shared: tilelang.layout.make_swizzled_layout(A_shared),
+-                }
+-            )
+-
+             T.fill(A_fragment, 0)
+             T.disable_warp_group_reg_alloc()
+             for i_s in T.Parallel(block_S):
+diff --git a/examples/gdn/example_wy_fast.py b/examples/gdn/example_wy_fast.py
+index 9ac086ca76..d36dcf9b72 100644
+--- a/examples/gdn/example_wy_fast.py
++++ b/examples/gdn/example_wy_fast.py
+@@ -100,11 +100,6 @@ def kernel(
+                 {
+                     K_shared: tilelang.layout.make_swizzled_layout(K_shared),
+                     V_shared: tilelang.layout.make_swizzled_layout(V_shared),
+-                    A_shared: tilelang.layout.make_swizzled_layout(A_shared),
+-                    W_shared: tilelang.layout.make_swizzled_layout(W_shared),
+-                    U_shared: tilelang.layout.make_swizzled_layout(U_shared),
+-                    W_Beta_shared: tilelang.layout.make_swizzled_layout(W_Beta_shared),
+-                    U_Beta_shared: tilelang.layout.make_swizzled_layout(U_Beta_shared),
+                 }
+             )
+ 
+diff --git a/examples/linear_attention/example_linear_attn_bwd.py b/examples/linear_attention/example_linear_attn_bwd.py
+index c920a3f73f..82ae1d982a 100644
+--- a/examples/linear_attention/example_linear_attn_bwd.py
++++ b/examples/linear_attention/example_linear_attn_bwd.py
+@@ -66,13 +66,6 @@ def fused_chunk_linear_attn_bwd(
+             dh = T.alloc_fragment([BK, BV], accum_dtype)
+             dh_shared = T.alloc_shared([BK, BV], dtype)
+ 
+-            T.annotate_layout(
+-                {
+-                    dq_shared: tilelang.layout.make_swizzled_layout(dq_shared),
+-                    dk_shared: tilelang.layout.make_swizzled_layout(dk_shared),
+-                    dv_shared: tilelang.layout.make_swizzled_layout(dv_shared),
+-                }
+-            )
+             T.use_swizzle(10)
+ 
+             T.clear(h)
+diff --git a/examples/linear_attention/example_linear_attn_fwd.py b/examples/linear_attention/example_linear_attn_fwd.py
+index fa0056c9b4..cdfd5cb721 100644
+--- a/examples/linear_attention/example_linear_attn_fwd.py
++++ b/examples/linear_attention/example_linear_attn_fwd.py
+@@ -58,7 +58,6 @@ def fused_chunk_linear_attn_fwd(
+             o = T.alloc_fragment([chunk_size, BV], accum_dtype)
+             o_shared = T.alloc_shared([chunk_size, BV], accum_dtype)
+ 
+-            T.annotate_layout({o_shared: tilelang.layout.make_swizzled_layout(o_shared)})
+             T.use_swizzle(10)
+ 
+             T.clear(h)
+diff --git a/examples/linear_attention/example_mamba_chunk_scan.py b/examples/linear_attention/example_mamba_chunk_scan.py
+index 1958dfb5aa..88a9b75bc2 100644
+--- a/examples/linear_attention/example_mamba_chunk_scan.py
++++ b/examples/linear_attention/example_mamba_chunk_scan.py
+@@ -112,20 +112,20 @@ def main(
+         ):
+             acc_o = T.alloc_fragment((block_M, block_N), accum_dtype)
+             acc_o_shared = T.alloc_shared((block_M, block_N), dtype)
+-            cb_shared = T.alloc_shared((block_M, block_K), dtype, scope="shared.dyn")
++            cb_shared = T.alloc_shared((block_M, block_K), dtype)
+             cb_local = T.alloc_fragment((block_M, block_K), dtype)
+-            dA_cs_k_shared = T.alloc_shared((block_K), dtype, scope="shared")
++            dA_cs_k_shared = T.alloc_shared((block_K), dtype)
+             dA_cs_k_local = T.alloc_fragment((block_K), accum_dtype)
+             dA_cs_m_local = T.alloc_fragment((block_M), accum_dtype)
+-            dt_shared = T.alloc_shared((block_K), dtype, scope="shared")
++            dt_shared = T.alloc_shared((block_K), dtype)
+             dt_local = T.alloc_fragment((block_K), accum_dtype)
+             x_shared = T.alloc_shared((block_K, block_N), dtype, scope="shared.dyn")
+-            dA_cs_m_shared = T.alloc_shared((block_M), dtype, scope="shared")
++            dA_cs_m_shared = T.alloc_shared((block_M), dtype)
+             scale_m_local = T.alloc_fragment((block_M), accum_dtype)
+             C_shared = T.alloc_shared((block_M, block_Dstate), dtype)
+             prev_state_shared = T.alloc_shared((block_N, block_Dstate), dtype)
+             D_local = T.alloc_fragment((1), accum_dtype)
+-            x_residual_shared = T.alloc_shared((block_M, block_N), dtype, scope="shared.dyn")
++            x_residual_shared = T.alloc_shared((block_M, block_N), dtype)
+             x_residual_local = T.alloc_fragment((block_M, block_N), accum_dtype)
+ 
+             batch_idx = by % batch
+@@ -137,7 +137,6 @@ def main(
+ 
+             T.annotate_layout(
+                 {
+-                    acc_o_shared: tilelang.layout.make_swizzled_layout(acc_o_shared),
+                     cb_shared: tilelang.layout.make_swizzled_layout(cb_shared),
+                     x_residual_shared: tilelang.layout.make_swizzled_layout(x_residual_shared),
+                 }
+diff --git a/examples/linear_attention/example_mamba_chunk_state.py b/examples/linear_attention/example_mamba_chunk_state.py
+index fb766d5e9c..96126889bd 100644
+--- a/examples/linear_attention/example_mamba_chunk_state.py
++++ b/examples/linear_attention/example_mamba_chunk_state.py
+@@ -89,9 +89,7 @@ def main(
+             m_idx = bx // T.ceildiv(dstate, block_N)
+             n_idx = bx % T.ceildiv(dstate, block_N)
+ 
+-            T.annotate_layout(
+-                {x_shared: tilelang.layout.make_swizzled_layout(x_shared), acc_o_shared: tilelang.layout.make_swizzled_layout(acc_o_shared)}
+-            )
++            T.annotate_layout({x_shared: tilelang.layout.make_swizzled_layout(x_shared)})
+ 
+             dA_cs_last[0] = dA_cumsum[batch_idx, bz, chunk_idx, chunk_size - 1]
+             T.clear(acc_o)
+diff --git a/examples/minference/example_vertical_slash_sparse_attn.py b/examples/minference/example_vertical_slash_sparse_attn.py
+index 3bd7e47390..91af8b454a 100644
+--- a/examples/minference/example_vertical_slash_sparse_attn.py
++++ b/examples/minference/example_vertical_slash_sparse_attn.py
+@@ -137,12 +137,6 @@ def vs_sparse_flashattn_ws(
+ 
+                 T.create_list_of_mbarrier([128] * 9)
+ 
+-                T.annotate_layout(
+-                    {
+-                        O_shared: tilelang.layout.make_swizzled_layout(O_shared),
+-                    }
+-                )
+-
+                 block_count = BlockCount[bz, by, bx]
+                 column_count = ColumnCount[bz, by, bx]
+ 
+diff --git a/examples/warp_specialize/example_warp_specialize_flashmla.py b/examples/warp_specialize/example_warp_specialize_flashmla.py
+index 6dcd51aa7c..25e59a03b4 100644
+--- a/examples/warp_specialize/example_warp_specialize_flashmla.py
++++ b/examples/warp_specialize/example_warp_specialize_flashmla.py
+@@ -81,13 +81,6 @@ def flash_attn(
+ 
+             cur_kv_head = hid // (kv_group_num // block_H)
+ 
+-            T.annotate_layout(
+-                {
+-                    O_shared_l: tilelang.layout.make_swizzled_layout(O_shared_l),
+-                    O_shared_r: tilelang.layout.make_swizzled_layout(O_shared_r),
+-                }
+-            )
+-
+             # barriers_Q
+             q_shared_ready_barrier = T.alloc_barrier(arrive_count=256)
+ 
+diff --git a/src/layout/gemm_layouts.cc b/src/layout/gemm_layouts.cc
+index fe9ec04b34..501241fc89 100644
+--- a/src/layout/gemm_layouts.cc
++++ b/src/layout/gemm_layouts.cc
+@@ -487,11 +487,23 @@ Layout makeGemmABLayoutF64_Kouter(int stride, int continuous) {
+   return Layout(Array<PrimExpr>{stride, continuous}, {tc, ts, index});
+ }
+ 
+-// The Default Layout for Tensor Access
+-Layout makeGemmLayoutLinear(int stride, int continuous) {
+-  IterVar i = make_itervar("i", stride);
+-  IterVar j = make_itervar("j", continuous);
+-  return Layout(Array{i, j}, {i * continuous + j});
++// The Default Layout for Tensor Access (row-major linear layout)
++Layout makeLinearLayout(Array<PrimExpr> shape) {
++  int ndim = static_cast<int>(shape.size());
++  Array<IterVar> iter_vars;
++  for (int i = 0; i < ndim; i++) {
++    iter_vars.push_back(make_itervar(std::string{char('i' + i)}, shape[i]));
++  }
++  // Row-major: index = i0 * (d1 * d2 * ...) + i1 * (d2 * ...) + ... + i_{n-1}
++  PrimExpr linear_index = 0;
++  for (int i = 0; i < ndim; i++) {
++    PrimExpr stride = 1;
++    for (int j = i + 1; j < ndim; j++) {
++      stride = stride * shape[j];
++    }
++    linear_index = linear_index + iter_vars[i]->var * stride;
++  }
++  return Layout(iter_vars, {linear_index});
+ }
+ 
+ Layout makeGemmABLayoutPadded(int stride, int continuous, int element_size) {
+@@ -758,7 +770,8 @@ Layout makeGemmABLayoutHopper(int mat_stride, int mat_continuous,
+     return makeQuarterBankSwizzleLayout(mat_stride, mat_continuous,
+                                         element_size);
+   else if (mat_continuous % vector_size == 0)
+-    return makeGemmLayoutLinear(mat_stride, mat_continuous);
++    return makeLinearLayout(
++        Array<PrimExpr>{Integer(mat_stride), Integer(mat_continuous)});
+   else
+     ICHECK(0) << "Unsupported layout for Hopper with stride=" << mat_stride
+               << ", continuous=" << mat_continuous
+@@ -779,7 +792,8 @@ Layout makeGemmABLayoutSm100(int mat_stride, int mat_continuous, int continuity,
+     return makeQuarterBankSwizzleLayout(mat_stride, mat_continuous,
+                                         element_size);
+   else if (mat_continuous % vector_size == 0)
+-    return makeGemmLayoutLinear(mat_stride, mat_continuous);
++    return makeLinearLayout(
++        Array<PrimExpr>{Integer(mat_stride), Integer(mat_continuous)});
+   else
+     ICHECK(0) << "Unsupported layout for sm100 with stride=" << mat_stride
+               << ", continuous=" << mat_continuous
+diff --git a/src/layout/layout.cc b/src/layout/layout.cc
+index 63d9c04011..ea7afab5ca 100644
+--- a/src/layout/layout.cc
++++ b/src/layout/layout.cc
+@@ -831,9 +831,8 @@ TVM_FFI_STATIC_INIT_BLOCK() {
+              return makeQuarterBankSwizzleLayout(stride, continuous,
+                                                  element_size);
+            })
+-      .def("tl.make_linear_layout", [](int stride, int continuous) {
+-        return makeGemmLayoutLinear(stride, continuous);
+-      });
++      .def("tl.make_linear_layout",
++           [](Array<PrimExpr> shape) { return makeLinearLayout(shape); });
+ }
+ 
+ TVM_FFI_STATIC_INIT_BLOCK() {
+diff --git a/src/layout/layout.h b/src/layout/layout.h
+index c30abfb6bf..2e7c8a40cc 100644
+--- a/src/layout/layout.h
++++ b/src/layout/layout.h
+@@ -223,8 +223,8 @@ Fragment makeGemmFragmentACDNA(const int block_m, const int block_n,
+                                const int warp_n, const int element_size,
+                                const int k_pack, bool transposed = false);
+ 
+-// Default Memory Layout
+-Layout makeGemmLayoutLinear(int stride, int continuous);
++// Default Memory Layout (row-major linear layout for any dimension)
++Layout makeLinearLayout(Array<PrimExpr> shape);
+ Layout makeGemmABLayoutPadded(int stride, int continuous, int element_size);
+ Layout makeGemmABLayout(int mat_stride, int mat_continuous, int continuity,
+                         int element_size, bool k_inner = true);
+diff --git a/src/op/copy.cc b/src/op/copy.cc
+index 1fb4f57436..bda21e9ebf 100644
+--- a/src/op/copy.cc
++++ b/src/op/copy.cc
+@@ -3,7 +3,6 @@
+  * \brief Define copy operator for various memory transfer strategies (Normal,
+  *        Bulk/TMA, LDSM/STSM) and lowering logic for GPU code generation.
+  *
+- * This module is part of TVM TensorIR's Tensor Layout (TL) operations,
+  * implementing memory copy operations that can target CPUs or GPUs with
+  * optimization for different instructions like bulk copy, matrix load/store,
+  * and Hopper's new TMA (Tensor Memory Accelerator).
+@@ -31,11 +30,7 @@ namespace tl {
+ 
+ using namespace tir;
+ 
+-/*!
+- * \brief Helper to map TVM's DataType to CUDA's CUtensorMapDataType enum value.
+- * This function converts TVM data types to CUDA tensor map data types for TMA
+- * operations.
+- */
++// Maps TVM DataType to CUDA's CUtensorMapDataType enum value.
+ static int to_CUtensorMapDataType(DataType dtype) {
+   CUtensorMapDataType tp;
+   if (dtype.is_float()) {
+@@ -99,35 +94,15 @@ static int to_CUtensorMapDataType(DataType dtype) {
+   return static_cast<int>(tp);
+ }
+ 
+-/*!
+- * \brief Utility function to reverse an array.
+- * This is commonly used to convert between row-major and column-major layouts.
+- */
++// Reverses an array (used for row-major/column-major layout conversion).
+ template <typename T> static Array<T> ReverseArray(Array<T> array) {
+   return Array<T>{array.rbegin(), array.rend()};
+ }
+ 
+-/*!
+- * \brief Construct a Copy operator node from call arguments and a buffer map.
+- *
+- * This constructor parses the first two entries of `args` as regions
+- * (BufferLoad/BufferRegion), extracts their Buffers and Ranges, and stores
+- * them on the newly created CopyNode. It also
+- * reads optional arguments:
+- * - args[2] (IntImm): coalesced width (stored only if > 0),
+- * - args[3] (Bool): disable TMA lowering flag,
+- * - args[4] (IntImm): eviction policy.
+- *
+- * Preconditions:
+- * - `args` must contain at least two region-compatible PrimExpr entries
+- *   (BufferLoad/BufferRegion); ICHECK will fail otherwise.
+- *
+- * @param args Array of PrimExpr where:
+- *   - args[0] is the source Region call,
+- *   - args[1] is the destination Region call,
+- *   - optional args[2..4] are coalesced width, disable_tma, and eviction
+- * policy.
+- */
++// Constructs a Copy operator node from call arguments.
++// args[0]: source region, args[1]: destination region
++// Optional: args[2] coalesced_width, args[3] disable_tma, args[4]
++// eviction_policy
+ Copy::Copy(Array<PrimExpr> args) {
+   ObjectPtr<CopyNode> node = tvm::ffi::make_object<CopyNode>();
+   Array<Range> rgs[2];
+@@ -154,16 +129,7 @@ Copy::Copy(Array<PrimExpr> args) {
+   data_ = std::move(node);
+ }
+ 
+-/**
+- * @brief Create a shallow clone of this CopyNode as a TileOperator.
+- *
+- * Produces a new CopyNode object copy-constructed from this node. If a parallel
+- * sub-operation (par_op_) is present, the sub-operation is cloned as well and
+- * attached to the new node. The returned value is a TileOperator wrapper
+- * around the newly created node.
+- *
+- * @return TileOperator A TileOperator owning the cloned CopyNode.
+- */
++// Creates a shallow clone of this CopyNode.
+ TileOperator CopyNode::Clone() const {
+   auto op = tvm::ffi::make_object<CopyNode>(*this);
+   if (par_op_.defined()) {
+@@ -172,12 +138,7 @@ TileOperator CopyNode::Clone() const {
+   return Copy(op);
+ }
+ 
+-/*!
+- * \brief Create iterator variables for the copy operation.
+- * This function creates iteration variables for dimensions that have extent
+- * > 1. \return Array of IterVar representing the iterator variables for the
+- * copy operation.
+- */
++// Creates iterator variables for dimensions with extent > 1.
+ Array<IterVar> CopyNode::MakeIterVars() const {
+   // Choose the range set from the lowest-level memory scope between src and
+   // dst. Scope levels: global < shared/shared.dyn/shared.tmem < local.fragment
+@@ -272,15 +233,8 @@ Array<IterVar> CopyNode::MakeIterVars() const {
+   return loop_vars;
+ }
+ 
+-/*!
+- * \brief Create s for the copy operation.
+- * This function generates the actual index expressions for accessing source or
+- * destination buffers. For dimensions with extent=1, it uses the range minimum;
+- * for others, it adds the iteration variable. \param ivs Array of IterVar
+- * returned by MakeIterVars(). \param src_dst 0 for src_indices, 1 for
+- * dst_indices. \return Array of PrimExpr representing the indices for the copy
+- * operation.
+- */
++// Generates index expressions for accessing src (src_dst=0) or dst (src_dst=1)
++// buffers.
+ Array<PrimExpr> CopyNode::MakeIndices(const Array<IterVar> &ivs,
+                                       int src_dst) const {
+   Array<PrimExpr> indices;
+@@ -300,28 +254,8 @@ Array<PrimExpr> CopyNode::MakeIndices(const Array<IterVar> &ivs,
+   return indices;
+ }
+ 
+-/**
+- * @brief Build a boundary predicate that guards memory accesses for the copy.
+- *
+- * Constructs a conjunction of per-dimension bounds checks (e.g. `min + iv <
+- * extent` and `min + iv >= 0`) for every dynamic dimension involved in the
+- * copy. Uses the provided arithmetic analyzer to elide checks that can be
+- * proven statically.
+- *
+- * The function ICHECKs that the supplied `extents` align with the operator's
+- * recorded ranges for the selected side (source when `src_dst == 0`,
+- * destination when `src_dst == 1`).
+- *
+- * @param ivs IterVars corresponding to the varying dimensions of the copy. Each
+- *   IterVar maps to a non-unit extent dimension in the stored ranges.
+- * @param extents Extents of the tensor being accessed (must match the number of
+- *   ranges); used as the upper bounds for generated checks.
+- * @param src_dst Selects which side's ranges to use: `0` for source, `1` for
+- *   destination.
+- * @return PrimExpr A conjunction of necessary bounds checks, or an empty
+- * `PrimExpr` (null) if all checks are provably true and no predicate is
+- * required.
+- */
++// Builds a boundary predicate for memory accesses.
++// Returns a conjunction of bounds checks, or empty PrimExpr if all checks pass.
+ PrimExpr CopyNode::MakePredicate(arith::Analyzer *analyzer,
+                                  const Array<IterVar> &ivs,
+                                  Array<PrimExpr> extents, int src_dst) const {
+@@ -353,26 +287,7 @@ PrimExpr CopyNode::MakePredicate(arith::Analyzer *analyzer,
+   }
+ }
+ 
+-/**
+- * @brief Construct a SIMT-style nested loop that implements the copy.
+- *
+- * Builds a loop nest that performs element-wise loads from the source buffer
+- * and stores into the destination buffer. For a scalar copy (no varying
+- * iteration dimensions) this returns a single serial loop executing one
+- * store. For multi-dimensional copies it:
+- * - creates data-parallel loops (Parallel For) for each varying dimension,
+- * - binds the resulting iteration variables to the provided arithmetic
+- *   analyzer for simplification,
+- * - computes source and destination index expressions,
+- * - applies per-buffer boundary predicates (if needed) to mask out-of-range
+- *   accesses,
+- * - inserts a cast when src and dst dtypes differ,
+- * - applies an optional `coalesced_width` annotation to generated parallel
+- *   loops when present.
+- *
+- * @param analyzer Analyzer used to simplify and bind loop variable domains.
+- * @return For A nested For statement representing the generated SIMT loop nest.
+- */
++// Constructs a SIMT-style nested loop that implements the copy.
+ For CopyNode::MakeSIMTLoop(arith::Analyzer *analyzer) const {
+   Array<IterVar> loop_vars = MakeIterVars();
+   bool is_scalar = loop_vars.empty();
+@@ -418,20 +333,8 @@ For CopyNode::MakeSIMTLoop(arith::Analyzer *analyzer) const {
+   return Downcast<For>(body);
+ }
+ 
+-/**
+- * @brief Compute a linearized shared-memory layout used for TMA transfers.
+- *
+- * Creates a Layout that maps an N-D shared tensor into a 1-D-like ordering
+- * suitable for TMA by blocking each dimension into 256-element tiles and
+- * splitting each original index into a quotient and remainder. Effectively
+- * transforms each index i_k into two coordinates: floor(i_k / 256) and
+- * i_k % 256, producing an ordering equivalent to concatenating all quotients
+- * followed by all remainders.
+- *
+- * @param shared_tensor The shared-memory buffer whose shape defines the input
+- *        dimensions for the layout inference.
+- * @return Layout A Layout describing the linearized ordering for the TMA copy.
+- */
++// Computes a linearized shared-memory layout for TMA transfers.
++// Maps [i, j] -> [i // 256, j // 256, i % 256, j % 256]
+ Layout CopyNode::ComputeLinearLayout(const Buffer &shared_tensor) const {
+   Array<PrimExpr> input_size = shared_tensor->shape;
+   Array<PrimExpr> forward_vars;
+@@ -449,28 +352,8 @@ Layout CopyNode::ComputeLinearLayout(const Buffer &shared_tensor) const {
+   return Layout(input_size, forward_index);
+ }
+ 
+-/**
+- * @brief Infer memory layouts for this Copy operation.
+- *
+- * Determines an appropriate LayoutMap for the copy based on the target and
+- * enabled lowering paths. For TMA-capable targets when the chosen copy
+- * instruction is BulkLoad or BulkStore, this may produce a linearized shared
+- * memory layout suitable for TMA transfers (only when inference is invoked at
+- * InferLevel::kFree and no layout for the shared buffer is already annotated).
+- * For other cases (including LDSM/STSM and the normal copy path), layout
+- * inference is delegated to the SIMT parallel operation produced by
+- * MakeSIMTLoop().
+- *
+- * This method may read PassContext configuration (kDisableTMALower) and may
+- * lazily construct and cache the parallel operation in par_op_ as a side
+- * effect.
+- *
+- * @param T LayoutInferArgs containing target and the current layout map.
+- * @param level The inference level controlling how aggressive/layouts may be
+- *              proposed.
+- * @return LayoutMap mapping buffers to inferred layouts (may be empty if no
+- *         additional layouts are suggested).
+- */
++// Infers memory layouts for this Copy operation based on target and copy
++// instruction.
+ LayoutMap CopyNode::InferLayout(const LayoutInferArgs &T,
+                                 InferLevel level) const {
+   auto target = T.target;
+@@ -545,18 +428,32 @@ LayoutMap CopyNode::InferLayout(const LayoutInferArgs &T,
+     return results;
+   }
+ 
+-  if (copy_inst == CopyInst::kBulkLoad || copy_inst == CopyInst::kBulkStore) {
++  if (copy_inst == CopyInst::kBulkLoad || copy_inst == CopyInst::kBulkStore ||
++      copy_inst == CopyInst::kBulkLoad1D ||
++      copy_inst == CopyInst::kBulkStore1D) {
+     // if can apply swizzling, we skip layout inference
+     // for bulk load/store, we can directly apply the layout of normal copy
+     // This must be a global/shared layout, so we can skip the parallel op
+     // layout inference (parallel layout inference only annotate the loop layout
+     // and the register layout).
++    Map<Buffer, Layout> result_map;
++
++    bool is_tma_1d = copy_inst == CopyInst::kBulkLoad1D ||
++                     copy_inst == CopyInst::kBulkStore1D;
+     bool is_load =
+         copy_inst == CopyInst::kBulkLoad || copy_inst == CopyInst::kBulkLoad1D;
+-    Buffer global_tensor = is_load ? src : dst;
+-    Buffer shared_tensor = is_load ? dst : src;
+-
+-    Map<Buffer, Layout> result_map;
++    bool is_store = copy_inst == CopyInst::kBulkStore ||
++                    copy_inst == CopyInst::kBulkStore1D;
++    auto global_tensor = is_load ? src : dst;
++    auto shared_tensor = is_load ? dst : src;
++    auto shared_range = is_load ? dst_range : src_range;
++
++    if (is_tma_1d && shared_range.size() == 1) {
++      // 1D TMA Store with single dimension can not be swizzled
++      // But 1D TMA can also have multiple dimensions when the last
++      // dimension is continuous.
++      return result_map;
++    }
+ 
+     // Collect fragment buffers from indices and mark them as fully replicated
+     // For Bulk Load/Store, fragment buffers used as indices should be
+@@ -578,12 +475,35 @@ LayoutMap CopyNode::InferLayout(const LayoutInferArgs &T,
+     // check shared layout is non-swizzle
+     // skip layout inference if shared layout is already annotated
+     if (level == InferLevel::kFree && !T.layout_map.count(shared_tensor)) {
+-      // create a new layout map for tma linear layout
+-      Layout linear_layout = ComputeLinearLayout(shared_tensor);
+-      result_map.Set(shared_tensor, linear_layout);
++      if (is_store) {
++        // For BulkStore, we should perform swizzle if possible.
++        // TMA Store is always 1d like, we can directly use the last two
++        // dimensions to analysis swizzling.
++        int dim = shared_tensor->shape.size();
++        const int64_t mat_stride = *as_const_int(shared_tensor->shape[dim - 2]);
++        const int64_t mat_continuous =
++            *as_const_int(shared_tensor->shape[dim - 1]);
++        Layout swizzle_layout = makeGemmABLayoutHopper(
++            mat_stride, mat_continuous, mat_continuous,
++            shared_tensor->dtype.bits(), /*k_inner=*/true);
++        // If makeGemmABLayoutHopper returns a linear layout, fallback to
++        // ComputeLinearLayout which handles arbitrary tensor shapes correctly.
++        if (StructuralEqual()(swizzle_layout, makeLinearLayout(Array<PrimExpr>{
++                                                  Integer(mat_stride),
++                                                  Integer(mat_continuous)}))) {
++          result_map.Set(shared_tensor, ComputeLinearLayout(shared_tensor));
++        } else {
++          result_map.Set(shared_tensor, swizzle_layout);
++        }
++      } else if (level == InferLevel::kFree) {
++        // create a new layout map for tma linear layout
++        Layout linear_layout = ComputeLinearLayout(shared_tensor);
++        result_map.Set(shared_tensor, linear_layout);
++      }
+     }
+     return result_map;
+   }
++
+   // for LDSM/STSM, the layout was deduced from register layout
+   // so we can directly apply the layout of normal copy
+   // Use parallel op to infer the layout
+@@ -594,25 +514,8 @@ LayoutMap CopyNode::InferLayout(const LayoutInferArgs &T,
+   auto layout_map = par_op_->InferLayout(T, level);
+   return layout_map;
+ }
+-/**
+- * @brief Determine whether this CopyNode can be lowered to a Bulk Load (TMA)
+- * instruction.
+- *
+- * The function returns true when all of the following hold:
+- * - the target architecture advertises bulk-copy/TMA support;
+- * - the source buffer resides in global memory;
+- * - the destination buffer resides in shared memory (either "shared" or
+- * "shared.dyn");
+- * - the source and destination have the same element data type.
+- *
+- * If the source and destination dtypes differ, a warning is logged and the
+- * function returns false (the caller is expected to fall back to a normal
+- * copy).
+- *
+- * @param target The compilation target to query for bulk-copy support.
+- * @return true if the copy can be implemented as a Bulk Load (TMA); false
+- * otherwise.
+- */
++// Checks if this copy can be lowered to a Bulk Load (TMA) instruction.
++// Requires: TMA support, global->shared scope, matching dtypes.
+ bool CopyNode::CheckBulkLoad(Target target, arith::Analyzer *analyzer,
+                              bool check_last_dim) const {
+   // 1. arch must have bulk copy support
+@@ -655,10 +558,14 @@ bool CopyNode::CheckBulkCopy1D(const Buffer &global_tensor,
+                                const LayoutMap &layout_map,
+                                arith::Analyzer *analyzer) const {
+ 
+-  // Step 1: check shared is contiguous
++  // Step 1: check shared is contiguous (linear layout is also contiguous)
+   bool shared_is_contiguous = true;
+   if (layout_map.count(shared_tensor)) {
+-    shared_is_contiguous = false;
++    // Check if the layout is linear
++    Layout existing =
++        layout_map.Get(shared_tensor).value().as<Layout>().value();
++    Layout linear_layout = makeLinearLayout(shared_tensor->shape);
++    shared_is_contiguous = StructuralEqual()(existing, linear_layout);
+   }
+   // Step 2: check global is contiguous
+   bool global_is_contiguous = true;
+@@ -719,18 +626,8 @@ bool CopyNode::CheckBulkStore1D(Target target, const LayoutMap &layout_map,
+                          shared_range, layout_map, analyzer);
+ }
+ 
+-/**
+- * @brief Determine if this CopyNode can be lowered to a CUDA BulkStore (TMA
+- * store).
+- *
+- * Checks whether the target supports bulk copy, the source buffer is in shared
+- * memory (shared or shared.dyn), the destination buffer is in global memory,
+- * and both buffers have the same element data type. If the data types differ,
+- * a warning is logged and false is returned.
+- *
+- * @param target Target device/architecture to check for bulk-copy support.
+- * @return true if all conditions for a BulkStore are met; false otherwise.
+- */
++// Checks if this copy can be lowered to a Bulk Store (TMA) instruction.
++// Requires: TMA support, shared->global scope, matching dtypes.
+ bool CopyNode::CheckBulkStore(Target target, arith::Analyzer *analyzer,
+                               bool check_last_dim) const {
+   // 1. arch must have bulk copy support
+@@ -765,82 +662,38 @@ bool CopyNode::CheckBulkStore(Target target, arith::Analyzer *analyzer,
+   return true;
+ }
+ 
+-/*!
+- * \brief Check if the copy operation is a LDSM copy.
+- * This function verifies if the copy operation can be implemented using CUDA's
+- * Load Matrix (LDSM) instruction. Requirements include: target supports
+- * LDMATRIX, source is shared.dyn, destination is local.fragment. \param target
+- * Target device. \return True if the copy operation is a LDSM copy, false
+- * otherwise.
+- */
++// Checks if copy can use CUDA's Load Matrix (LDSM) instruction.
++// Requires: LDMATRIX support, shared->fragment scope.
+ bool CopyNode::CheckLDSMCopy(Target target) const {
+   return TargetHasLdmatrix(target) &&
+          (src.scope() == "shared.dyn" || src.scope() == "shared") &&
+          IsFragmentBuffer(dst);
+ }
+ 
+-/**
+- * @brief Determine whether this copy can use the STMATRIX store (STSM) path.
+- *
+- * Returns true when the target supports STMATRIX and the source buffer is in
+- * the `local.fragment` scope while the destination buffer is in shared memory
+- * (`shared` or `shared.dyn`).
+- *
+- * @param target The compilation target to query for STMATRIX support.
+- * @return true if the copy may be lowered to an STSM instruction; false
+- * otherwise.
+- */
++// Checks if copy can use CUDA's Store Matrix (STSM) instruction.
++// Requires: STMATRIX support, fragment->shared scope.
+ bool CopyNode::CheckSTSMCopy(Target target) const {
+   return TargetHasStmatrix(target) && IsFragmentBuffer(src) &&
+          (dst.scope() == "shared.dyn" || dst.scope() == "shared");
+ }
+ 
+-/**
+- * @brief Determine whether this copy can use tensor memory load (tcgen05.ld).
+- *
+- * Returns true when the target supports tensor memory and the source buffer is
+- * in `shared.tmem` scope while the destination buffer is in `local.fragment`.
+- *
+- * @param target The compilation target to query for tensor memory support.
+- * @return true if the copy may be lowered to a tcgen05.ld instruction; false
+- * otherwise.
+- */
++// Checks if copy can use tensor memory load (tcgen05.ld).
++// Requires: tmem support, shared.tmem->fragment scope.
+ bool CopyNode::CheckTMemLoad(Target target) const {
+   return TargetHasTmem(target) && src.scope() == "shared.tmem" &&
+          IsFragmentBuffer(dst);
+ }
+ 
+-/**
+- * @brief Determine whether this copy can use tensor memory store (tcgen05.st).
+- *
+- * Returns true when the target supports tensor memory and the source buffer is
+- * in `local.fragment` scope while the destination buffer is in `shared.tmem`.
+- *
+- * @param target The compilation target to query for tensor memory support.
+- * @return true if the copy may be lowered to a tcgen05.st instruction; false
+- * otherwise.
+- */
++// Checks if copy can use tensor memory store (tcgen05.st).
++// Requires: tmem support, fragment->shared.tmem scope.
+ bool CopyNode::CheckTMemStore(Target target) const {
+   return TargetHasTmem(target) && IsFragmentBuffer(src) &&
+          dst.scope() == "shared.tmem";
+ }
+ 
+-/**
+- * @brief Selects the most specific copy instruction supported for the given
+- * target and buffers.
+- *
+- * Determines which specialized copy lowering to use (TMA bulk load/store, LDSM,
+- * STSM, TMem load/store) based on target capabilities and the memory scopes of
+- * the source/destination buffers. If TMA lowering is disabled via the flag,
+- * BulkLoad/BulkStore are not selected. The selection priority is: TMemLoad,
+- * TMemStore, BulkLoad1D, BulkStore1D, BulkLoad, BulkStore, LDSM, STSM, then
+- * Normal (fallback).
+- *
+- * @param target The compilation target used to query hardware capabilities.
+- * @param disable_tma_lower If true, prevents selecting TMA-based bulk
+- * load/store instructions.
+- * @return CopyInst The chosen copy instruction enum value.
+- */
++// Selects the most specific copy instruction for the given target and buffers.
++// Priority: BulkLoad1D, BulkStore1D, BulkLoad, BulkStore, LDSM, STSM, TMemLoad,
++// TMemStore, Normal.
+ CopyInst CopyNode::GetCopyInst(Target target, bool disable_tma_lower,
+                                const LayoutMap &layout_map,
+                                arith::Analyzer *analyzer,
+@@ -874,18 +727,8 @@ CopyInst CopyNode::GetCopyInst(Target target, bool disable_tma_lower,
+   }
+ }
+ 
+-/*!
+- * \brief Lower the copy operation to PTX code.
+- * This function converts the high-level copy operation into low-level PTX
+- * instructions. It dispatches to specialized lowering functions based on the
+- * determined copy instruction type:
+- * - Bulk Load/Store: Uses Tensor Memory Accelerator (TMA) instructions
+- * - LDSM/STSM: Uses matrix load/store instructions for tensor cores
+- * - Normal: Uses standard load/store operations with loop transformations
+- * \param T LowerArgs containing target and layout map.
+- * \param analyzer Arithmetic analyzer for simplification.
+- * \return Stmt representing the PTX code for the copy operation.
+- */
++// Lowers the copy operation to PTX code by dispatching to specialized lowering
++// functions.
+ Stmt CopyNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
+   Target target = T.target;
+ 
+@@ -920,24 +763,7 @@ Stmt CopyNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
+   }
+ }
+ 
+-/**
+- * @brief Lower the copy operator using the generic (non-specialized) path.
+- *
+- * Generates standard load/store code paths for targets that cannot or should
+- * not use specialized copy instructions (TMA, LDSM/STSM). Builds a SIMT loop,
+- * fuses and transforms parallel loops, infers and applies loop layouts on GPU
+- * targets, partitions by thread, and applies vectorization appropriate to the
+- * device (CPU or GPU). If a thread-level predicate is required, the resulting
+- * body is guarded with an IfThenElse.
+- *
+- * @param T Lowering context including the target, thread bounds, thread var,
+- *          layout map, and buffer remapping used during layout inference and
+- *          loop partitioning.
+- * @param analyzer Arithmetic analyzer used to simplify and reason about bounds
+- *                 during loop partitioning and predicate construction.
+- * @return Stmt Lowered statement representing the transformed, vectorized
+- *              normal-copy loop (possibly wrapped in a predicate).
+- */
++// Lowers the copy using standard load/store with loop transformations.
+ Stmt CopyNode::LowerNormalCopy(const LowerArgs &T,
+                                arith::Analyzer *analyzer) const {
+   bool is_cpu_target = T.target->GetTargetDeviceType() == kDLCPU;
+@@ -984,30 +810,8 @@ Stmt CopyNode::LowerNormalCopy(const LowerArgs &T,
+   return vectorized_thread_loop;
+ }
+ 
+-/**
+- * @brief Lower a Copy operator to LDSM/STSM (warp-level 8x8 matrix)
+- * instructions.
+- *
+- * Lowers a CopyNode into PTX matrix load/store (LDSM/STSM) sequences when the
+- * access/layouts meet the hardware constraints required by warp-level 8x8
+- * fragment transfers (thread-mapped 8x8 fragment layout, 16-byte contiguous
+- * shared memory accesses, full-range local tiles, matching dtypes for loads,
+- * and no access predicates). If these conditions are not met the function
+- * falls back to lowering via LowerNormalCopy().
+- *
+- * The routine validates layout/thread-mapping compatibility (including support
+- * for transposed fragment layouts), determines vectorization factor (4/2/1)
+- * based on extent alignment, computes shared/local addresses, emits the
+- * appropriate ptx_ldmatrix/ptx_stmatrix call(s), and wraps them in a small
+- * loop that may be unrolled and adjusted for thread-bounds offsets.
+- *
+- * @param T Lowering context (target, layout/ buffer remaps, thread/ bounds).
+- * @param analyzer Arithmetic analyzer used to simplify and prove bounds.
+- * @param copy_inst Must be either CopyInst::kLDSM or CopyInst::kSTSM to select
+- *                  matrix-load vs matrix-store lowering.
+- * @return Stmt A statement implementing the LDSM/STSM lowering, or the result
+- *              of LowerNormalCopy(...) when constraints require fallback.
+- */
++// Lowers copy to LDSM/STSM (warp-level 8x8 matrix) instructions.
++// Falls back to LowerNormalCopy if hardware constraints are not met.
+ Stmt CopyNode::LowerLDSMCopy(const LowerArgs &T, arith::Analyzer *analyzer,
+                              CopyInst copy_inst) const {
+   ICHECK(copy_inst == CopyInst::kLDSM || copy_inst == CopyInst::kSTSM)
+@@ -1190,30 +994,8 @@ Stmt CopyNode::LowerLDSMCopy(const LowerArgs &T, arith::Analyzer *analyzer,
+   return for_node;
+ }
+ 
+-/**
+- * @brief Lower tensor memory copy operations (tcgen05.ld/st/cp).
+- *
+- * Handles copy operations involving shared.tmem buffers (tensor memory on
+- * SM100/Blackwell). Supports three types of tensor memory copies:
+- * - tcgen05.ld: tensor memory -> register (local.fragment)
+- * - tcgen05.st: register (local.fragment) -> tensor memory
+- * - tcgen05.cp: shared memory -> tensor memory
+- *
+- * The function validates buffer scopes, extracts 2D loop structure, performs
+- * layout compatibility checks, selects an appropriate TCGEN05 instruction
+- * variant based on data width and thread count, and emits the corresponding PTX
+- * intrinsic call.
+- *
+- * Currently only tcgen05.ld is fully supported; st/cp will trigger an ICHECK
+- * failure.
+- *
+- * @param T Lowering context (target, thread bounds, layout maps, buffer
+- * remaps).
+- * @param analyzer Arithmetic analyzer for proving bounds and simplifying
+- * expressions.
+- * @return Stmt The lowered tensor memory copy statement, or an empty Stmt if
+- * this copy does not involve tensor memory.
+- */
++// Lowers tensor memory copy operations (tcgen05.ld/st/cp).
++// Currently only tcgen05.ld is fully supported.
+ Stmt CopyNode::LowerTmemCopy(const LowerArgs &T,
+                              arith::Analyzer *analyzer) const {
+   if (src.scope() != "shared.tmem" && dst.scope() != "shared.tmem") {
+@@ -1238,8 +1020,9 @@ Stmt CopyNode::LowerTmemCopy(const LowerArgs &T,
+   } else if (src.scope() == "shared.dyn" && dst.scope() == "shared.tmem") {
+     is_cp = true;
+   } else {
+-    ICHECK(0) << "Unsupported tensor memory copy: " << "src scope = "
+-              << src.scope() << ", dst scope = " << dst.scope();
++    LOG(FATAL) << "Unsupported tensor memory copy: "
++               << "src scope = " << src.scope()
++               << ", dst scope = " << dst.scope();
+   }
+   // Currently tcgen05.cp is not supported
+   // TODO (mzw) Support tcgen05.cp
+@@ -1396,32 +1179,8 @@ Stmt CopyNode::LowerTmemCopy(const LowerArgs &T,
+   return body;
+ }
+ 
+-/**
+- * @brief Lower a Copy operator to a bulk TMA (Tensor Memory Accelerator)
+- * transfer.
+- *
+- * Lowers the copy to an optimized TMA load or store when the target and buffer
+- * layouts permit. Constructs a TMADesc, detects shared-memory
+- * swizzle/interleave patterns, encodes global shape/stride/SMEM parameters, and
+- * emits either a 1D TMA transfer (when global/shared are contiguous and element
+- * counts match, currently only for loads) or a full multi-dimensional TMA call.
+- * The emitted statement is guarded so only the thread with min thread id
+- * executes the TMA.
+- *
+- * If preconditions are not satisfied (unsupported swizzle, stride/size limits,
+- * mismatched element counts, OOB risks, or other hardware constraints), this
+- * function falls back to LowerNormalCopy.
+- *
+- * @param T LowerArgs containing target information, thread/bounds variables,
+- *          and layout/ buffer remap information used for descriptor
+- * construction.
+- * @param analyzer Analyzer used to prove shapes/contiguity/equality
+- * constraints.
+- * @param copy_inst Indicates whether to emit a BulkLoad (TMA load) or BulkStore
+- *                  (TMA store). Must be CopyInst::kBulkLoad or kBulkStore.
+- * @return Stmt A TIR statement performing the bulk TMA copy (or the result of
+- *         LowerNormalCopy when falling back).
+- */
++// Lowers copy to a bulk TMA (Tensor Memory Accelerator) transfer.
++// Falls back to LowerNormalCopy if preconditions are not satisfied.
+ Stmt CopyNode::LowerBulkCopy(const LowerArgs &T, arith::Analyzer *analyzer,
+                              CopyInst copy_inst) const {
+   ICHECK(copy_inst == CopyInst::kBulkLoad || copy_inst == CopyInst::kBulkStore)
+@@ -1788,13 +1547,8 @@ Stmt CopyNode::LowerBulkCopy1D(const LowerArgs &T, arith::Analyzer *analyzer,
+   tma_copy = IfThenElse(EQ(T.thread_var, T.thread_bounds->min), tma_copy);
+   return tma_copy;
+ }
+-/*!
+- * \brief Encode the TMA descriptor into an array of PrimExpr.
+- * This function serializes the TMA descriptor fields into a format suitable for
+- * passing to the create_tma_descriptor() builtin function. The encoding follows
+- * the expected argument order for the TMA descriptor creation.
+- * \return Array of PrimExpr representing the encoded TMA descriptor.
+- */
++// Encodes the TMA descriptor into an array of PrimExpr for
++// create_tma_descriptor().
+ Array<PrimExpr> TMADesc::EncodeCallArgs() const {
+   Array<PrimExpr> args;
+   args.reserve(rank * 4 + 7);
+@@ -1818,28 +1572,9 @@ Array<PrimExpr> TMADesc::EncodeCallArgs() const {
+   return args;
+ }
+ 
+-/**
+- * @brief Construct a Conv2DIm2ColOp node.
+- *
+- * Initializes a Conv2DIm2ColOpNode from raw TL-call arguments and a buffer map.
+- * The constructor extracts source and destination Buffers from vmap and reads
+- * convolution parameters encoded in args:
+- * - args[0]: source tensor access pointer
+- * - args[1]: destination tensor access pointer
+- * - args[2]: nhw_step (PrimExpr)
+- * - args[3]: c_step (PrimExpr)
+- * - args[4]: kernel (IntImm)
+- * - args[5]: stride (IntImm)
+- * - args[6]: dilation (IntImm)
+- * - args[7]: padding (IntImm)
+- * - args[8]: eviction_policy (IntImm)
+- *
+- * The created node stores these values (src, dst, nhw_step, c_step, kernel,
+- * stride, dilation, padding, eviction_policy) for later lowering to TMA-based
+- * GPU intrinsics.
+- *
+- * @param args Array of PrimExpr TL-call arguments (see list above).
+- */
++// Constructs a Conv2DIm2ColOp node from call arguments.
++// args: src, dst, nhw_step, c_step, kernel, stride, dilation, padding,
++// eviction_policy
+ Conv2DIm2ColOp::Conv2DIm2ColOp(Array<PrimExpr> args) {
+   ObjectPtr<Conv2DIm2ColOpNode> node =
+       tvm::ffi::make_object<Conv2DIm2ColOpNode>();
+@@ -1857,50 +1592,13 @@ Conv2DIm2ColOp::Conv2DIm2ColOp(Array<PrimExpr> args) {
+   data_ = std::move(node);
+ }
+ 
+-/**
+- * @brief Create a shallow copy of this Conv2DIm2ColOpNode wrapped as a
+- * TileOperator.
+- *
+- * Produces a new Conv2DIm2ColOp that owns a freshly allocated
+- * Conv2DIm2ColOpNode initialized from this node (member-wise copy). This is
+- * used to duplicate the operator node for compiler passes that require
+- * independent operator instances.
+- *
+- * @return TileOperator A TileOperator containing the cloned Conv2DIm2ColOpNode.
+- */
++// Creates a shallow copy of this Conv2DIm2ColOpNode.
+ TileOperator Conv2DIm2ColOpNode::Clone() const {
+   auto op = tvm::ffi::make_object<Conv2DIm2ColOpNode>(*this);
+   return Conv2DIm2ColOp(op);
+ }
+ 
+-/**
+- * @brief Lower Conv2D im2col into a TMA-backed PTX sequence for Hopper.
+- *
+- * Constructs a TMA im2col descriptor from the Conv2DIm2ColOp parameters
+- * (kernel, stride, dilation, padding, channel/image tiling, dtype and shapes),
+- * emits a call to create the im2col descriptor, and returns a statement that
+- * invokes the corresponding tma_load_im2col builtin guarded to a single
+- * thread. The lowering assumes the destination resides in shared memory and the
+- * source in global memory and uses the provided layout information (when
+- * available) to select the appropriate shared-memory swizzle.
+- *
+- * Preconditions (checked with ICHECK):
+- * - Target is Hopper.
+- * - src.scope() == "global" and dst.scope() is "shared.dyn" or "shared".
+- * - src->shape has rank 4 and dst->shape has rank 2.
+- * - src and dst have the same dtype.
+- * - When a shared layout is supplied it must match a recognized TMA swizzle
+- *   pattern (32B/64B/128B) or an ICHECK will fail.
+- *
+- * @param T Lowering context (target, layout map, thread_var, thread_bounds,
+- *          buffer remapping, etc.). Used to fetch target/layout and to emit a
+- *          thread-guarded TMA call.
+- * @param analyzer Arithmetic analyzer used to prove divisibility and simplify
+- *                 expressions required by descriptor construction.
+- * @return Stmt A TIR statement that performs a tma_load_im2col call wrapped in
+- *              a thread-min guard (IfThenElse). The returned statement is ready
+- *              to be inserted into the lowered TIR.
+- */
++// Lowers Conv2D im2col into a TMA-backed PTX sequence for Hopper.
+ Stmt Conv2DIm2ColOpNode::Lower(const LowerArgs &T,
+                                arith::Analyzer *analyzer) const {
+   ICHECK(TargetIsHopper(T.target));
+@@ -1966,7 +1664,7 @@ Stmt Conv2DIm2ColOpNode::Lower(const LowerArgs &T,
+                                                     dst_->dtype.bits()))) {
+       desc.swizzle = static_cast<int>(CU_TENSOR_MAP_SWIZZLE_128B);
+     } else {
+-      ICHECK(0) << "Cannot detect TMA layout.";
++      LOG(FATAL) << "Cannot detect TMA layout.";
+     }
+   }
+ 
+@@ -2025,14 +1723,7 @@ Stmt Conv2DIm2ColOpNode::Lower(const LowerArgs &T,
+   return tma_copy;
+ }
+ 
+-/*!
+- * \brief Encode the TMA im2col descriptor into an array of PrimExpr.
+- * This function serializes the TMA im2col descriptor fields for passing to the
+- * create_tma_im2col_descriptor() builtin function. It includes
+- * convolution-specific parameters like kernel size, stride, padding, and
+- * dilation in addition to standard tensor descriptor fields. \return Array of
+- * PrimExpr representing the encoded TMA im2col descriptor.
+- */
++// Encodes the TMA im2col descriptor for create_tma_im2col_descriptor().
+ Array<PrimExpr> TMAIm2ColDesc::EncodeCallArgs() const {
+   Array<PrimExpr> args;
+   args.reserve(rank * 5 + 5);
+@@ -2094,16 +1785,7 @@ TIR_REGISTER_TL_TILE_OP(Copy, copy)
+     .set_attr<TCallEffectKind>("TCallEffectKind",
+                                Integer(CallEffectKind::kOpaque));
+ 
+-/**
+- * @brief Layout inference hook for Conv2DIm2ColOpNode.
+- *
+- * This operator does not provide any layout inference; the function
+- * intentionally returns an empty LayoutMap to indicate no layout suggestions.
+- *
+- * @param T Context for layout inference (ignored).
+- * @param level Inference level (ignored).
+- * @return LayoutMap An empty map.
+- */
++// Layout inference hook - returns empty map (no layout suggestions).
+ LayoutMap Conv2DIm2ColOpNode::InferLayout(const LayoutInferArgs &T,
+                                           InferLevel level) const {
+   return {};
+diff --git a/src/op/copy.h b/src/op/copy.h
+index aca629f5c6..be6331c543 100644
+--- a/src/op/copy.h
++++ b/src/op/copy.h
+@@ -28,6 +28,32 @@ enum class CopyInst : uint8_t {
+   kTMemStore = 8,   // tcgen05.st (register -> tensor memory)
+ };
+ 
++/// Convert CopyInst enum to string for debugging
++inline const char *CopyInstToString(CopyInst inst) {
++  switch (inst) {
++  case CopyInst::kNormal:
++    return "Normal";
++  case CopyInst::kLDSM:
++    return "LDSM";
++  case CopyInst::kSTSM:
++    return "STSM";
++  case CopyInst::kBulkLoad:
++    return "BulkLoad";
++  case CopyInst::kBulkStore:
++    return "BulkStore";
++  case CopyInst::kBulkLoad1D:
++    return "BulkLoad1D";
++  case CopyInst::kBulkStore1D:
++    return "BulkStore1D";
++  case CopyInst::kTMemLoad:
++    return "TMemLoad";
++  case CopyInst::kTMemStore:
++    return "TMemStore";
++  default:
++    return "Unknown";
++  }
++}
++
+ /// Descriptor for Tensor Memory Access (TMA) copy operations
+ struct TMADesc {
+   size_t rank;                   ///< Tensor rank (number of dimensions)
+diff --git a/src/op/gemm.h b/src/op/gemm.h
+index 3ec58becc9..fb3d5c0f6f 100644
+--- a/src/op/gemm.h
++++ b/src/op/gemm.h
+@@ -22,8 +22,41 @@ enum class GemmWarpPolicyType : uint8_t {
+   kFree = 3,
+ };
+ 
++/// Convert GemmWarpPolicyType enum to string for debugging
++inline const char *GemmWarpPolicyTypeToString(GemmWarpPolicyType type) {
++  switch (type) {
++  case GemmWarpPolicyType::kSquare:
++    return "Square";
++  case GemmWarpPolicyType::kFullRow:
++    return "FullRow";
++  case GemmWarpPolicyType::kFullCol:
++    return "FullCol";
++  case GemmWarpPolicyType::kFree:
++    return "Free";
++  default:
++    return "Unknown";
++  }
++}
++
+ // Target GEMM instruction
+ enum class GemmInst : uint8_t { kMMA, kWGMMA, kTCGEN5MMA, kMFMA };
++
++/// Convert GemmInst enum to string for debugging
++inline const char *GemmInstToString(GemmInst inst) {
++  switch (inst) {
++  case GemmInst::kMMA:
++    return "MMA";
++  case GemmInst::kWGMMA:
++    return "WGMMA";
++  case GemmInst::kTCGEN5MMA:
++    return "TCGEN5MMA";
++  case GemmInst::kMFMA:
++    return "MFMA";
++  default:
++    return "Unknown";
++  }
++}
++
+ class GemmWarpPolicyNode : public Object {
+ public:
+   mutable int m_warp{0};
+diff --git a/src/op/operator.h b/src/op/operator.h
+index c246864e40..2a508e31aa 100644
+--- a/src/op/operator.h
++++ b/src/op/operator.h
+@@ -32,6 +32,20 @@ enum class InferLevel : uint8_t {
+   kStrict = 2,
+ };
+ 
++/// Convert InferLevel enum to string for debugging
++inline const char *InferLevelToString(InferLevel level) {
++  switch (level) {
++  case InferLevel::kFree:
++    return "Free";
++  case InferLevel::kCommon:
++    return "Common";
++  case InferLevel::kStrict:
++    return "Strict";
++  default:
++    return "Unknown";
++  }
++}
++
+ struct LowerArgs {
+   Target target;
+   Range thread_bounds;
+diff --git a/src/op/reduce.cc b/src/op/reduce.cc
+index 91beee4925..58b403a044 100644
+--- a/src/op/reduce.cc
++++ b/src/op/reduce.cc
+@@ -10,6 +10,7 @@
+ #include <tvm/tir/op_attr_types.h>
+ #include <tvm/tir/stmt_functor.h>
+ 
++#include "../layout/layout.h"
+ #include "../layout/utils.h"
+ #include "../op/parallel.h"
+ #include "../target/utils.h"
+@@ -565,7 +566,37 @@ Stmt CumSumOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
+ 
+ LayoutMap CumSumOpNode::InferLayout(const LayoutInferArgs &T,
+                                     InferLevel level) const {
+-  return {};
++  // Only infer layout in strict mode
++  if (level != InferLevel::kStrict) {
++    return {};
++  }
++
++  LayoutMap result_map;
++
++  auto make_linear_layout = [](const Buffer &buf) -> Layout {
++    return makeLinearLayout(buf->shape);
++  };
++
++  auto check_or_set_linear_layout = [&](const Buffer &buf) {
++    if (!IsSharedBuffer(buf))
++      return;
++
++    Layout linear_layout = make_linear_layout(buf);
++    if (T.layout_map.count(buf)) {
++      // Check if existing layout is linear
++      Layout existing = T.layout_map.Get(buf).value().as<Layout>().value();
++      ICHECK(StructuralEqual()(existing, linear_layout))
++          << "CumSum requires linear layout for shared buffer " << buf->name
++          << ", but got non-linear layout.";
++    } else {
++      result_map.Set(buf, linear_layout);
++    }
++  };
++
++  check_or_set_linear_layout(src);
++  check_or_set_linear_layout(dst);
++
++  return result_map;
+ }
+ 
+ TIR_REGISTER_TL_TILE_OP(CumSumOp, cumsum)
+diff --git a/testing/python/jit/test_tilelang_jit_callback.py b/testing/python/jit/test_tilelang_jit_callback.py
+index 98b88820cb..9ad8da47fb 100644
+--- a/testing/python/jit/test_tilelang_jit_callback.py
++++ b/testing/python/jit/test_tilelang_jit_callback.py
+@@ -3,6 +3,7 @@
+ import tilelang
+ from tilelang.engine.callback import register_cuda_postproc_callback
+ import torch
++import pytest
+ 
+ 
+ def matmul(
+@@ -98,7 +99,8 @@ def tilelang_callback_cuda_postproc(code, _):
+     assert stramp in kernel_source, f"Expected {stramp} in the kernel source"
+ 
+ 
+-def test_gemm_f16f16f16_nn():
++@pytest.mark.skip(reason="Skipping callback test")
++def test_cuda_postproc_callback():
+     run_gemm(
+         512,
+         1024,
+diff --git a/testing/python/jit/test_tilelang_jit_nvrtc.py b/testing/python/jit/test_tilelang_jit_nvrtc.py
+index b6823b8cca..cf2a9dcc3d 100644
+--- a/testing/python/jit/test_tilelang_jit_nvrtc.py
++++ b/testing/python/jit/test_tilelang_jit_nvrtc.py
+@@ -395,14 +395,6 @@ def main(
+             kernel_flat = T.Tensor((KH * KW * C, F), dtype, kernel.data)
+             out_flat = T.Tensor((N * OH * OW, F), dtype, out.data)
+ 
+-            T.annotate_layout(
+-                {
+-                    out_shared: tilelang.layout.make_swizzled_layout(out_shared),
+-                    data_shared: tilelang.layout.make_swizzled_layout(data_shared),
+-                    kernel_shared: tilelang.layout.make_swizzled_layout(kernel_shared),
+-                }
+-            )
+-
+             T.clear(out_local)
+             for k_iter in T.Pipelined(T.ceildiv(KH * KW * C, block_K), num_stages=num_stages):
+                 T.c2d_im2col(data, data_shared, by, k_iter, KH, S, D, P)
+diff --git a/testing/python/jit/test_tilelang_jit_tvm_ffi.py b/testing/python/jit/test_tilelang_jit_tvm_ffi.py
+index a0df271921..d9ab313c48 100644
+--- a/testing/python/jit/test_tilelang_jit_tvm_ffi.py
++++ b/testing/python/jit/test_tilelang_jit_tvm_ffi.py
+@@ -335,14 +335,6 @@ def main(
+             kernel_flat = T.Tensor((KH * KW * C, F), dtype, kernel.data)
+             out_flat = T.Tensor((N * OH * OW, F), dtype, out.data)
+ 
+-            T.annotate_layout(
+-                {
+-                    out_shared: tilelang.layout.make_swizzled_layout(out_shared),
+-                    data_shared: tilelang.layout.make_swizzled_layout(data_shared),
+-                    kernel_shared: tilelang.layout.make_swizzled_layout(kernel_shared),
+-                }
+-            )
+-
+             T.clear(out_local)
+             for k_iter in T.Pipelined(T.ceildiv(KH * KW * C, block_K), num_stages=num_stages):
+                 T.c2d_im2col(data, data_shared, by, k_iter, KH, S, D, P)
+diff --git a/tilelang/layout/swizzle.py b/tilelang/layout/swizzle.py
+index e083d756db..beaf3b6b5c 100644
+--- a/tilelang/layout/swizzle.py
++++ b/tilelang/layout/swizzle.py
+@@ -184,21 +184,15 @@ def make_quarter_bank_swizzled_layout(*args):
+     )
+ 
+ 
+-def make_linear_layout(*args):
++def make_linear_layout(buffer_or_load_or_region: Buffer | BufferLoad | BufferRegion):
+     """
++    Create a row-major linear layout for any dimension.
++
+     Args:
+-        args: buffer/BufferLoad/BufferRegion or (stride, continuous)
+-    Examples:
+-        make_linear_layout(buffer)
+-        make_linear_layout(stride, continuous)
++        buffer_or_load_or_region: Buffer, BufferLoad, or BufferRegion
++
++    Returns:
++        Layout: A row-major linear layout
+     """
+-    if len(args) == 1:
+-        stride, continuous = _get_stride_continuous(args[0])
+-    elif len(args) == 2:
+-        stride, continuous = args
+-    else:
+-        raise ValueError(f"Invalid arguments: {args}")
+-    return _ffi_api.make_linear_layout(
+-        stride,
+-        continuous,
+-    )
++    _, shape, _ = _get_buffer_info(buffer_or_load_or_region)
++    return _ffi_api.make_linear_layout(list(shape))

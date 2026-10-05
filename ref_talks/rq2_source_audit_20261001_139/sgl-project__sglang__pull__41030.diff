@@ -1,0 +1,243 @@
+diff --git a/python/sglang/srt/layers/layer_boundary/residual/add_norm.py b/python/sglang/srt/layers/layer_boundary/residual/add_norm.py
+index c1378d05e39f..e8017ae8ef26 100644
+--- a/python/sglang/srt/layers/layer_boundary/residual/add_norm.py
++++ b/python/sglang/srt/layers/layer_boundary/residual/add_norm.py
+@@ -33,7 +33,9 @@
+ from sglang.srt.layers.layer_boundary.residual import LayerResidualOps
+ from sglang.srt.layers.quantization.fp8_utils import (
+     _use_aiter_bpreshuffle_gfx95,
++    emit_transposed_bpreshuffle_scale,
+     materialize_bpreshuffle_fp8_scale_tuple,
++    view_aiter_fused_rms_transposed_fp8_scale_tuple,
+ )
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+ from sglang.srt.runtime_context import get_exec, get_parallel, get_platform
+@@ -213,6 +215,10 @@ def _update_and_read_residual_aiter_fp8_group(
+     unquantized bf16 output rides along as a third element, so the DSA indexer
+     can skip dequantizing. post_residual_addition is not applied on this path."""
+     needs_bf16 = get_attn_tp_context().is_dsa
++    emit_transposed_scale = emit_transposed_bpreshuffle_scale(
++        hidden_states.shape[0],
++        on_bpreshuffle_gfx95=_use_aiter_bpreshuffle_gfx95,
++    )
+     output, unquantized, _, residual_out = fused_rms_fp8_group_quant(
+         hidden_states,
+         norm.weight,
+@@ -224,9 +230,11 @@ def _update_and_read_residual_aiter_fp8_group(
+         dtype_quant=torch.float8_e4m3fn,
+         res1=residual,
+         output_unquantized_inp1=needs_bf16,
+-        transpose_scale=False,
++        transpose_scale=emit_transposed_scale,
+     )
+-    if _use_aiter_bpreshuffle_gfx95:
++    if emit_transposed_scale:
++        output = view_aiter_fused_rms_transposed_fp8_scale_tuple(output)
++    elif _use_aiter_bpreshuffle_gfx95:
+         output = materialize_bpreshuffle_fp8_scale_tuple(output)
+     if needs_bf16:
+         output = (output[0], output[1], unquantized)
+diff --git a/python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mha_rocm.py b/python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mha_rocm.py
+index a28b3228a8ae..0e539804092c 100644
+--- a/python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mha_rocm.py
++++ b/python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mha_rocm.py
+@@ -16,7 +16,9 @@
+ from sglang.srt.layers.dcp import all_gather_kv_cache_for_mha_extend
+ from sglang.srt.layers.layer_boundary import get_attn_tp_context
+ from sglang.srt.layers.quantization.fp8_utils import (
++    emit_transposed_bpreshuffle_scale,
+     materialize_bpreshuffle_fp8_scale_tuple,
++    view_aiter_fused_rms_transposed_fp8_scale_tuple,
+ )
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+ from sglang.srt.model_executor.forward_context import (
+@@ -74,6 +76,10 @@ def forward_normal_rocm_prepare(
+                 # the unquantized output for q_lora; otherwise q_lora becomes the (fp8,scale)
+                 # tuple.
+                 if _use_aiter_gfx95 and _is_block_scale_fp8(self.q_b_proj):
++                    emit_transposed_scale = emit_transposed_bpreshuffle_scale(
++                        q.shape[0],
++                        on_bpreshuffle_gfx95=_use_aiter_bpreshuffle_gfx95,
++                    )
+                     q_quanted, q_lora, _, _ = fused_rms_fp8_group_quant(
+                         q,
+                         self.q_a_layernorm.weight,
+@@ -85,9 +91,13 @@ def forward_normal_rocm_prepare(
+                         dtype_quant=torch.float8_e4m3fn,
+                         res1=None,
+                         output_unquantized_inp1=True,
+-                        transpose_scale=False,
++                        transpose_scale=emit_transposed_scale,
+                     )
+-                    if _use_aiter_bpreshuffle_gfx95:
++                    if emit_transposed_scale:
++                        q_quanted = view_aiter_fused_rms_transposed_fp8_scale_tuple(
++                            q_quanted
++                        )
++                    elif _use_aiter_bpreshuffle_gfx95:
+                         q_quanted = materialize_bpreshuffle_fp8_scale_tuple(q_quanted)
+                     q = self.q_b_proj(q_quanted)[0].view(
+                         -1, self.num_local_heads, self.qk_head_dim
+@@ -118,6 +128,10 @@ def forward_normal_rocm_prepare(
+                 )
+                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+             elif _use_aiter_gfx95 and _is_block_scale_fp8(self.q_b_proj):
++                emit_transposed_scale = emit_transposed_bpreshuffle_scale(
++                    q.shape[0],
++                    on_bpreshuffle_gfx95=_use_aiter_bpreshuffle_gfx95,
++                )
+                 q, _, _, _ = fused_rms_fp8_group_quant(
+                     q,
+                     self.q_a_layernorm.weight,
+@@ -129,9 +143,11 @@ def forward_normal_rocm_prepare(
+                     dtype_quant=torch.float8_e4m3fn,
+                     res1=None,
+                     output_unquantized_inp1=False,
+-                    transpose_scale=False,
++                    transpose_scale=emit_transposed_scale,
+                 )
+-                if _use_aiter_bpreshuffle_gfx95:
++                if emit_transposed_scale:
++                    q = view_aiter_fused_rms_transposed_fp8_scale_tuple(q)
++                elif _use_aiter_bpreshuffle_gfx95:
+                     q = materialize_bpreshuffle_fp8_scale_tuple(q)
+                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+             else:
+@@ -149,6 +165,10 @@ def forward_normal_rocm_prepare(
+         latent_cache = latent_cache.unsqueeze(1)
+ 
+         if _use_aiter_gfx95 and _is_block_scale_fp8(self.kv_b_proj):
++            emit_transposed_scale = emit_transposed_bpreshuffle_scale(
++                kv_a.shape[0],
++                on_bpreshuffle_gfx95=_use_aiter_bpreshuffle_gfx95,
++            )
+             kv_a_quanted, kv_a, _, _ = fused_rms_fp8_group_quant(
+                 kv_a,
+                 self.kv_a_layernorm.weight,
+@@ -160,9 +180,13 @@ def forward_normal_rocm_prepare(
+                 dtype_quant=torch.float8_e4m3fn,
+                 res1=None,
+                 output_unquantized_inp1=True,  # return unqaunt kv_a
+-                transpose_scale=False,
++                transpose_scale=emit_transposed_scale,
+             )
+-            if _use_aiter_bpreshuffle_gfx95:
++            if emit_transposed_scale:
++                kv_a_quanted = view_aiter_fused_rms_transposed_fp8_scale_tuple(
++                    kv_a_quanted
++                )
++            elif _use_aiter_bpreshuffle_gfx95:
+                 kv_a_quanted = materialize_bpreshuffle_fp8_scale_tuple(kv_a_quanted)
+         else:
+             kv_a = self.kv_a_layernorm(kv_a)
+diff --git a/python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla_rocm.py b/python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla_rocm.py
+index d6e8728c164b..2bb7aa642da0 100644
+--- a/python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla_rocm.py
++++ b/python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla_rocm.py
+@@ -495,6 +495,10 @@ def forward_absorb_rocm_prepare(
+                     self.kv_a_layernorm.variance_epsilon,
+                 )
+             elif _use_aiter_gfx95 and _is_block_scale_fp8(self.q_b_proj):
++                emit_transposed_scale = emit_transposed_bpreshuffle_scale(
++                    q.shape[0],
++                    on_bpreshuffle_gfx95=_use_aiter_bpreshuffle_gfx95,
++                )
+                 if self.use_dsa:
+                     q_quanted, q_lora, k_nope, _ = fused_rms_fp8_group_quant(
+                         q,
+@@ -507,9 +511,13 @@ def forward_absorb_rocm_prepare(
+                         dtype_quant=torch.float8_e4m3fn,
+                         res1=None,
+                         output_unquantized_inp1=True,
+-                        transpose_scale=False,
++                        transpose_scale=emit_transposed_scale,
+                     )
+-                    if _use_aiter_bpreshuffle_gfx95:
++                    if emit_transposed_scale:
++                        q_quanted = view_aiter_fused_rms_transposed_fp8_scale_tuple(
++                            q_quanted
++                        )
++                    elif _use_aiter_bpreshuffle_gfx95:
+                         q_quanted = materialize_bpreshuffle_fp8_scale_tuple(q_quanted)
+                     q = q_quanted
+                 else:
+@@ -524,9 +532,11 @@ def forward_absorb_rocm_prepare(
+                         dtype_quant=torch.float8_e4m3fn,
+                         res1=None,
+                         output_unquantized_inp1=False,
+-                        transpose_scale=False,
++                        transpose_scale=emit_transposed_scale,
+                     )
+-                    if _use_aiter_bpreshuffle_gfx95:
++                    if emit_transposed_scale:
++                        q = view_aiter_fused_rms_transposed_fp8_scale_tuple(q)
++                    elif _use_aiter_bpreshuffle_gfx95:
+                         q = materialize_bpreshuffle_fp8_scale_tuple(q)
+             elif _use_aiter:
+                 q, k_nope = fused_qk_rmsnorm_bf16(
+diff --git a/test/registered/kernels/ops/layernorm/test_fused_rms_fp8_group_quant.py b/test/registered/kernels/ops/layernorm/test_fused_rms_fp8_group_quant.py
+index 793c6a1317a3..b05dfbd4b815 100644
+--- a/test/registered/kernels/ops/layernorm/test_fused_rms_fp8_group_quant.py
++++ b/test/registered/kernels/ops/layernorm/test_fused_rms_fp8_group_quant.py
+@@ -187,6 +187,61 @@ def test_transposed_scale_matches_bpreshuffle_layout_contract(self):
+                 self.assertEqual(repaired.data_ptr(), scale_transposed.data_ptr())
+                 self.assertEqual(materialized.data_ptr(), scale_transposed.data_ptr())
+ 
++    def test_transposed_scale_preserves_fused_rms_outputs(self):
++        from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
++
++        for res1_enabled, output_unquantized in itertools.product(
++            (False, True), repeat=2
++        ):
++            with self.subTest(
++                res1_enabled=res1_enabled,
++                output_unquantized=output_unquantized,
++            ):
++                torch.manual_seed(0)
++                m, k = 8, 1024
++                x1 = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
++                x2 = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
++                weight1 = torch.ones(k, dtype=torch.float32, device="cuda")
++                weight2 = torch.ones(k, dtype=torch.float32, device="cuda")
++                res1 = (
++                    torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
++                    if res1_enabled
++                    else None
++                )
++                kwargs = dict(
++                    inp2=x2,
++                    inp2_weight=weight2,
++                    inp2_epsilon=1e-6,
++                    group_size=128,
++                    dtype_quant=torch.float8_e4m3fn,
++                    res1=res1,
++                    output_unquantized_inp1=output_unquantized,
++                )
++
++                row_major = fused_rms_fp8_group_quant(
++                    x1, weight1, 1e-6, transpose_scale=False, **kwargs
++                )
++                transposed = fused_rms_fp8_group_quant(
++                    x1, weight1, 1e-6, transpose_scale=True, **kwargs
++                )
++
++                (q_row_major, scale_row_major), *row_side_outputs = row_major
++                (q_transposed, scale_transposed), *transposed_side_outputs = transposed
++                repaired = view_aiter_fused_rms_transposed_fp8_scale(scale_transposed)
++                materialized = materialize_bpreshuffle_fp8_scale(scale_row_major)
++
++                torch.testing.assert_close(q_transposed, q_row_major, rtol=0, atol=0)
++                torch.testing.assert_close(repaired, materialized, rtol=0, atol=0)
++                for actual, expected in zip(
++                    transposed_side_outputs, row_side_outputs, strict=True
++                ):
++                    if actual is None or expected is None:
++                        self.assertIs(actual, expected)
++                    else:
++                        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
++                self.assertEqual(repaired.stride(), (1, m))
++                self.assertEqual(repaired.data_ptr(), scale_transposed.data_ptr())
++
+ 
+ if __name__ == "__main__":
+     unittest.main(verbosity=2)

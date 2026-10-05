@@ -1,0 +1,898 @@
+diff --git a/csrc/apis/mega.hpp b/csrc/apis/mega.hpp
+index b4ab0b3f0b..063f752ad7 100644
+--- a/csrc/apis/mega.hpp
++++ b/csrc/apis/mega.hpp
+@@ -172,9 +172,28 @@ static void fp8_fp4_mega_moe(
+ ) {
+     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
+     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
++    constexpr int kWeightTileN = kMegaMoEPacketBlockN;
++    constexpr int kWeightTileK = 256;
++    constexpr int kPackedWeightTileK = kWeightTileK / 2;
++    constexpr int kPackedSFTileK = kWeightTileK / 128;
++    constexpr int kWeightPacketBytes =
++        kWeightTileN * kPackedWeightTileK +
++        kPackedSFTileK * kWeightTileN * sizeof(int32_t);
++    const bool tile_packed_weights =
++        l1_weights.dim() == 3 and l2_weights.dim() == 3 and
++        l1_weights.size(1) == kWeightTileN and
++        l2_weights.size(1) == kWeightTileN and
++        l1_weights.size(2) == kPackedWeightTileK and
++        l2_weights.size(2) == kPackedWeightTileK and
++        l1_weights_sf.dim() == 3 and l2_weights_sf.dim() == 3 and
++        l1_weights_sf.size(1) == kPackedSFTileK and
++        l2_weights_sf.size(1) == kPackedSFTileK and
++        l1_weights_sf.size(2) == kWeightTileN and
++        l2_weights_sf.size(2) == kWeightTileN;
+ 
+     // Config checks
+     const auto num_tokens = static_cast<int>(y.size(0));
++    const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
+     const auto [rm, rn, rk] = recipe;
+     DG_HOST_ASSERT(rm == 1 and rn == 1 and rk == 32);
+     DG_HOST_ASSERT(activation == "swiglu");
+@@ -186,27 +205,66 @@ static void fp8_fp4_mega_moe(
+     DG_HOST_ASSERT(activation_clamp >= 0);
+ 
+     // Tensor checks
+-    DG_HOST_ASSERT(get_major_type_ab(l1_weights) == cute::UMMA::Major::K);
+-    DG_HOST_ASSERT(get_major_type_ab(l2_weights) == cute::UMMA::Major::K);
+     const auto arch_major = device_runtime->get_arch_major();
+-    const auto [num_experts_per_rank, intermediate_hidden_2, hidden] =
+-        check_grouped_ab_fp8_fp4(l1_weights, cute::UMMA::Major::K, arch_major);
+-    const auto [num_experts_per_rank_, hidden_, intermediate_hidden] =
+-        check_grouped_ab_fp8_fp4(l2_weights, cute::UMMA::Major::K, arch_major);
++    int num_experts_per_rank, intermediate_hidden_2, hidden;
++    int num_experts_per_rank_, hidden_, intermediate_hidden;
++    if (tile_packed_weights) {
++        DG_HOST_ASSERT(num_experts % num_ranks == 0);
++        num_experts_per_rank = num_experts_per_rank_ = num_experts / num_ranks;
++        hidden = hidden_ = static_cast<int>(y.size(1));
++        const auto l2_logical_elements =
++            static_cast<int64_t>(l2_weights.size(0)) *
++            kWeightTileN * kWeightTileK;
++        DG_HOST_ASSERT(
++            l2_logical_elements %
++                (static_cast<int64_t>(num_experts_per_rank) * hidden) == 0);
++        intermediate_hidden = static_cast<int>(
++            l2_logical_elements /
++            (static_cast<int64_t>(num_experts_per_rank) * hidden));
++        intermediate_hidden_2 = intermediate_hidden * 2;
++        DG_HOST_ASSERT(l1_weights.size(0) == l2_weights.size(0) * 2);
++        DG_HOST_ASSERT(l1_weights.stride(0) == kWeightPacketBytes);
++        DG_HOST_ASSERT(l2_weights.stride(0) == kWeightPacketBytes);
++        DG_HOST_ASSERT(l1_weights.stride(1) == kPackedWeightTileK);
++        DG_HOST_ASSERT(l2_weights.stride(1) == kPackedWeightTileK);
++        DG_HOST_ASSERT(l1_weights_sf.stride(0) == kWeightPacketBytes / 4);
++        DG_HOST_ASSERT(l2_weights_sf.stride(0) == kWeightPacketBytes / 4);
++        DG_HOST_ASSERT(
++            reinterpret_cast<const uint8_t*>(l1_weights_sf.data_ptr<int32_t>()) ==
++            reinterpret_cast<const uint8_t*>(l1_weights.data_ptr<int8_t>()) +
++                kWeightTileN * kPackedWeightTileK);
++        DG_HOST_ASSERT(
++            reinterpret_cast<const uint8_t*>(l2_weights_sf.data_ptr<int32_t>()) ==
++            reinterpret_cast<const uint8_t*>(l2_weights.data_ptr<int8_t>()) +
++                kWeightTileN * kPackedWeightTileK);
++    } else {
++        DG_HOST_ASSERT(get_major_type_ab(l1_weights) == cute::UMMA::Major::K);
++        DG_HOST_ASSERT(get_major_type_ab(l2_weights) == cute::UMMA::Major::K);
++        std::tie(num_experts_per_rank, intermediate_hidden_2, hidden) =
++            check_grouped_ab_fp8_fp4(
++                l1_weights, cute::UMMA::Major::K, arch_major);
++        std::tie(num_experts_per_rank_, hidden_, intermediate_hidden) =
++            check_grouped_ab_fp8_fp4(
++                l2_weights, cute::UMMA::Major::K, arch_major);
++    }
+     DG_HOST_ASSERT(l1_weights.scalar_type() == kPackedFP4);
+     DG_HOST_ASSERT(l2_weights.scalar_type() == kPackedFP4);
+     DG_HOST_ASSERT(num_tokens <= num_max_tokens_per_rank);
+     DG_HOST_ASSERT(num_experts_per_rank == num_experts_per_rank_);
+     DG_HOST_ASSERT(hidden == hidden_);
+     DG_HOST_ASSERT(intermediate_hidden_2 == 2 * intermediate_hidden);
+-    DG_HOST_ASSERT(l1_weights.is_contiguous() and l2_weights.is_contiguous());
++    DG_HOST_ASSERT(
++        tile_packed_weights or
++        (l1_weights.is_contiguous() and l2_weights.is_contiguous()));
+ 
+     // Check weight SF layout for UE8M0 packing, MN-major, and TMA alignment
+     constexpr int kGranMN = 1, kGranK = 32;
+-    check_sf_layout(l1_weights_sf, intermediate_hidden * 2, hidden, kGranMN, kGranK,
+-                    num_experts_per_rank, true, false, torch::kInt);
+-    check_sf_layout(l2_weights_sf, hidden, intermediate_hidden, kGranMN, kGranK,
+-                    num_experts_per_rank, true, false, torch::kInt);
++    if (not tile_packed_weights) {
++        check_sf_layout(l1_weights_sf, intermediate_hidden * 2, hidden, kGranMN, kGranK,
++                        num_experts_per_rank, true, false, torch::kInt);
++        check_sf_layout(l2_weights_sf, hidden, intermediate_hidden, kGranMN, kGranK,
++                        num_experts_per_rank, true, false, torch::kInt);
++    }
+ 
+     int num_shared_experts = 0, shared_intermediate_hidden = 0;
+     torch::Tensor shared_l1_weights, shared_l1_weights_sf, shared_l2_weights, shared_l2_weights_sf;
+@@ -240,7 +298,6 @@ static void fp8_fp4_mega_moe(
+     }
+ 
+     // Check buffer bytes
+-    const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
+     const auto num_experts_ = num_experts_per_rank * num_ranks;
+     const auto [num_required_bytes, slice] = get_symm_buffer_size_for_mega_moe(
+         num_ranks, num_experts,
+@@ -274,7 +331,8 @@ static void fp8_fp4_mega_moe(
+                                num_shared_experts,
+                                num_tokens, num_topk,
+                                hidden, intermediate_hidden,
+-                               activation_clamp, fast_math);
++                               activation_clamp, fast_math,
++                               tile_packed_weights);
+     } else {
+         DG_HOST_UNREACHABLE("Unsupported architecture");
+     }
+diff --git a/csrc/jit_kernels/heuristics/mega_moe.hpp b/csrc/jit_kernels/heuristics/mega_moe.hpp
+index 0a7a75794d..160ae76dc0 100644
+--- a/csrc/jit_kernels/heuristics/mega_moe.hpp
++++ b/csrc/jit_kernels/heuristics/mega_moe.hpp
+@@ -15,6 +15,11 @@
+ 
+ namespace deep_gemm {
+ 
++constexpr int kMegaMoESmallTokenBlockM = 16;
++// Packet weights are physically grouped as pairs of 128-wide N tiles.
++// Keep the Python packer and host validation in sync if this changes.
++constexpr int kMegaMoEPacketBlockN = 128;
++
+ struct MegaMoEConfig {
+     // Block tiling
+     int block_m, block_n, block_k;
+@@ -77,12 +82,15 @@ static std::tuple<int, int, int, int, int> get_block_config_for_mega_moe(
+     const int& num_ranks, const int& num_experts,
+     const int& num_max_tokens_per_rank, const int& num_topk,
+     const int& num_tokens,
+-    const MmaKind& mma_kind) {
++    const MmaKind& mma_kind,
++    const bool tile_packed_weights = false) {
+     auto [cluster_size, block_m, store_block_m, block_k, num_epilogue_warpgroups] = [&]() -> std::tuple<int, int, int, int, int> {
+         float num_expected_tokens_per_expert = static_cast<float>(num_tokens) * num_ranks * num_topk / num_experts;
+         if (num_expected_tokens_per_expert <= 8.5) {
+             // Really small token-per-expert (e.g. RL long-tail rollout), use the smallest block_m and larger BLOCK_K for less synchronization
+-            return {2, 16, 8, 256, 2};
++            return {
++                2, kMegaMoESmallTokenBlockM, 8, 256,
++                tile_packed_weights ? 1 : 2};
+         } else if (num_expected_tokens_per_expert <= 16.5) {
+             // Small batch size, small EP, decoding, e.g. 6/384 experts, EP8, bsz 128
+             return {2, 32, 16, 128, 2};
+@@ -186,12 +194,15 @@ static MegaMoEConfig get_mega_moe_config(
+     const int& hidden, const int& intermediate_hidden,
+     const int& num_ring_tokens,
+     const int& num_sf_ring_tokens,
+-    const MmaKind& mma_kind) {
++    const MmaKind& mma_kind,
++    const bool tile_packed_weights = false) {
+ 
+     // Block config
+     const auto [cluster_size, block_m, store_block_m, block_k, num_epilogue_threads] =
+-        get_block_config_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens, mma_kind);
+-    const int block_n = 128;
++        get_block_config_for_mega_moe(
++            num_ranks, num_experts, num_max_tokens_per_rank, num_topk,
++            num_tokens, mma_kind, tile_packed_weights);
++    const int block_n = kMegaMoEPacketBlockN;
+     const int load_block_m = block_m / 2;
+     const int load_block_n = block_n;
+     const auto [sf_block_m, sf_block_n] = is_mma_with_sf(mma_kind) ?
+diff --git a/csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp b/csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp
+index 9c4be4b08d..5af869cd48 100644
+--- a/csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp
++++ b/csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp
+@@ -25,6 +25,8 @@ class SM100FP8FP4MegaMoERuntime final : public LaunchRuntime<SM100FP8FP4MegaMoER
+         int num_ranks;
+         float activation_clamp;
+         bool fast_math;
++        bool evict_first_weights;
++        bool tile_packed_weights;
+         MegaMoEConfig config;
+ 
+         // Runtime arguments
+@@ -79,6 +81,8 @@ static void __instantiate_kernel() {{
+         {}, {}, {},
+         {}, {},
+         {},
++        {},
++        {},
+         {}
+     >);
+ }};
+@@ -96,7 +100,9 @@ static void __instantiate_kernel() {{
+     args.config.num_dispatch_threads, args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
+     args.launch_args.grid_dim.first, args.num_ranks,
+     to_string(args.activation_clamp),
+-    args.fast_math ? "true" : "false");
++    args.fast_math ? "true" : "false",
++    args.evict_first_weights ? "true" : "false",
++    args.tile_packed_weights ? "true" : "false");
+     }
+ 
+     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
+@@ -146,7 +152,8 @@ static void sm100_fp8_fp4_mega_moe(
+     const int& num_tokens, const int& num_topk,
+     const int& hidden, const int& intermediate_hidden,
+     const float& activation_clamp,
+-    const bool& fast_math
++    const bool& fast_math,
++    const bool& tile_packed_weights
+ ) {
+     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
+     const auto num_experts = num_experts_per_rank * num_ranks;
+@@ -159,10 +166,17 @@ static void sm100_fp8_fp4_mega_moe(
+         num_ranks, num_experts, num_experts_per_rank,
+         num_max_tokens_per_rank, num_tokens, num_topk, hidden, intermediate_hidden,
+         num_ring_tokens, num_sf_ring_tokens,
+-        MmaKind::MXFP8FP4);
++        MmaKind::MXFP8FP4, tile_packed_weights);
++    if (tile_packed_weights) {
++        DG_HOST_ASSERT(config.block_n == kMegaMoEPacketBlockN);
++        DG_HOST_ASSERT(config.load_block_n == kMegaMoEPacketBlockN);
++        DG_HOST_ASSERT(config.block_k == 128 or config.block_k == 256);
++    }
+ 
+     // Make tensormap
+     constexpr int kGranK = 32;
++    constexpr int kWeightPacketK = 256;
++    constexpr int kWeightPacketSFK = kWeightPacketK / 128;
+     const int sf_smem_outer_dim = config.block_k / (kGranK * 4);
+     const auto tensor_map_l1_acts = make_tma_2d_desc(l1_acts,
+                                                      hidden, config.num_ring_tokens,
+@@ -174,16 +188,35 @@ static void sm100_fp8_fp4_mega_moe(
+                                                         config.sf_block_m, kGranK,
+                                                         1, 0, 0, false,
+                                                         sf_smem_outer_dim);
+-    const auto tensor_map_l1_weights = make_tma_2d_desc(l1_weights,
+-                                                        hidden, num_experts_per_rank * intermediate_hidden * 2,
+-                                                        config.block_k, config.load_block_n,
+-                                                        static_cast<int>(l1_weights.stride(-2)),
+-                                                        config.swizzle_weights_mode);
+-    const auto tensor_map_l1_weights_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l1_weights_sf,
+-                                                           intermediate_hidden * 2, hidden,
+-                                                           config.block_n, kGranK,
+-                                                           num_experts_per_rank, 0, 0, false,
+-                                                        sf_smem_outer_dim);
++    const auto tensor_map_l1_weights = tile_packed_weights ?
++        make_tma_3d_desc(
++            l1_weights,
++            kWeightPacketK, config.block_n, static_cast<int>(l1_weights.size(0)),
++            config.block_k, config.load_block_n, 1,
++            static_cast<int>(l1_weights.stride(1)),
++            static_cast<int>(l1_weights.stride(0)),
++            config.swizzle_weights_mode) :
++        make_tma_2d_desc(
++            l1_weights,
++            hidden, num_experts_per_rank * intermediate_hidden * 2,
++            config.block_k, config.load_block_n,
++            static_cast<int>(l1_weights.stride(-2)),
++            config.swizzle_weights_mode);
++    const auto tensor_map_l1_weights_sf = tile_packed_weights ?
++        make_tma_3d_desc(
++            l1_weights_sf,
++            config.block_n, kWeightPacketSFK,
++            static_cast<int>(l1_weights_sf.size(0)),
++            config.block_n, sf_smem_outer_dim, 1,
++            static_cast<int>(l1_weights_sf.stride(1)),
++            static_cast<int>(l1_weights_sf.stride(0)),
++            0) :
++        make_tma_sf_desc(
++            cute::UMMA::Major::MN, l1_weights_sf,
++            intermediate_hidden * 2, hidden,
++            config.block_n, kGranK,
++            num_experts_per_rank, 0, 0, false,
++            sf_smem_outer_dim);
+     // NOTES: L1 output and L2 activations are essentially the same tensor.
+     // Post-SwiGLU output has half the N width (`BLOCK_N / 2` per input tile),
+     // so the swizzle mode is also halved (128 -> 64).
+@@ -202,16 +235,35 @@ static void sm100_fp8_fp4_mega_moe(
+                                                         config.sf_block_m, kGranK,
+                                                         1, 0, 0, false,
+                                                         sf_smem_outer_dim);
+-    const auto tensor_map_l2_weights = make_tma_2d_desc(l2_weights,
+-                                                        intermediate_hidden, num_experts_per_rank * hidden,
+-                                                        config.block_k, config.load_block_n,
+-                                                        static_cast<int>(l2_weights.stride(-2)),
+-                                                        config.swizzle_weights_mode);
+-    const auto tensor_map_l2_weights_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l2_weights_sf,
+-                                                           hidden, intermediate_hidden,
+-                                                           config.block_n, kGranK,
+-                                                           num_experts_per_rank, 0, 0, false,
+-                                                        sf_smem_outer_dim);
++    const auto tensor_map_l2_weights = tile_packed_weights ?
++        make_tma_3d_desc(
++            l2_weights,
++            kWeightPacketK, config.block_n, static_cast<int>(l2_weights.size(0)),
++            config.block_k, config.load_block_n, 1,
++            static_cast<int>(l2_weights.stride(1)),
++            static_cast<int>(l2_weights.stride(0)),
++            config.swizzle_weights_mode) :
++        make_tma_2d_desc(
++            l2_weights,
++            intermediate_hidden, num_experts_per_rank * hidden,
++            config.block_k, config.load_block_n,
++            static_cast<int>(l2_weights.stride(-2)),
++            config.swizzle_weights_mode);
++    const auto tensor_map_l2_weights_sf = tile_packed_weights ?
++        make_tma_3d_desc(
++            l2_weights_sf,
++            config.block_n, kWeightPacketSFK,
++            static_cast<int>(l2_weights_sf.size(0)),
++            config.block_n, sf_smem_outer_dim, 1,
++            static_cast<int>(l2_weights_sf.stride(1)),
++            static_cast<int>(l2_weights_sf.stride(0)),
++            0) :
++        make_tma_sf_desc(
++            cute::UMMA::Major::MN, l2_weights_sf,
++            hidden, intermediate_hidden,
++            config.block_n, kGranK,
++            num_experts_per_rank, 0, 0, false,
++            sf_smem_outer_dim);
+ 
+     const auto tensor_map_shared_l1_acts = num_shared_experts > 0 ? make_tma_2d_desc(
+         shared_l1_acts,
+@@ -283,6 +335,10 @@ static void sm100_fp8_fp4_mega_moe(
+         .num_ranks = num_ranks,
+         .activation_clamp = activation_clamp,
+         .fast_math = fast_math,
++        .evict_first_weights =
++            tile_packed_weights and
++            config.block_m == kMegaMoESmallTokenBlockM,
++        .tile_packed_weights = tile_packed_weights,
+         .config = config,
+         .y = y.data_ptr(),
+         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
+diff --git a/deep_gemm/include/deep_gemm/common/tma_copy.cuh b/deep_gemm/include/deep_gemm/common/tma_copy.cuh
+index 2c5bf708d4..30f1111fcc 100644
+--- a/deep_gemm/include/deep_gemm/common/tma_copy.cuh
++++ b/deep_gemm/include/deep_gemm/common/tma_copy.cuh
+@@ -19,7 +19,9 @@ template <uint32_t BLOCK_INNER, uint32_t BLOCK_OUTER,
+ CUTLASS_DEVICE void
+ copy(void const* desc_ptr, cutlass::arch::ClusterTransactionBarrier* barrier_ptr,
+      dtype_t* smem_ptr, const uint32_t& inner_idx, const uint32_t& outer_idx,
+-     const uint32_t& num_tma_multicast = 1, const uint32_t& batch_idx = 0) {
++     const uint32_t& num_tma_multicast = 1, const uint32_t& batch_idx = 0,
++     const cute::TMA::CacheHintSm100& cache_hint =
++         cute::TMA::CacheHintSm100::EVICT_NORMAL) {
+     DG_STATIC_ASSERT(static_cast<uint64_t>(cute::TMA::CacheHintSm90::EVICT_NORMAL) ==
+                      static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL), "Invalid cache hint");
+     constexpr uint32_t BLOCK_INNER_ATOM = get_inner_block_atom_size<BLOCK_INNER, kSwizzleMode, dtype_t>();
+@@ -29,7 +31,7 @@ copy(void const* desc_ptr, cutlass::arch::ClusterTransactionBarrier* barrier_ptr
+             #pragma unroll
+             for (uint32_t i = 0; i < BLOCK_INNER / BLOCK_INNER_ATOM; ++ i) {
+                 cute::SM90_TMA_LOAD_2D::copy(desc_ptr, reinterpret_cast<uint64_t*>(barrier_ptr),
+-                                             static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL),
++                                             static_cast<uint64_t>(cache_hint),
+                                              smem_ptr + i * BLOCK_OUTER * BLOCK_INNER_ATOM,
+                                              inner_idx + i * BLOCK_INNER_ATOM, outer_idx);
+             }
+@@ -39,7 +41,7 @@ copy(void const* desc_ptr, cutlass::arch::ClusterTransactionBarrier* barrier_ptr
+                 #pragma unroll
+                 for (uint32_t i = 0; i < BLOCK_INNER / BLOCK_INNER_ATOM; ++ i) {
+                     cute::SM100_TMA_2SM_LOAD_2D::copy(desc_ptr, reinterpret_cast<uint64_t*>(barrier_ptr),
+-                                                      static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL),
++                                                      static_cast<uint64_t>(cache_hint),
+                                                       smem_ptr + i * BLOCK_OUTER * BLOCK_INNER_ATOM,
+                                                       inner_idx + i * BLOCK_INNER_ATOM, outer_idx);
+                 }
+@@ -48,7 +50,7 @@ copy(void const* desc_ptr, cutlass::arch::ClusterTransactionBarrier* barrier_ptr
+                     #pragma unroll
+                     for (uint32_t i = 0; i < BLOCK_INNER / BLOCK_INNER_ATOM; ++ i) {
+                         cute::SM90_TMA_LOAD_MULTICAST_2D::copy(desc_ptr, reinterpret_cast<uint64_t*>(barrier_ptr),
+-                                                               (1 << num_tma_multicast) - 1, static_cast<uint64_t>(cute::TMA::CacheHintSm90::EVICT_NORMAL),
++                                                               (1 << num_tma_multicast) - 1, static_cast<uint64_t>(cache_hint),
+                                                                smem_ptr + i * BLOCK_OUTER * BLOCK_INNER_ATOM,
+                                                                inner_idx + i * BLOCK_INNER_ATOM, outer_idx);
+                     }
+@@ -60,7 +62,7 @@ copy(void const* desc_ptr, cutlass::arch::ClusterTransactionBarrier* barrier_ptr
+             #pragma unroll
+             for (uint32_t i = 0; i < BLOCK_INNER / BLOCK_INNER_ATOM; ++ i) {
+                 cute::SM90_TMA_LOAD_3D::copy(desc_ptr, reinterpret_cast<uint64_t*>(barrier_ptr),
+-                                            static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL),
++                                            static_cast<uint64_t>(cache_hint),
+                                             smem_ptr + i * BLOCK_OUTER * BLOCK_INNER_ATOM,
+                                             inner_idx + i * BLOCK_INNER_ATOM, outer_idx, batch_idx);
+             }
+@@ -70,7 +72,7 @@ copy(void const* desc_ptr, cutlass::arch::ClusterTransactionBarrier* barrier_ptr
+                 #pragma unroll
+                 for (uint32_t i = 0; i < BLOCK_INNER / BLOCK_INNER_ATOM; ++ i) {
+                     cute::SM100_TMA_2SM_LOAD_3D::copy(desc_ptr, reinterpret_cast<uint64_t*>(barrier_ptr),
+-                                                      static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL),
++                                                      static_cast<uint64_t>(cache_hint),
+                                                       smem_ptr + i * BLOCK_OUTER * BLOCK_INNER_ATOM,
+                                                       inner_idx + i * BLOCK_INNER_ATOM, outer_idx, batch_idx);
+                 }
+@@ -79,7 +81,7 @@ copy(void const* desc_ptr, cutlass::arch::ClusterTransactionBarrier* barrier_ptr
+                     #pragma unroll
+                     for (uint32_t i = 0; i < BLOCK_INNER / BLOCK_INNER_ATOM; ++ i) {
+                         cute::SM90_TMA_LOAD_MULTICAST_3D::copy(desc_ptr, reinterpret_cast<uint64_t*>(barrier_ptr),
+-                                                               (1 << num_tma_multicast) - 1, static_cast<uint64_t>(cute::TMA::CacheHintSm90::EVICT_NORMAL),
++                                                               (1 << num_tma_multicast) - 1, static_cast<uint64_t>(cache_hint),
+                                                                smem_ptr + i * BLOCK_OUTER * BLOCK_INNER_ATOM,
+                                                                inner_idx + i * BLOCK_INNER_ATOM, outer_idx, batch_idx);
+                     }
+diff --git a/deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh b/deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh
+index 4ac276d3ed..8eb7902ebf 100644
+--- a/deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh
++++ b/deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh
+@@ -35,6 +35,8 @@ template <
+     uint32_t kNumSMs, uint32_t kNumRanks,
+     float kActivationClamp,
+     bool kFastMath,
++    bool kEvictFirstWeights,
++    bool kTilePackedWeights,
+     bool kHasShared = (kNumSharedExperts > 0),
+     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
+     uint32_t L1_SHAPE_K = kHidden,
+@@ -128,6 +130,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+ 
+     // SF and its buffer configs
+     constexpr uint32_t kGranK = 32;
++    constexpr uint32_t kWeightPacketK = 256;
++    DG_STATIC_ASSERT(
++        kWeightPacketK % BLOCK_K == 0,
++        "Weight packet K must be divisible by block K");
+     constexpr uint32_t kNumUTCCPAlignedElems = 128;
+     DG_STATIC_ASSERT(SF_BLOCK_M == math::constexpr_align(BLOCK_M, kNumUTCCPAlignedElems), "Invalid SF_BLOCK_M");
+     DG_STATIC_ASSERT(SF_BLOCK_N == BLOCK_N, "No padding is needed for SFB");
+@@ -763,6 +769,19 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+                 uint32_t k_idx = k_block_idx * BLOCK_K;
+                 uint32_t sfb_n_idx = n_block_idx * BLOCK_N;
+                 uint32_t sfb_k_idx = task_info.is_shared() ? k_block_idx * (BLOCK_K / 128) : task_info.local_expert_idx * shape_sfb_k + k_block_idx * (BLOCK_K / 128);
++                constexpr uint32_t kNumKBlocksPerPacket =
++                    kWeightPacketK / BLOCK_K;
++                const uint32_t num_n_clusters = shape_n / BLOCK_N / 2;
++                const uint32_t num_k_tiles = shape_k / kWeightPacketK;
++                const uint32_t packet_k_idx =
++                    k_block_idx / kNumKBlocksPerPacket;
++                const uint32_t packet_k_block_idx =
++                    k_block_idx % kNumKBlocksPerPacket;
++                const uint32_t weight_tile_idx =
++                    ((task_info.local_expert_idx * num_n_clusters +
++                      task_info.n_cluster_idx) * num_k_tiles +
++                     packet_k_idx) * 2 +
++                    (is_leader_cta ? 0u : 1u);
+ 
+                 // TMA copy weights with SF
+                 if (cute::elect_one_sync()) {
+@@ -777,10 +796,41 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+                             shared_storage.full_barriers[stage_idx].arrive(0u);
+                         }
+                     } else {
+-                        tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t>(
+-                            tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx], k_idx, n_idx, 2);
+-                        tma::copy<BLOCK_N, 1, 0>(
+-                            tensor_map_sfb_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_sfb[stage_idx], sfb_n_idx, sfb_k_idx, 2);
++                        if constexpr (kTilePackedWeights) {
++                            tma::copy<
++                                BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode,
++                                b_dtype_t, true>(
++                                tensor_map_b_ptr,
++                                &shared_storage.full_barriers[stage_idx],
++                                shared_storage.smem_b[stage_idx],
++                                packet_k_block_idx * BLOCK_K, 0, 2,
++                                weight_tile_idx,
++                                kEvictFirstWeights ?
++                                    cute::TMA::CacheHintSm100::EVICT_FIRST :
++                                    cute::TMA::CacheHintSm100::EVICT_NORMAL);
++                            tma::copy<BLOCK_N, 1, 0, uint32_t, true>(
++                                tensor_map_sfb_ptr,
++                                &shared_storage.full_barriers[stage_idx],
++                                shared_storage.smem_sfb[stage_idx], 0,
++                                packet_k_block_idx * (BLOCK_K / 128), 2,
++                                weight_tile_idx,
++                                kEvictFirstWeights ?
++                                    cute::TMA::CacheHintSm100::EVICT_FIRST :
++                                    cute::TMA::CacheHintSm100::EVICT_NORMAL);
++                        } else {
++                            tma::copy<
++                                BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode,
++                                b_dtype_t>(
++                                tensor_map_b_ptr,
++                                &shared_storage.full_barriers[stage_idx],
++                                shared_storage.smem_b[stage_idx],
++                                k_idx, n_idx, 2);
++                            tma::copy<BLOCK_N, 1, 0>(
++                                tensor_map_sfb_ptr,
++                                &shared_storage.full_barriers[stage_idx],
++                                shared_storage.smem_sfb[stage_idx],
++                                sfb_n_idx, sfb_k_idx, 2);
++                        }
+                         if (is_leader_cta) {
+                             shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(sizeof(SharedStorage::smem_b[0]) + sizeof(SharedStorage::smem_sfb[0]) * 2);
+                         } else {
+diff --git a/deep_gemm/mega/__init__.py b/deep_gemm/mega/__init__.py
+index 2314564e22..d0d7027b89 100644
+--- a/deep_gemm/mega/__init__.py
++++ b/deep_gemm/mega/__init__.py
+@@ -128,10 +128,72 @@ def _transpose_sf_for_utccp(sf: torch.Tensor) -> torch.Tensor:
+     return result.squeeze(0) if squeeze_group_dim else result
+ 
+ 
++def _pack_fp4_weight_tiles(
++    weight: torch.Tensor,
++    sf: torch.Tensor,
++    tile_n: int = 128,
++    tile_k: int = 256,
++) -> Tuple[torch.Tensor, torch.Tensor]:
++    """Store each FP4 weight tile next to the scale words consumed with it."""
++    assert weight.dtype == torch.int8 and weight.dim() == 3
++    assert sf.dtype == torch.int and sf.dim() == 3
++    num_groups, n, packed_k = weight.shape
++    assert n % tile_n == 0
++    assert (packed_k * 2) % tile_k == 0
++    num_n_tiles = n // tile_n
++    assert num_n_tiles % 2 == 0, \
++        'Cluster-paired packets require an even number of N tiles'
++    num_n_clusters = num_n_tiles // 2
++    num_k_tiles = packed_k * 2 // tile_k
++    packed_tile_k = tile_k // 2
++    packed_sf_k = tile_k // 128
++    assert sf.shape == (num_groups, n, num_k_tiles * packed_sf_k)
++
++    weight_tiles = (
++        weight.reshape(
++            num_groups, num_n_clusters, 2, tile_n,
++            num_k_tiles, packed_tile_k)
++        .permute(0, 1, 4, 2, 3, 5)
++        .contiguous()
++        .reshape(-1, tile_n, packed_tile_k)
++    )
++    sf_tiles = (
++        sf.permute(0, 2, 1)
++        .reshape(
++            num_groups, num_k_tiles, packed_sf_k,
++            num_n_clusters, 2, tile_n)
++        .permute(0, 3, 1, 4, 2, 5)
++        .contiguous()
++        .reshape(-1, packed_sf_k, tile_n)
++    )
++
++    weight_bytes = tile_n * packed_tile_k
++    sf_words = packed_sf_k * tile_n
++    packet_bytes = weight_bytes + sf_words * 4
++    num_tiles = weight_tiles.size(0)
++    storage = torch.empty(
++        (num_tiles, packet_bytes), dtype=torch.uint8, device=weight.device)
++    packed_weight = torch.as_strided(
++        storage.view(torch.int8),
++        size=(num_tiles, tile_n, packed_tile_k),
++        stride=(packet_bytes, packed_tile_k, 1),
++    )
++    packed_sf = torch.as_strided(
++        storage.view(torch.int32),
++        size=(num_tiles, packed_sf_k, tile_n),
++        stride=(packet_bytes // 4, tile_n, 1),
++        storage_offset=weight_bytes // 4,
++    )
++    packed_weight.copy_(weight_tiles)
++    packed_sf.copy_(sf_tiles)
++    return packed_weight, packed_sf
++
++
+ def transform_weights_for_mega_moe(
+     l1_weights: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+     l2_weights: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+-    activation: str = 'swiglu'
++    activation: str = 'swiglu',
++    tile_pack: bool = False,
+ ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]:
+     assert activation == 'swiglu', f'Only `swiglu` activation is supported, got `{activation}`'
+@@ -139,9 +201,17 @@ def transform_weights_for_mega_moe(
+         # FP8: interleave gate/up for weight and SF, then transpose L1 SF for UTCCP
+         l1_w = _interleave_weights(l1_weights[0])
+         l1_sf = _transpose_sf_for_utccp(_interleave_weights(l1_weights[1]))
+-        l1_transformed = (l1_w, l1_sf)
++        l1_transformed = (
++            _pack_fp4_weight_tiles(l1_w, l1_sf)
++            if tile_pack else (l1_w, l1_sf)
++        )
+         # L2: only transpose SF for UTCCP
+-        l2_transformed = (l2_weights[0], _transpose_sf_for_utccp(l2_weights[1]))
++        l2_w = l2_weights[0]
++        l2_sf = _transpose_sf_for_utccp(l2_weights[1])
++        l2_transformed = (
++            _pack_fp4_weight_tiles(l2_w, l2_sf)
++            if tile_pack else (l2_w, l2_sf)
++        )
+     else:
+         # BF16: L1 interleave gate/up, L2 unchanged
+         l1_transformed = _interleave_weights(l1_weights)
+diff --git a/tests/compile_mega_moe_tile_packets.cu b/tests/compile_mega_moe_tile_packets.cu
+new file mode 100644
+index 0000000000..3df1824261
+--- /dev/null
++++ b/tests/compile_mega_moe_tile_packets.cu
+@@ -0,0 +1,47 @@
++#include <deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh>
++
++using namespace deep_gemm;
++
++static void instantiate_k256_packet() {
++    auto ptr = reinterpret_cast<void*>(&sm100_fp8_fp4_mega_moe_impl<
++        384,
++        7168, 3072,
++        384, 0,
++        6, 16, 128,
++        256,
++        8, 128,
++        128,
++        6144,
++        98304,
++        5,
++        3584, 128, 128,
++        128, 152,
++        4,
++        0x1.4p+3f,
++        true,
++        true,
++        true
++    >);
++}
++
++static void instantiate_k128_packet() {
++    auto ptr = reinterpret_cast<void*>(&sm100_fp8_fp4_mega_moe_impl<
++        2304,
++        7168, 3072,
++        384, 0,
++        6, 192, 128,
++        128,
++        32, 256,
++        128,
++        12672,
++        202752,
++        6,
++        3584, 128, 128,
++        256, 152,
++        4,
++        0x1.4p+3f,
++        true,
++        false,
++        true
++    >);
++}
+diff --git a/tests/test_mega_moe.py b/tests/test_mega_moe.py
+index 9987e024a0..b83d16184f 100644
+--- a/tests/test_mega_moe.py
++++ b/tests/test_mega_moe.py
+@@ -74,8 +74,8 @@ def _copy_fp8_sf(dst: torch.Tensor, src: torch.Tensor, num_tokens: int) -> None:
+ # noinspection PyUnboundLocalVariable,PyShadowingNames
+ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
+     rank_idx, num_ranks, group = init_dist(local_rank, num_local_ranks)
+-    torch.manual_seed(rank_idx)
+-    random.seed(rank_idx)
++    torch.manual_seed(rank_idx + args.seed_offset)
++    random.seed(rank_idx + args.seed_offset)
+ 
+     # Settings
+     is_bf16xbf16 = args.mma_type == 'bf16xbf16'
+@@ -113,6 +113,7 @@ def _cast_weights_to_fp4(bf16_weights: torch.Tensor) -> Tuple[torch.Tensor, torc
+     def create_inputs():
+         global x, shared_x, shared_l1_x_sf, topk_idx, topk_weights, l1_weights, l2_weights
+         global transformed_l1_weights, transformed_l2_weights
++        global tile_packed_l1_weights, tile_packed_l2_weights
+         global shared_l1_weights, shared_l2_weights, transformed_shared_l1_weights, transformed_shared_l2_weights
+         global cumulative_local_expert_recv_stats_fused, cumulative_local_expert_recv_stats_baseline
+         global initial_cumulative_local_expert_recv_stats_fused, initial_cumulative_local_expert_recv_stats_baseline
+@@ -159,6 +160,14 @@ def create_inputs():
+ 
+         transformed_l1_weights, transformed_l2_weights = (
+             deep_gemm.transform_weights_for_mega_moe(l1_weights, l2_weights))
++        if (not is_bf16xbf16 and
++                (args.tile_packed_weights or args.compare_tile_packed or
++                 args.benchmark_tile_packed_ab)):
++            tile_packed_l1_weights, tile_packed_l2_weights = (
++                deep_gemm.transform_weights_for_mega_moe(
++                    l1_weights, l2_weights, tile_pack=True))
++        else:
++            tile_packed_l1_weights = tile_packed_l2_weights = None
+         if num_shared_experts > 0:
+             transformed_shared_l1_weights, transformed_shared_l2_weights = (
+                 deep_gemm.transform_weights_for_mega_moe(shared_l1_weights, shared_l2_weights))
+@@ -178,13 +187,22 @@ def copy_inputs_to_buffer():
+         buffer.topk_idx[:num_tokens].copy_(topk_idx)
+         buffer.topk_weights[:num_tokens].copy_(topk_weights)
+ 
+-    def run_fused():
++    def run_fused(use_tile_packed=None):
+         cumulative_local_expert_recv_stats_fused.copy_(initial_cumulative_local_expert_recv_stats_fused)
+         copy_inputs_to_buffer()
+ 
+         y = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
++        if use_tile_packed is None:
++            use_tile_packed = args.tile_packed_weights
++        selected_l1_weights = (
++            tile_packed_l1_weights if use_tile_packed
++            else transformed_l1_weights)
++        selected_l2_weights = (
++            tile_packed_l2_weights if use_tile_packed
++            else transformed_l2_weights)
+         kernel_kwargs = dict(
+-            y=y, l1_weights=transformed_l1_weights, l2_weights=transformed_l2_weights,
++            y=y, l1_weights=selected_l1_weights,
++            l2_weights=selected_l2_weights,
+             sym_buffer=buffer,
+             cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats_fused,
+             activation_clamp=args.activation_clamp,
+@@ -330,6 +348,20 @@ def run_baseline():
+     else:
+         create_inputs()
+ 
++    if args.compare_tile_packed:
++        assert not is_bf16xbf16
++        assert num_shared_experts == 0
++        stock_y, stock_stats = run_fused(use_tile_packed=False)
++        stock_y = stock_y.clone()
++        stock_stats = stock_stats.clone()
++        packed_y, packed_stats = run_fused(use_tile_packed=True)
++        assert torch.equal(packed_y, stock_y)
++        assert torch.equal(packed_stats, stock_stats)
++        dist_print(
++            'Bitwise layout A/B passed: row-major -> tile-packed',
++            once_in_node=True,
++        )
++
+     # Count local received tokens
+     gathered_topk_idx = uneven_all_gather(topk_idx, group=group)
+     gathered_topk_idx[(gathered_topk_idx < rank_idx * num_experts_per_rank) | \
+@@ -338,6 +370,34 @@ def run_baseline():
+ 
+     # Benchmark
+     barrier_fn = lambda: ep_buffer.barrier(use_comm_stream=False) if ep_buffer else dist.all_reduce(torch.empty(1, device='cuda'))
++    if args.benchmark_tile_packed_ab:
++        baseline_times, candidate_times = [], []
++
++        def bench_tile_packed(enabled: bool) -> float:
++            return bench_kineto(
++                lambda: run_fused(use_tile_packed=enabled),
++                'mega_moe',
++                num_tests=args.ab_num_tests,
++                barrier=barrier_fn,
++                with_multiple_kernels=True,
++            )
++
++        for repeat_idx in range(args.ab_repeats):
++            if repeat_idx % 2 == 0:
++                baseline_times.append(bench_tile_packed(False))
++                candidate_times.append(bench_tile_packed(True))
++            else:
++                candidate_times.append(bench_tile_packed(True))
++                baseline_times.append(bench_tile_packed(False))
++
++        baseline_csv = ','.join(
++            f'{value * 1e6:.3f}' for value in baseline_times)
++        candidate_csv = ','.join(
++            f'{value * 1e6:.3f}' for value in candidate_times)
++        dist_print(
++            f'TILE_PACKED_AB rank={rank_idx} '
++            f'baseline_us={baseline_csv} candidate_us={candidate_csv}')
++
+     trace_path = None if not args.dump_profile_traces else f'{args.dump_profile_traces}/mega_moe_rank{rank_idx}.json'
+     t_fused = bench_kineto(run_fused, 'mega_moe', barrier=barrier_fn, trace_path=trace_path)
+     t_baseline = tilelang_bench(
+@@ -426,6 +486,16 @@ def print_perf(elapsed: float, ref_time: float, ref_label: str):
+ 
+     # Test settings
+     parser.add_argument('--num-correctness-tests', type=int, default=None, help='Pressure test')
++    parser.add_argument('--tile-packed-weights', action='store_true',
++                        help='Run with cluster-paired FP4 weight packets')
++    parser.add_argument('--compare-tile-packed', action='store_true',
++                        help='Check row-major versus tile-packed output')
++    parser.add_argument('--benchmark-tile-packed-ab', action='store_true',
++                        help='Benchmark alternating row-major/tile-packed runs')
++    parser.add_argument('--ab-repeats', type=int, default=4)
++    parser.add_argument('--ab-num-tests', type=int, default=20)
++    parser.add_argument('--seed-offset', type=int, default=0,
++                        help='Offset deterministic input generation')
+     parser.add_argument('--dump-profile-traces', type=str, default='', help='Dump profiling trace JSONs')
+     parser.add_argument('--local-rank-idx', type=int, default=None, help='Run as single process with this local rank (e.g. for NCU prof)')
+     args = parser.parse_args()
+diff --git a/tests/test_mega_moe_tile_packets.py b/tests/test_mega_moe_tile_packets.py
+new file mode 100644
+index 0000000000..a7566d1bd4
+--- /dev/null
++++ b/tests/test_mega_moe_tile_packets.py
+@@ -0,0 +1,99 @@
++import pytest
++import torch
++
++from deep_gemm.mega import _pack_fp4_weight_tiles
++
++
++def test_tile_packets_require_complete_cta_pairs():
++    weight = torch.empty((1, 128, 128), dtype=torch.int8)
++    sf = torch.empty((1, 128, 2), dtype=torch.int32)
++
++    with pytest.raises(
++            AssertionError,
++            match='require an even number of N tiles'):
++        _pack_fp4_weight_tiles(weight, sf)
++
++
++def test_tile_packets_keep_cluster_peers_and_scales_adjacent():
++    num_groups = 2
++    n = 512
++    logical_k = 512
++    packed_k = logical_k // 2
++    packed_sf_k = logical_k // 128
++
++    weight = torch.arange(
++        num_groups * n * packed_k, dtype=torch.int64
++    ).to(torch.int8).reshape(num_groups, n, packed_k)
++    sf = torch.arange(
++        num_groups * n * packed_sf_k, dtype=torch.int32
++    ).reshape(num_groups, n, packed_sf_k)
++
++    packed_weight, packed_sf = _pack_fp4_weight_tiles(weight, sf)
++
++    assert packed_weight.untyped_storage().data_ptr() == \
++        packed_sf.untyped_storage().data_ptr()
++    assert packed_sf.data_ptr() - packed_weight.data_ptr() == 128 * 128
++    assert packed_weight.stride() == (17408, 128, 1)
++    assert packed_sf.stride() == (4352, 128, 1)
++
++    num_n_clusters = n // 128 // 2
++    num_k_tiles = logical_k // 256
++    for group_idx in range(num_groups):
++        for cluster_idx in range(num_n_clusters):
++            for k_tile_idx in range(num_k_tiles):
++                for peer_idx in range(2):
++                    packet_idx = (
++                        ((group_idx * num_n_clusters + cluster_idx) *
++                         num_k_tiles + k_tile_idx) * 2 + peer_idx
++                    )
++                    n_start = (cluster_idx * 2 + peer_idx) * 128
++                    k_start = k_tile_idx * 128
++                    expected_weight = weight[
++                        group_idx,
++                        n_start:n_start + 128,
++                        k_start:k_start + 128,
++                    ]
++                    expected_sf = sf[
++                        group_idx,
++                        n_start:n_start + 128,
++                        k_tile_idx * 2:k_tile_idx * 2 + 2,
++                    ].T
++                    assert torch.equal(
++                        packed_weight[packet_idx], expected_weight)
++                    assert torch.equal(packed_sf[packet_idx], expected_sf)
++
++
++def test_k128_compute_tiles_are_the_two_halves_of_one_packet():
++    n = 256
++    logical_k = 256
++    weight = torch.arange(
++        n * logical_k // 2, dtype=torch.int64
++    ).to(torch.int8).reshape(1, n, logical_k // 2)
++    sf = torch.arange(
++        n * logical_k // 128, dtype=torch.int32
++    ).reshape(1, n, logical_k // 128)
++
++    packed_weight, packed_sf = _pack_fp4_weight_tiles(weight, sf)
++
++    for peer_idx in range(2):
++        packet_idx = peer_idx
++        n_start = peer_idx * 128
++        for packet_half in range(2):
++            packed_k_start = packet_half * 64
++            expected_weight = weight[
++                0,
++                n_start:n_start + 128,
++                packed_k_start:packed_k_start + 64,
++            ]
++            expected_sf = sf[
++                0,
++                n_start:n_start + 128,
++                packet_half:packet_half + 1,
++            ].T
++            assert torch.equal(
++                packed_weight[
++                    packet_idx, :, packed_k_start:packed_k_start + 64],
++                expected_weight)
++            assert torch.equal(
++                packed_sf[packet_idx, packet_half:packet_half + 1, :],
++                expected_sf)

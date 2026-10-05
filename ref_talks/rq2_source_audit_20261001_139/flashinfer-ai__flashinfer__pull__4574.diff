@@ -1,0 +1,329 @@
+diff --git a/csrc/trtllm_fused_moe_kernel_launcher.cu b/csrc/trtllm_fused_moe_kernel_launcher.cu
+index f04e2110fed..2bdc07bda4d 100644
+--- a/csrc/trtllm_fused_moe_kernel_launcher.cu
++++ b/csrc/trtllm_fused_moe_kernel_launcher.cu
+@@ -494,6 +494,10 @@ struct MoeRunResultBuffers {
+   // Optional activation output.
+   // Sync with flashinfer/fused_moe/core.py:_unpack_trtllm_moe_output.
+   Optional<Tensor> activation_output;
++  // Optional block scales for a quantized activation output. Physical layout is
++  // preserved in tensor rank: rank 4 is SWIZZLED_8x4, rank 5 is SWIZZLED_128x4.
++  // Sync with flashinfer/fused_moe/core.py:_unpack_trtllm_moe_output.
++  Optional<Tensor> activation_output_scale;
+   // Whether FFI[0] is finalized output rather than an unfinalized FC2 buffer.
+   // Sync with flashinfer/fused_moe/core.py:_unpack_trtllm_moe_output.
+   bool is_finalized{true};
+@@ -516,6 +520,9 @@ struct MoeRunResultBuffers {
+     if (activation_output.has_value()) {
+       tensors.push_back(activation_output.value());
+     }
++    if (activation_output_scale.has_value()) {
++      tensors.push_back(activation_output_scale.value());
++    }
+     return tensors;
+   }
+ };
+@@ -1472,9 +1479,10 @@ class FusedMoeLauncher {
+   // | do_finalize | return_activation_output | Returned tensors                                  |
+   // |-------------|--------------------------|---------------------------------------------------|
+   // | true  | false | [output]                                                                   |
+-  // | true  | true  | [output, expanded_idx_to_permuted_idx, gemm1_output]                       |
++  // | true  | true  | [output, expanded_idx_to_permuted_idx, gemm1_output, (gemm1_output_scale)] |
+   // | false | false | [gemm2_output, expert_weights, expanded_idx_to_permuted_idx]               |
+-  // | false | true  | [gemm2_output, expert_weights, expanded_idx_to_permuted_idx, gemm1_output] |
++  // | false | true  | [gemm2_output, expert_weights, expanded_idx_to_permuted_idx, gemm1_output, |
++  // |               |  (gemm1_output_scale)]                                                     |
+   //
+   // The `gemm1_output` slot carries the post-activation FC1 output with shape
+   // [num_padded_tokens, intermediate_size].
+@@ -3150,10 +3158,32 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
+ 
+     auto const gemm1_output_hidden =
+         mDtypeAct == btg::Dtype::E2m1 ? args->intermediate_size / 2 : args->intermediate_size;
+-    if (mDtypeAct == btg::Dtype::E2m1 || mDtypeAct == btg::Dtype::MxE4m3) {
++    if (mDtypeAct == btg::Dtype::E2m1) {
+       int64_t sf_size = tensorrt_llm::computeSwizzledLayoutSFSize(
+           max_num_padded_tokens_gemm1, args->intermediate_size / sf_vec_size);
+       gemm1_output_scale = alloc_tensor({sf_size}, dl_uint8, hidden_states.device());
++    } else if (mDtypeAct == btg::Dtype::MxE4m3) {
++      int64_t sf_size = tensorrt_llm::computeSwizzledLayoutSFSize(
++          max_num_padded_tokens_gemm1, args->intermediate_size / sf_vec_size);
++      // Preserve tactic-selected physical layout in tensor shape. This keeps
++      // the public result graph-safe: consumers can dispatch from host metadata
++      // without copying a device scalar or synchronizing the launch stream.
++      int64_t const sf_cols = args->intermediate_size / sf_vec_size;
++      int64_t const padded_sf_cols = ((sf_cols + 3) / 4) * 4;
++      TVM_FFI_ICHECK_EQ(sf_size % padded_sf_cols, 0)
++          << "MXFP8 FC1 scale allocation is not row-aligned";
++      int64_t const padded_sf_rows = sf_size / padded_sf_cols;
++      if (tile_tokens_dim <= 64) {
++        TVM_FFI_ICHECK_EQ(padded_sf_rows % 8, 0)
++            << "SWIZZLED_8x4 FC1 scales require rows padded to 8";
++        gemm1_output_scale = alloc_tensor({padded_sf_rows / 8, padded_sf_cols / 4, 8, 4}, dl_uint8,
++                                          hidden_states.device());
++      } else {
++        TVM_FFI_ICHECK_EQ(padded_sf_rows % 128, 0)
++            << "SWIZZLED_128x4 FC1 scales require rows padded to 128";
++        gemm1_output_scale = alloc_tensor({padded_sf_rows / 128, padded_sf_cols / 4, 32, 4, 4},
++                                          dl_uint8, hidden_states.device());
++      }
+     }
+     if (!per_token_scales.has_value()) {
+       gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1, gemm1_output_hidden},
+@@ -3320,6 +3350,9 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
+     }
+     if (return_activation_output) {
+       result.activation_output = gemm1_output;
++      if (mDtypeAct == btg::Dtype::MxE4m3 && gemm1_output_scale.has_value()) {
++        result.activation_output_scale = gemm1_output_scale.value();
++      }
+     }
+     return result;
+   }
+diff --git a/flashinfer/fused_moe/core.py b/flashinfer/fused_moe/core.py
+index 2e3947d7fd4..361c9a50b2c 100644
+--- a/flashinfer/fused_moe/core.py
++++ b/flashinfer/fused_moe/core.py
+@@ -1679,6 +1679,7 @@ def _unpack_trtllm_moe_output(
+     do_finalize: bool,
+     gemm1_lora_delta: Optional[torch.Tensor],
+     expert_weights: Optional[torch.Tensor] = None,
++    return_gemm1_output_scale: bool = False,
+ ) -> List[torch.Tensor]:
+     """Translate the ``Array<Tensor>`` returned by ``FusedMoeLauncher::run`` to
+     the Python-facing ``List[torch.Tensor]``.
+@@ -1692,11 +1693,16 @@ def _unpack_trtllm_moe_output(
+     if do_finalize and gemm1_lora_delta is None:
+         return [output]
+     elif do_finalize and gemm1_lora_delta is not None:
+-        return [
++        result = [
+             output,
+             torch.from_dlpack(intermediate_output[1]),  # expanded_idx_to_permuted_idx
+             torch.from_dlpack(intermediate_output[2]),  # gemm1_output
+         ]
++        if return_gemm1_output_scale and len(intermediate_output) > 3:
++            # Quantized activation scale. Tensor rank preserves physical layout:
++            # rank 4 is SWIZZLED_8x4 and rank 5 is SWIZZLED_128x4.
++            result.append(torch.from_dlpack(intermediate_output[3]))
++        return result
+ 
+     # do_finalize=False: index 1 is expert_weights.  Only convert it when the
+     # launcher owned (allocated) the buffer -- converting a borrowed slot would
+@@ -1713,6 +1719,10 @@ def _unpack_trtllm_moe_output(
+     ]
+     if gemm1_lora_delta is not None:
+         result.append(torch.from_dlpack(intermediate_output[3]))  # gemm1_output
++        if return_gemm1_output_scale and len(intermediate_output) > 4:
++            result.append(
++                torch.from_dlpack(intermediate_output[4])
++            )  # gemm1_output_scale
+     return result
+ 
+ 
+@@ -3640,6 +3650,7 @@ def trtllm_fp4_block_scale_moe_op(
+         norm_topk_prob: bool = True,
+         routing_replay_out: Optional[torch.Tensor] = None,
+         num_fused_shared_experts: int = 0,
++        return_gemm1_output_scale: bool = False,
+     ) -> List[torch.Tensor]:
+         if routing_logits is None:
+             assert topk_ids is not None, (
+@@ -3837,6 +3848,7 @@ def run_selected_tactic(tactic: Any) -> List[torch.Tensor]:
+                 do_finalize,
+                 gemm1_lora_delta,
+                 topk_weights,
++                return_gemm1_output_scale,
+             )
+ 
+         # When do_finalize=False, the FC2 output format is determined on device based on runtime
+@@ -3891,7 +3903,12 @@ def run_selected_tactic(tactic: Any) -> List[torch.Tensor]:
+             routed_scaling_factor=routed_scaling_factor,
+             run_fixed_tactic=run_selected_tactic,
+             finish_switch=lambda: _unpack_trtllm_moe_output(
+-                [], output, do_finalize, gemm1_lora_delta, topk_weights
++                [],
++                output,
++                do_finalize,
++                gemm1_lora_delta,
++                topk_weights,
++                return_gemm1_output_scale,
+             ),
+         )
+ 
+@@ -3935,10 +3952,12 @@ def _fake_trtllm_fp4_block_scale_moe(
+         norm_topk_prob: bool = True,
+         routing_replay_out: Optional[torch.Tensor] = None,
+         num_fused_shared_experts: int = 0,
++        return_gemm1_output_scale: bool = False,
+     ):
+         # Acknowledge mutation-only and fallback-only controls without executing the native op.
+         _ = routing_replay_out
+         _ = num_fused_shared_experts
++        _ = return_gemm1_output_scale
+         # Respect a caller-provided output width when tracing the finalized public result.
+         seq_len = hidden_states.shape[0]
+         hidden_size = hidden_states.shape[1] if output is None else output.shape[1]
+@@ -6260,6 +6279,7 @@ def trtllm_fp4_block_scale_routed_moe(
+     output: Optional[torch.Tensor] = None,
+     tune_max_num_tokens: int = 8192,
+     gemm1_lora_delta: Optional[torch.Tensor] = None,
++    return_gemm1_output_scale: bool = False,
+ ) -> List[torch.Tensor]:
+     """FP4 block scale MoE operation with pre-computed routing.
+ 
+@@ -6378,8 +6398,15 @@ def trtllm_fp4_block_scale_routed_moe(
+     gemm1_lora_delta : Optional[torch.Tensor]
+         Optional MoE LoRA delta of shape
+         ``[num_tokens, top_k, 2 * intermediate_size]``, ``bfloat16``.  When
+-        set it is added to FC1 before the fused gated activation and the
+-        post-activation FC1 output is appended to the return list.
++        set it is added to FC1 before the fused gated activation. The
++        post-activation FC1 output is appended to the return list, followed by
++        its scale tensor when quantized. Scale tensor rank is graph-safe layout
++        metadata: rank 4 is ``SWIZZLED_8x4`` and rank 5 is
++        ``SWIZZLED_128x4``.
++    return_gemm1_output_scale : bool
++        When ``True`` and ``gemm1_lora_delta`` is set for MXFP4×MXFP8,
++        append the post-activation FC1 scale tensor after the FC1 output.
++        Defaults to ``False`` to preserve the established return-list length.
+ 
+     Returns
+     -------
+@@ -6411,7 +6438,7 @@ def trtllm_fp4_block_scale_routed_moe(
+             gemm1_lora_delta.to(torch.float32) * inv_dequant_ab[..., None]
+         ).to(gemm1_lora_delta.dtype)
+ 
+-    return get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe(
++    result = get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe(
+         routing_mode,
+         None,
+         topk_ids_tensor,
+@@ -6451,6 +6478,13 @@ def trtllm_fp4_block_scale_routed_moe(
+         None,  # routing_replay_out: not used for pre-computed routing
+         0,  # num_fused_shared_experts: not used for pre-computed routing
+     )
++    if (
++        gemm1_lora_delta is not None
++        and not return_gemm1_output_scale
++        and len(result) > 3
++    ):
++        return result[:3]
++    return result
+ 
+ 
+ @flashinfer_api(trace=trtllm_mxint4_block_scale_moe_trace)
+diff --git a/tests/moe/test_trtllm_gen_fused_moe.py b/tests/moe/test_trtllm_gen_fused_moe.py
+index 467ecea9262..56c03bba714 100644
+--- a/tests/moe/test_trtllm_gen_fused_moe.py
++++ b/tests/moe/test_trtllm_gen_fused_moe.py
+@@ -2567,7 +2567,7 @@ def _build_w_ptr_table(weights, num_experts):
+     return w_ptr, stride
+ 
+ 
+-@pytest.mark.parametrize("num_tokens", [8, 128])
++@pytest.mark.parametrize("num_tokens", [8, 128, 1152])
+ @pytest.mark.parametrize("hidden_size", [1024])
+ @pytest.mark.parametrize("intermediate_size", [1024])
+ @pytest.mark.parametrize(
+@@ -2676,6 +2676,16 @@ def test_moe_lora_delta(
+       * "fake": zero vs constant delta, so the test fails if LoRA is silently dropped;
+       * "real": regular 2-slice delta built by bgmv_moe_gemm1_lora_delta inside run_moe_test;
+       * "performant": shared-A + horizontally-fused-B delta via 1D [E] w_ptr tables."""
++    if num_tokens == 1152 and not (
++        isinstance(moe_impl, FP4Moe)
++        and moe_impl.quant_mode == QuantMode.FP4_MXFP4_MXFP8
++        and weight_processing["layout"] == WeightLayout.MajorK
++        and delta_mode == "real"
++    ):
++        pytest.skip(
++            "large-M scale-layout transition is covered on MxFp4xMxFp8 real delta"
++        )
++
+     if delta_mode == "performant" and not (
+         num_tokens == 128
+         and weight_processing["layout"] == WeightLayout.BlockMajorK
+diff --git a/tests/moe/trtllm_gen_fused_moe_utils.py b/tests/moe/trtllm_gen_fused_moe_utils.py
+index c2aef180416..cf556583a53 100644
+--- a/tests/moe/trtllm_gen_fused_moe_utils.py
++++ b/tests/moe/trtllm_gen_fused_moe_utils.py
+@@ -283,6 +283,7 @@ def _run_moe_computation(self, runtime_args):
+                 routing_method_type=self.config["routing_method_type"],
+                 activation_type=self.config["activation_type"],
+                 gemm1_lora_delta=self.gemm1_lora_delta_slot,
++                return_gemm1_output_scale=True,
+                 tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
+             )
+ 
+@@ -453,16 +454,41 @@ def _gather_intermediate_by_expanded_idx(raw_kernel_output, reference_args):
+     return kernel_routed, ref_routed
+ 
+ 
+-def _decode_mxfp8_intermediate(kernel_routed, ref_routed):
+-    """Decode MxFp8 (e4m3) codes to fp32 using an mx block scale recovered from the
+-    reference (the kernel does not return its scale). Compare the result against the
+-    CLEAN fp32 ``ref_routed`` — e4m3 is fine-grained enough that clean-fp32 comparison
+-    holds (unlike fp4, which needs a round-tripped reference).
++def _unswizzle_mxfp8_scale_layout(swizzled_scales, rows, blocks):
++    """Decode graph-safe physical layout metadata carried by tensor rank."""
++    scales = swizzled_scales.view(torch.uint8)
++    if scales.ndim == 4:
++        assert scales.shape[-2:] == (8, 4)
++        padded_rows = scales.shape[0] * 8
++        padded_blocks = scales.shape[1] * 4
++        return (
++            scales.permute(0, 2, 1, 3)
++            .contiguous()
++            .view(padded_rows, padded_blocks)[:rows, :blocks]
++        )
++    assert scales.ndim == 5 and scales.shape[-3:] == (32, 4, 4)
++    padded_rows = scales.shape[0] * 128
++    padded_blocks = scales.shape[1] * 4
++    return (
++        scales.permute(0, 3, 2, 1, 4)
++        .contiguous()
++        .view(padded_rows, padded_blocks)[:rows, :blocks]
++    )
++
++
++def _decode_mxfp8_intermediate(kernel_routed, ref_routed, kernel_scale=None):
++    """Decode MxFp8 codes with returned scales, or reference scales for legacy paths.
++
++    Compare against clean fp32 ``ref_routed`` — e4m3 is fine-grained enough that
++    clean-fp32 comparison holds (unlike fp4, which needs a round-tripped reference).
+     """
+-    _, ref_scale = mxfp8_quantize(ref_routed.to(torch.bfloat16), True)
+-    ref_scale_bytes = ref_scale.view(torch.uint8).reshape(-1).cpu()
++    if kernel_scale is None:
++        _, ref_scale = mxfp8_quantize(ref_routed.to(torch.bfloat16), True)
++        scale_bytes = ref_scale.view(torch.uint8).reshape(-1).cpu()
++    else:
++        scale_bytes = kernel_scale.view(torch.uint8).reshape(-1).cpu()
+     return (
+-        mxfp8_dequantize_host(kernel_routed.cpu().view(torch.uint8), ref_scale_bytes)
++        mxfp8_dequantize_host(kernel_routed.cpu().view(torch.uint8), scale_bytes)
+         .to(ref_routed.device)
+         .to(torch.float32)
+     )
+@@ -943,7 +969,20 @@ def _decode(codes):
+             )
+             ref_compare = ref_routed
+             if self.quant_mode == QuantMode.FP4_MXFP4_MXFP8:
+-                kernel_dequant = _decode_mxfp8_intermediate(kernel_routed, ref_routed)
++                assert len(raw_kernel_output) >= 4, (
++                    "MxFp4xMxFp8 LoRA output must return tactic-layout-aware "
++                    "gemm1_output_scale after gemm1_output"
++                )
++                all_scales = _unswizzle_mxfp8_scale_layout(
++                    raw_kernel_output[3],
++                    raw_kernel_output[2].shape[0],
++                    intermediate_size // 32,
++                )
++                expanded_to_permuted = raw_kernel_output[1].to(torch.int64)
++                kernel_scale = all_scales[expanded_to_permuted]
++                kernel_dequant = _decode_mxfp8_intermediate(
++                    kernel_routed, ref_routed, kernel_scale
++                )
+             else:  # FP4_MXFP4_Bf16
+                 kernel_dequant = kernel_routed.to(torch.float32)
+ 

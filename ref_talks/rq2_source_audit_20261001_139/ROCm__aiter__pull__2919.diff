@@ -1,0 +1,1738 @@
+diff --git a/aiter/ops/attention.py b/aiter/ops/attention.py
+index 572c5225937..f8995e6317d 100644
+--- a/aiter/ops/attention.py
++++ b/aiter/ops/attention.py
+@@ -12,6 +12,9 @@
+ from csrc.cpp_itfs.pa.pa_ragged import (
+     paged_attention_ragged as paged_attention_ragged_core,
+ )
++from csrc.cpp_itfs.pa.pa_ragged_nhd import (
++    paged_attention_ragged_nhd as paged_attention_ragged_nhd_core,
++)
+ from csrc.cpp_itfs.pa.pa_v1 import paged_attention_v1 as paged_attention_v1_core
+ from csrc.cpp_itfs.torch_utils import direct_register_custom_op
+ from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
+@@ -642,12 +645,69 @@ def paged_attention_ragged(
+     return out
+ 
+ 
++def paged_attention_ragged_nhd(
++    out: torch.Tensor,
++    exp_sums: torch.Tensor,
++    max_logits: torch.Tensor,
++    tmp_out: torch.Tensor,
++    query: torch.Tensor,
++    key_cache: torch.Tensor,
++    value_cache: torch.Tensor,
++    scale: float,
++    kv_indptr: torch.Tensor,
++    kv_page_indices: torch.Tensor,
++    kv_last_page_lens: torch.Tensor,
++    block_size: int,
++    max_num_partitions: int,
++    alibi_slopes: Optional[torch.Tensor],
++    kv_cache_dtype: str,
++    kv_cache_layout: str,
++    logits_soft_cap: float,
++    k_scale: torch.Tensor,
++    v_scale: torch.Tensor,
++    fp8_out_scale: Optional[torch.Tensor] = None,
++    partition_size: int = 256,
++    mtp: int = 1,
++) -> torch.Tensor:
++    paged_attention_ragged_nhd_core(
++        out,
++        exp_sums,
++        max_logits,
++        tmp_out,
++        query,
++        key_cache,
++        value_cache,
++        scale,
++        kv_indptr,
++        kv_page_indices,
++        kv_last_page_lens,
++        block_size,
++        max_num_partitions,
++        alibi_slopes,
++        kv_cache_dtype,
++        kv_cache_layout,
++        logits_soft_cap,
++        k_scale,
++        v_scale,
++        fp8_out_scale,
++        partition_size,
++        mtp,
++    )
++    return out
++
++
+ direct_register_custom_op(
+     "paged_attention_ragged",
+     paged_attention_ragged,
+     ["out", "workspace_buffer"],
+ )
+ 
++direct_register_custom_op(
++    "paged_attention_ragged_nhd",
++    paged_attention_ragged_nhd,
++    ["out", "exp_sums", "max_logits", "tmp_out"],
++)
++
+ 
+ MD_NAME = "module_mla_asm"
+ 
+diff --git a/csrc/cpp_itfs/pa/pa_ragged.cpp b/csrc/cpp_itfs/pa/pa_ragged.cpp
+index 46571efc082..aa706ba25c6 100644
+--- a/csrc/cpp_itfs/pa/pa_ragged.cpp
++++ b/csrc/cpp_itfs/pa/pa_ragged.cpp
+@@ -98,6 +98,106 @@ void paged_attention_ragged(std::optional<std::string> folder,
+             fp8_out_scale_ptr,
+             reinterpret_cast<const void*>(stream));
+ }
++
++void paged_attention_ragged_nhd(std::optional<std::string> folder,
++                                void* query_ptr,
++                                void* key_cache_ptr,
++                                void* value_cache_ptr,
++                                void* exp_sums_ptr,
++                                void* max_logits_ptr,
++                                void* tmp_out_ptr,
++                                int* kv_indptr_ptr,
++                                int* kv_page_indices_ptr,
++                                int* kv_last_page_lens_ptr,
++                                const float* k_scale_ptr,
++                                const float* v_scale_ptr,
++                                const float* fp8_out_scale_ptr,
++                                void* out_ptr,
++                                const float* alibi_slopes_ptr,
++                                const float scale,
++                                const int num_seqs,
++                                const int num_kv_heads,
++                                const int num_heads,
++                                const int max_num_partitions,
++                                const int head_size,
++                                const int block_size,
++                                const float logits_soft_cap,
++                                const int q_stride,
++                                const int kv_block_stride,
++                                const int kv_head_stride,
++                                const int kv_seq_stride,
++                                const std::string dtype,
++                                const std::string kv_dtype,
++                                const std::string kv_cache_dtype,
++                                const std::string out_dtype,
++                                const hipStream_t stream)
++{
++    static constexpr const char* MD_NAME_NHD = "pa_ragged_nhd";
++    const int gqa_ratio = num_heads / num_kv_heads;
++    const int npar_loops = DIVIDE_ROUND_UP(max_num_partitions, warpSize);
++    const std::string alibi_enabled = alibi_slopes_ptr ? "true" : "false";
++    // Must match execute_cmd placeholder order: gqa, num_kv_heads, head, npar, ...
++    std::list<std::string> args{std::to_string(gqa_ratio),
++                                std::to_string(num_kv_heads),
++                                std::to_string(head_size),
++                                std::to_string(npar_loops),
++                                dtype,
++                                kv_dtype,
++                                kv_cache_dtype,
++                                out_dtype,
++                                std::to_string(block_size),
++                                alibi_enabled};
++    const std::string func_name = get_default_func_name(MD_NAME_NHD, args);
++
++    if(!folder)
++    {
++        folder = func_name;
++    }
++
++    if(not_built(folder.value()))
++    {
++        args.push_back(func_name);
++        execute_cmd(R"(python3 -m csrc.cpp_itfs.pa.pa_ragged_nhd \
++                                    --gqa_ratio={} \
++                                    --num_kv_heads={} \
++                                    --head_size={} \
++                                    --npar_loops={} \
++                                    --dtype={} \
++                                    --kv_dtype={} \
++                                    --fp8_kv_dtype={} \
++                                    --out_dtype={} \
++                                    --block_size={} \
++                                    --alibi_enabled={} \
++                                    --func_name={})", args);
++    }
++    run_lib(func_name,
++            folder.value(),
++            out_ptr,
++            exp_sums_ptr,
++            max_logits_ptr,
++            tmp_out_ptr,
++            query_ptr,
++            key_cache_ptr,
++            value_cache_ptr,
++            scale,
++            num_seqs,
++            num_kv_heads,
++            num_heads,
++            max_num_partitions,
++            q_stride,
++            kv_block_stride,
++            kv_head_stride,
++            kv_seq_stride,
++            kv_indptr_ptr,
++            kv_page_indices_ptr,
++            kv_last_page_lens_ptr,
++            alibi_slopes_ptr,
++            logits_soft_cap,
++            k_scale_ptr,
++            v_scale_ptr,
++            fp8_out_scale_ptr,
++            reinterpret_cast<const void*>(stream));
++}
+ #undef MD_NAME
+ #undef DIVIDE_ROUND_UP
+ } // namespace aiter
+diff --git a/csrc/cpp_itfs/pa/pa_ragged.h b/csrc/cpp_itfs/pa/pa_ragged.h
+index 77b437b8f3e..d89916330f9 100644
+--- a/csrc/cpp_itfs/pa/pa_ragged.h
++++ b/csrc/cpp_itfs/pa/pa_ragged.h
+@@ -34,4 +34,37 @@ void paged_attention_ragged(std::optional<std::string> folder,
+                             const std::string kv_cache_dtype,
+                             const std::string out_dtype,
+                             const hipStream_t stream);
++
++void paged_attention_ragged_nhd(std::optional<std::string> folder,
++                                void* query_ptr,
++                                void* key_cache_ptr,
++                                void* value_cache_ptr,
++                                void* exp_sums_ptr,
++                                void* max_logits_ptr,
++                                void* tmp_out_ptr,
++                                int* kv_indptr_ptr,
++                                int* kv_page_indices_ptr,
++                                int* kv_last_page_lens_ptr,
++                                const float* k_scale_ptr,
++                                const float* v_scale_ptr,
++                                const float* fp8_out_scale_ptr,
++                                void* out_ptr,
++                                const float* alibi_slopes_ptr,
++                                const float scale,
++                                const int num_seqs,
++                                const int num_kv_heads,
++                                const int num_heads,
++                                const int max_num_partitions,
++                                const int head_size,
++                                const int block_size,
++                                const float logits_soft_cap,
++                                const int q_stride,
++                                const int kv_block_stride,
++                                const int kv_head_stride,
++                                const int kv_seq_stride,
++                                const std::string dtype,
++                                const std::string kv_dtype,
++                                const std::string kv_cache_dtype,
++                                const std::string out_dtype,
++                                const hipStream_t stream);
+ }
+diff --git a/csrc/cpp_itfs/pa/pa_ragged_nhd.cpp.jinja b/csrc/cpp_itfs/pa/pa_ragged_nhd.cpp.jinja
+new file mode 100644
+index 00000000000..db14e9b24b0
+--- /dev/null
++++ b/csrc/cpp_itfs/pa/pa_ragged_nhd.cpp.jinja
+@@ -0,0 +1,134 @@
++#include <hip/hip_runtime.h>
++#include <hip/hip_bf16.h>
++#include <cmath>
++#include <cassert>
++#include <iostream>
++#include <cstdio>
++#include <cstdlib>
++
++// pa-256.cpp currently uses macro-driven specialization.
++// Instantiate concrete NHD BF16 shape from compile-time args here.
++#define HQ {{gqa_ratio * num_kv_heads}}
++#define HK {{num_kv_heads}}
++#define S {{head_size}}
++#define BLOCK_SIZE {{block_size}}
++#define KV_PART_SIZE {{partition_size}}
++#define SCALE (1.0f / sqrtf((float)S))
++#define FAKE_Q 0
++#define FAKE_K_IDX 0
++#define OUTPUT_QK 0
++
++#include "pa_ragged_nhd_impl.cpp"
++
++extern "C" {
++void {{func_name}}(void* out_ptr,
++        void* exp_sums_ptr,
++        void* max_logits_ptr,
++        void* tmp_out_ptr,
++        void* query_ptr,
++        void* key_cache_ptr,
++        void* value_cache_ptr,
++        int* kv_indptr_ptr,
++        int* kv_page_indices_ptr,
++        int* kv_last_page_lens_ptr,
++        const float* alibi_slopes_ptr,
++        const float* q_scale_ptr,
++        const float* k_scale_ptr,
++        const float* v_scale_ptr,
++        const float* fp8_out_scale_ptr,
++        float scale,
++        float logits_soft_cap,
++        const int num_seqs,
++        const int num_kv_heads,
++        const int num_heads,
++        const int max_num_partitions,
++        const int q_stride,
++        const int kv_block_stride,
++        const int kv_head_stride,
++        const int kv_seq_stride,
++        void* stream);
++}
++
++void {{func_name}}(void* out_ptr,
++        void* exp_sums_ptr,
++        void* max_logits_ptr,
++        void* tmp_out_ptr,
++        void* query_ptr,
++        void* key_cache_ptr,
++        void* value_cache_ptr,
++        int* kv_indptr_ptr,
++        int* kv_page_indices_ptr,
++        int* kv_last_page_lens_ptr,
++        const float* alibi_slopes_ptr,
++        const float* q_scale_ptr,
++        const float* k_scale_ptr,
++        const float* v_scale_ptr,
++        const float* fp8_out_scale_ptr,
++        float scale,
++        float logits_soft_cap,
++        const int num_seqs,
++        const int num_kv_heads,
++        const int num_heads,
++        const int max_num_partitions,
++        const int q_stride,
++        const int kv_block_stride,
++        const int kv_head_stride,
++        const int kv_seq_stride,
++        void* stream)
++{
++    (void)kv_last_page_lens_ptr;
++    (void)alibi_slopes_ptr;
++    (void)q_scale_ptr;
++    (void)k_scale_ptr;
++    (void)v_scale_ptr;
++    (void)fp8_out_scale_ptr;
++    (void)logits_soft_cap;
++    (void)q_stride;
++    (void)kv_block_stride;
++    (void)kv_head_stride;
++    (void)kv_seq_stride;
++    (void)scale;
++
++    // pa-256 implementation constraints (current port):
++    // BF16 only, head_size=256, BLOCK_SIZE=1.
++    assert(num_kv_heads == HK);
++    assert(num_heads == HQ);
++    static_assert(S == 256, "pa_ragged_nhd(pa-256): only head_size=256 is supported");
++    static_assert(BLOCK_SIZE == 1, "pa_ragged_nhd(pa-256): only block_size=1 is supported");
++   // 不要动 这个是用来debug的~
++    printf("==========================================hit pa nhd========================= num_seqs=%d q_stride=%d kv_block_stride=%d kv_head_stride=%d kv_seq_stride=%d max_num_partitions=%d PARTITION_SIZE=%d\n",
++           num_seqs,
++           q_stride,
++           kv_block_stride,
++           kv_head_stride,
++           kv_seq_stride,
++           max_num_partitions,
++           KV_PART_SIZE);
++
++    float* exp_sums = reinterpret_cast<float*>(exp_sums_ptr);
++    float* max_logits = reinterpret_cast<float*>(max_logits_ptr);
++    __bf16* tmp_out = reinterpret_cast<__bf16*>(tmp_out_ptr);
++
++    hipStream_t hip_stream = reinterpret_cast<hipStream_t>(stream);
++    dim3 pa_grid(num_seqs, num_kv_heads, max_num_partitions);
++    dim3 pa_block(256);
++    pa<<<pa_grid, pa_block, 0, hip_stream>>>(reinterpret_cast<__bf16*>(query_ptr),
++                                             reinterpret_cast<__bf16*>(key_cache_ptr),
++                                             reinterpret_cast<__bf16*>(value_cache_ptr),
++                                             reinterpret_cast<unsigned int*>(kv_indptr_ptr),
++                                             reinterpret_cast<unsigned int*>(kv_page_indices_ptr),
++                                             tmp_out,
++                                             nullptr,
++                                             max_logits,
++                                             exp_sums);
++
++    dim3 reduce_grid(num_seqs, num_heads);
++    dim3 reduce_block(256);
++    pa_reduce<<<reduce_grid, reduce_block, 0, hip_stream>>>(
++        reinterpret_cast<unsigned int*>(kv_indptr_ptr),
++        tmp_out,
++        max_logits,
++        exp_sums,
++        reinterpret_cast<__bf16*>(out_ptr),
++        max_num_partitions);
++}
+diff --git a/csrc/cpp_itfs/pa/pa_ragged_nhd.py b/csrc/cpp_itfs/pa/pa_ragged_nhd.py
+new file mode 100644
+index 00000000000..1f009e76169
+--- /dev/null
++++ b/csrc/cpp_itfs/pa/pa_ragged_nhd.py
+@@ -0,0 +1,329 @@
++from jinja2 import Template
++from csrc.cpp_itfs.utils import compile_template_op, AITER_CORE_DIR, str_to_bool
++import ctypes
++import math
++
++MD_NAME = "pa_ragged_nhd"
++
++with open(f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa/pa_ragged_nhd.cpp.jinja", "r") as f:
++    src_template = Template(f.read())
++
++
++def compile(
++    gqa_ratio: int,
++    num_kv_heads: int,
++    head_size: int,
++    npar_loops: int,
++    dtype: str,
++    kv_dtype: str,
++    fp8_kv_dtype: str,
++    out_dtype: str,
++    block_size: int,
++    alibi_enabled: bool = False,
++    partition_size: int = 256,
++    mtp: int = 1,
++    logits_soft_cap_enabled: bool = False,
++    func_name: str = None,
++):
++    import os
++
++    version = os.getenv("QKV_VERSION", "GOLDEN")
++
++    if head_size != 256 or kv_dtype != "__hip_bfloat16" or gqa_ratio > 16:
++        raise ValueError(
++            "pa_ragged_nhd requires head_size=256, kv_dtype=__hip_bfloat16, and gqa_ratio <= 16"
++        )
++    return compile_template_op(
++        src_template,
++        MD_NAME,
++        [
++            f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa/pa_ragged_nhd_impl.cpp",
++        ],
++        gqa_ratio=gqa_ratio,
++        num_kv_heads=num_kv_heads,
++        head_size=head_size,
++        npar_loops=npar_loops,
++        dtype=dtype,
++        kv_dtype=kv_dtype,
++        fp8_kv_dtype=fp8_kv_dtype,
++        out_dtype=out_dtype,
++        block_size=block_size,
++        partition_size=partition_size,
++        mtp=mtp,
++        alibi_enabled=alibi_enabled,
++        logits_soft_cap_enabled=logits_soft_cap_enabled,
++        func_name=func_name,
++        # choice: [GOLDEN, EXPERIMENTAL]. Classify original kernel and experimental kernel
++        version=version,
++    )
++
++
++def paged_attention_ragged_nhd(
++    out,  # [num_seqs, num_heads, head_size]
++    exp_sums,  # float32, numel >= num_seqs*num_heads*max_num_partitions (layout: pool max_bs in SGLang)
++    max_logits,  # float32, same numel as exp_sums
++    tmp_out,  # bfloat16, numel >= num_seqs*num_heads*max_num_partitions*head_size
++    query,  # [num_seqs, num_heads, head_size]
++    key_cache,  # [num_blocks, num_heads, head_size/x, block_size, x]
++    value_cache,  # [num_blocks, num_heads, head_size, block_size]
++    scale,
++    kv_indptr,
++    kv_page_indices,  # 1D ragged: [kv_indptr[-1]) valid
++    kv_last_page_lens,  # [num_seqs]
++    block_size,
++    max_num_partitions,
++    alibi_slopes,
++    kv_cache_dtype,
++    kv_cache_layout,
++    logits_soft_cap,
++    k_scale,
++    v_scale,
++    fp8_out_scale=None,
++    partition_size=256,
++    mtp=1,
++    q_scale=None,
++):
++    import os
++    import torch
++    from csrc.cpp_itfs.torch_utils import torch_to_c_types
++
++    warpSize = torch.cuda.get_device_properties(out.device).warp_size
++    if query.dtype != torch.bfloat16 or out.dtype != torch.bfloat16:
++        raise ValueError("paged_attention_ragged_nhd(pa-256) only supports bf16")
++    if kv_cache_dtype != "auto":
++        raise ValueError(
++            "paged_attention_ragged_nhd(pa-256) only supports kv_cache_dtype='auto'"
++        )
++    if kv_cache_layout != "NHD":
++        raise ValueError(
++            "paged_attention_ragged_nhd(pa-256) only supports kv_cache_layout='NHD'"
++        )
++    if block_size != 1:
++        raise ValueError("paged_attention_ragged_nhd(pa-256) only supports block_size=1")
++    if query.size(2) != 256:
++        raise ValueError("paged_attention_ragged_nhd(pa-256) only supports head_size=256")
++    dtype = "__hip_bfloat16"
++    kv_dtype = "__hip_bfloat16"
++    out_dtype = "__hip_bfloat16"
++
++    num_kv_heads = key_cache.size(1) if kv_cache_layout == "HND" else key_cache.size(2)
++    num_seqs = query.size(0)
++    num_heads = query.size(1)
++    head_size = query.size(2)
++    q_stride = query.stride(0)
++    kv_block_stride = key_cache.stride(0)
++    kv_head_stride = (
++        key_cache.stride(1) if kv_cache_layout == "HND" else key_cache.stride(2)
++    )
++    kv_seq_stride = (
++        key_cache.stride(2) if kv_cache_layout == "HND" else key_cache.stride(1)
++    )
++    if num_kv_heads < 1 or num_heads < 1 or num_seqs < 0:
++        raise ValueError("invalid num_seqs/num_heads/num_kv_heads")
++    if num_heads % num_kv_heads != 0:
++        raise ValueError("num_heads must be divisible by num_kv_heads (GQA)")
++    gqa_ratio = num_heads // num_kv_heads
++    npar_loops = int(math.ceil(max_num_partitions / warpSize))
++    n_blocks = int(key_cache.size(0))
++    for t in (out, exp_sums, max_logits, tmp_out, query, key_cache, value_cache):
++        assert t.is_contiguous(), (
++            "paged_attention_ragged_nhd(pa-256) expects contiguous out/exp_sums/max_logits/tmp_out/query/key_cache/value_cache"
++        )
++    if exp_sums.dtype != torch.float32 or max_logits.dtype != torch.float32:
++        raise ValueError("paged_attention_ragged_nhd: exp_sums and max_logits must be float32")
++    if tmp_out.dtype != torch.bfloat16:
++        raise ValueError("paged_attention_ragged_nhd: tmp_out must be bfloat16")
++    _nhp_run = int(num_seqs) * int(num_heads) * int(max_num_partitions)
++    _nhp_el = int(exp_sums.numel())
++    if _nhp_el < _nhp_run or int(max_logits.numel()) < _nhp_run:
++        raise ValueError(
++            "paged_attention_ragged_nhd: exp_sums/max_logits numel must be >= "
++            f"num_seqs*num_heads*max_num_partitions ({_nhp_run}), got exp_sums={_nhp_el}"
++        )
++    if int(tmp_out.numel()) < _nhp_run * int(head_size):
++        raise ValueError(
++            "paged_attention_ragged_nhd: tmp_out numel must be >= "
++            f"num_seqs*num_heads*max_num_partitions*head_size"
++        )
++    if kv_cache_layout == "NHD":
++        assert key_cache.size(1) == block_size and key_cache.size(2) == num_kv_heads, (
++            "key_cache NHD shape [num_blocks, block_size, num_kv_heads, head_size]"
++        )
++        assert list(value_cache.shape[:3]) == [n_blocks, block_size, num_kv_heads], (
++            "value_cache must match key_cache for [num_blocks, block_size, num_kv_heads, ...]"
++        )
++        assert key_cache.size(3) == head_size, "key_cache last dim must equal head_size"
++        assert int(value_cache.size(3)) == int(head_size), "pa-256: value last dim must equal head_size (256)"
++    #if num_seqs > 0:
++        #_kv0 = int(kv_indptr[0].item())
++        # if _kv0 != 0:
++        #     print(
++        #         "[paged_attention_ragged_nhd] warning: expected kv_indptr[0]==0 (1D ragged base), "
++        #         f"got kv_indptr[0]={_kv0}; kernel uses ptr+kv_indptr[b] on kv_page_indices"
++        #     )
++    #     assert kv_indptr[0] == 0, "kv_indptr[0] must be 0" # 保留这个 先跳过 看看后面有没有别的雷
++    #     assert int(kv_indptr.size(0)) == num_seqs + 1, "kv_indptr must be [num_seqs+1] (CSRS)"
++    #     last_idx = int(kv_indptr[-1].item())
++    #     assert last_idx >= 0
++    #     if last_idx > 0:
++    #         assert kv_page_indices.is_contiguous()
++    #         assert int(kv_page_indices.numel()) >= last_idx, (
++    #             "kv_page_indices is too small for kv_indptr[-1] (1D ragged buffer)"
++    #         )
++    #     lens = kv_indptr[1:] - kv_indptr[:-1]
++    #     max_kv_len = int(lens.max().item()) if lens.numel() else 0
++    #     if max_kv_len > 0:
++    #         need_parts = (max_kv_len + int(partition_size) - 1) // int(partition_size)
++    #         assert need_parts <= int(
++    #             max_num_partitions
++    #         ), (
++    #             f"max_num_partitions too small: need ceil(max_kv_len/partition)={need_parts} "
++    #             f"<= max_num_partitions, max_kv_len={max_kv_len}, partition_size={partition_size}"
++    #         )
++    #     for b in range(num_seqs):
++    #         lo = int(kv_indptr[b].item())
++    #         hi = int(kv_indptr[b + 1].item())
++    #         assert 0 <= lo <= hi, "kv_indptr must be non-decreasing"
++    #         if hi > lo:
++    #             seg = kv_page_indices[lo:hi]
++    #             assert bool((seg >= 0).all().item()) and bool((seg < n_blocks).all().item()), (
++    #                 f"kv_page_ids must be in [0, num_blocks), num_blocks={n_blocks}, b={b}"
++    #             )
++    # _nhp = num_seqs * num_heads * int(max_num_partitions)
++    # _meta = 2 * _nhp * 4
++    # _tmp_base = (_meta + 1023) // 1024 * 1024
++    # _need = _tmp_base + _nhp * int(head_size) * 2
++    # assert int(workspace_buffer.numel()) >= int(_need), (
++    #     f"workspace_buffer too small: need at least {_need} uint8, got {int(workspace_buffer.numel())} "
++    #     "(see pa_ragged_nhd.cpp.jinja: exp_sums|max_logits, 1024-align tmp_out)"
++    # )
++    func = compile(
++        gqa_ratio,
++        num_kv_heads,
++        head_size,
++        npar_loops,
++        dtype,
++        kv_dtype,
++        kv_cache_dtype,
++        out_dtype,
++        block_size,
++        alibi_slopes is not None,
++        partition_size,
++        mtp,
++        bool(logits_soft_cap),
++    )
++
++    alibi_slopes_ptr = (
++        ctypes.cast(alibi_slopes.data_ptr(), ctypes.POINTER(ctypes.c_float))
++        if alibi_slopes is not None
++        else ctypes.POINTER(ctypes.c_int)()
++    )
++    kv_indptr_ptr = ctypes.cast(kv_indptr.data_ptr(), ctypes.POINTER(ctypes.c_int))
++    kv_page_indices_ptr = ctypes.cast(
++        kv_page_indices.data_ptr(), ctypes.POINTER(ctypes.c_int)
++    )
++    kv_last_page_lens_ptr = (
++        ctypes.cast(kv_last_page_lens.data_ptr(), ctypes.POINTER(ctypes.c_int))
++        if block_size > 1
++        else ctypes.POINTER(ctypes.c_int)()
++    )
++
++    k_scale_ptr = ctypes.cast(k_scale.data_ptr(), ctypes.POINTER(ctypes.c_float))
++    v_scale_ptr = ctypes.cast(v_scale.data_ptr(), ctypes.POINTER(ctypes.c_float))
++    fp8_out_scale_ptr = (
++        ctypes.cast(fp8_out_scale.data_ptr(), ctypes.POINTER(ctypes.c_float))
++        if fp8_out_scale
++        else ctypes.POINTER(ctypes.c_int)()
++    )
++
++    (
++        out_ptr,
++        exp_sums_ptr,
++        max_logits_ptr,
++        tmp_out_ptr,
++        query_ptr,
++        key_cache_ptr,
++        value_cache_ptr,
++        scale,
++        logits_soft_cap,
++        num_seqs,
++        num_kv_heads,
++        num_heads,
++        max_num_partitions,
++        q_stride,
++        kv_block_stride,
++        kv_head_stride,
++        kv_seq_stride,
++        stream,
++    ) = torch_to_c_types(
++        out,
++        exp_sums,
++        max_logits,
++        tmp_out,
++        query,
++        key_cache,
++        value_cache,
++        scale,
++        logits_soft_cap,
++        num_seqs,
++        num_kv_heads,
++        num_heads,
++        max_num_partitions,
++        q_stride,
++        kv_block_stride,
++        kv_head_stride,
++        kv_seq_stride,
++        torch.cuda.current_stream(),
++    )
++    q_scale_ptr = (
++        ctypes.cast(q_scale.data_ptr(), ctypes.POINTER(ctypes.c_float))
++        if q_scale is not None
++        else ctypes.POINTER(ctypes.c_float)()
++    )
++    func(
++        out_ptr,
++        exp_sums_ptr,
++        max_logits_ptr,
++        tmp_out_ptr,
++        query_ptr,
++        key_cache_ptr,
++        value_cache_ptr,
++        kv_indptr_ptr,
++        kv_page_indices_ptr,
++        kv_last_page_lens_ptr,
++        alibi_slopes_ptr,
++        q_scale_ptr,
++        k_scale_ptr,
++        v_scale_ptr,
++        fp8_out_scale_ptr,
++        scale,
++        logits_soft_cap,
++        num_seqs,
++        num_kv_heads,
++        num_heads,
++        max_num_partitions,
++        q_stride,
++        kv_block_stride,
++        kv_head_stride,
++        kv_seq_stride,
++        stream,
++    )
++
++
++if __name__ == "__main__":
++    import argparse
++
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--gqa_ratio", type=int, required=True)
++    parser.add_argument("--num_kv_heads", type=int, required=True)
++    parser.add_argument("--head_size", type=int, required=True)
++    parser.add_argument("--npar_loops", type=int, required=True)
++    parser.add_argument("--dtype", type=str, required=True)
++    parser.add_argument("--kv_dtype", type=str, required=True)
++    parser.add_argument("--fp8_kv_dtype", type=str, required=True)
++    parser.add_argument("--out_dtype", type=str, required=True)
++    parser.add_argument("--block_size", type=int, required=True)
++    parser.add_argument("--alibi_enabled", type=str_to_bool, required=True)
++    parser.add_argument("--func_name", type=str, default=None)
++    args = parser.parse_args()
++    compile(**vars(args))
+diff --git a/csrc/cpp_itfs/pa/pa_ragged_nhd_impl.cpp b/csrc/cpp_itfs/pa/pa_ragged_nhd_impl.cpp
+new file mode 100644
+index 00000000000..9a83e7b93fa
+--- /dev/null
++++ b/csrc/cpp_itfs/pa/pa_ragged_nhd_impl.cpp
+@@ -0,0 +1,668 @@
++#include <__clang_hip_runtime_wrapper.h>
++#include <bit>
++#include <cfloat>
++#include <cmath>
++#include <cstdint>
++#include <hip/amd_detail/amd_hip_runtime.h>
++#include <hip/hip_fp16.h> // for __fp16
++#include <hip/hip_bf16.h> // for bfloat16
++#include "hip/hip_runtime.h"
++#include <vector>
++#include <iostream>
++#include <cstdio>
++#include <cstdlib>
++
++// using float16x4 = __fp16 __attribute__ ((ext_vector_type(2)));
++// using float16x8 = __fp16 __attribute__ ((ext_vector_type(8)));
++// using float16x32 = __fp16 __attribute__ ((ext_vector_type(32)));
++using bfloat16x2 = __bf16  __attribute__ ((ext_vector_type(2)));
++using bfloat16x4 = __bf16  __attribute__ ((ext_vector_type(4)));
++using bfloat16x8 = __bf16  __attribute__ ((ext_vector_type(8)));
++using bfloat16x32 = __bf16 __attribute__ ((ext_vector_type(32)));
++using float32x16 = float  __attribute__ ((ext_vector_type(16)));
++using float32x4 = float  __attribute__ ((ext_vector_type(4)));
++using float32x2 = float  __attribute__ ((ext_vector_type(2)));
++using int32x4_t = int  __attribute__ ((ext_vector_type(4)));
++using int32x16_t = int  __attribute__ ((ext_vector_type(16)));
++using uint32x2_t = uint  __attribute__ ((ext_vector_type(2)));
++
++using as3_uint32_ptr = __attribute__((address_space(3))) uint32_t *;
++union BufferResource {
++    __device__ __inline__ constexpr BufferResource()
++        : config(0x00020000U) {}
++
++    __device__ __inline__ constexpr BufferResource(void* buffer_address, uint32_t buffer_size)
++        : address(buffer_address),
++          range(buffer_size),
++          config(0x00020000U) {}
++    
++    __device__ __inline__ constexpr void set_base(void* buffer_address) {
++        address = buffer_address;
++    }
++
++    int32x4_t descriptor;
++    struct{
++        void* address;      // 8B, out of which first 48b is address, and 16b is stride (unused)
++        uint32_t range;     // Byte range for the buffer resource
++        uint32_t config;    // Constant, DFMT=32b
++    };
++};
++
++using DWORDX4 = int32x4_t;
++
++#define NUM_THREADS 256
++
++template <typename Object, std::enable_if_t<std::is_trivially_copyable_v<Object>, int> = 0>
++__device__ inline auto amd_wave_read_first_lane(const Object& obj)
++{
++    constexpr size_t ObjectSize = sizeof(Object);
++    constexpr size_t SGPR_size  = 4;
++    constexpr size_t NumFull    = ObjectSize / SGPR_size;
++    constexpr size_t Tail       = ObjectSize % SGPR_size;
++
++    const unsigned char* src = reinterpret_cast<const unsigned char*>(&obj);
++    alignas(Object) unsigned char dst[ObjectSize];
++
++    #pragma unroll
++    for (size_t Ic = 0; Ic < NumFull; Ic++) {
++        size_t offset = Ic * SGPR_size;
++        uint32_t read_src;
++        __builtin_memcpy(&read_src, src + offset, SGPR_size);
++        read_src = __builtin_amdgcn_readfirstlane(read_src);
++        __builtin_memcpy(dst + offset, &read_src, SGPR_size);
++    }
++
++    if constexpr(Tail != 0)
++    {
++        constexpr size_t offset = NumFull * SGPR_size;
++        uint32_t tail_loc       = 0;
++        __builtin_memcpy(&tail_loc, src + offset, Tail);
++        tail_loc = __builtin_amdgcn_readfirstlane(tail_loc);
++        __builtin_memcpy(dst + offset, &tail_loc, Tail);
++    }
++    Object out;
++    __builtin_memcpy(&out, dst, ObjectSize);
++    return out;
++}
++
++__device__ DWORDX4 read_dwordx4(BufferResource& buffer, int soffset, int nstride) {
++    DWORDX4 data;
++    //volatile int dummy[40] = {0};
++    int lane_offset = threadIdx.x * sizeof(DWORDX4);
++    int soff = soffset;
++    auto r = amd_wave_read_first_lane(buffer.descriptor);
++    asm volatile("buffer_load_dwordx4 %[vdst], %[vaddr], %[srsrc], %[soffset] offen\n"
++        :[vdst]"=v"(data)
++        :[vaddr]"v"(lane_offset), [srsrc]"s"(r), [soffset]"s"(soff));
++    return data;
++}
++
++template<typename T>
++__device__ T buffer_load_dwordx4(BufferResource& buffer, int soffset, int voffset, bool is_asm=false) {
++    T v;
++    if (is_asm) {
++        auto r = amd_wave_read_first_lane(buffer.descriptor);
++        asm volatile("buffer_load_dwordx4 %[vdst], %[vaddr], %[srsrc], %[soffset] offen\n"
++            :[vdst]"=v"(v)
++            :[vaddr]"v"(voffset), [srsrc]"s"(r), [soffset]"s"(soffset));
++    } else {
++        v = *(T*)((char*)buffer.address + soffset + voffset);
++    }
++    return v;
++}
++
++__device__ float llvm_amdgcn_raw_buffer_load_fp32(int32x4_t srsrc,
++                                 int voffset,
++                                 int soffset,
++                                 int glc_slc) __asm("llvm.amdgcn.raw.buffer.load.f32");
++
++__device__ __inline__
++void llvm_amdgcn_raw_buffer_load_lds(int32x4_t rsrc,    //
++                                as3_uint32_ptr lds_ptr, // LDS base offset
++                                int32_t size,           // Data byte size: 1/2/4 (/12/16 for gfx950)
++                                int32_t voffset,        // voffset(VGPR, included in bounds checking and swizzling)
++                                int32_t soffset,        // soffset(SGPR/imm, excluded from bounds checking and swizzling)
++                                int32_t offset,         // imm offset(imm, included in bounds checking and swizzling)
++                                int32_t aux             // auxiliary/cachepolicy(imm):
++                            ) __asm("llvm.amdgcn.raw.buffer.load.lds");
++
++template<typename T>
++__device__ T buffer_load_dword(BufferResource& buffer, int soffset, int voffset, int coffset, bool is_asm=false) {
++    T v;
++    if (is_asm) {
++        int32x4_t r = __builtin_bit_cast(int32x4_t, buffer);
++        r.x         = __builtin_amdgcn_readfirstlane(r.x);
++        r.y         = __builtin_amdgcn_readfirstlane(r.y);
++        r.z         = __builtin_amdgcn_readfirstlane(r.z);
++        r.w         = __builtin_amdgcn_readfirstlane(r.w);
++
++        //auto r = amd_wave_read_first_lane(buffer.descriptor);
++        asm volatile("buffer_load_dword %[vdst], %[vaddr], %[srsrc], 0 offen offset:%[coffset]\n"
++            :[vdst]"=v"(v)
++            :[vaddr]"v"(voffset), [srsrc]"s"(r), [coffset]"n"(coffset)
++            : "memory");
++    } else {
++        int32x4_t r = __builtin_bit_cast(int32x4_t, buffer);
++        auto d = llvm_amdgcn_raw_buffer_load_fp32(r, voffset + coffset, soffset, 0);
++        v = __builtin_bit_cast(T, d);
++        //v = *(T*)((char*)buffer.address + soffset + voffset + coffset);
++    }
++    return v;
++}
++
++template<typename T>
++__device__ T global_load_dwordx4(void* addr, uint64_t voffset, bool is_asm=false) {
++    T v;
++    if (is_asm) {
++        asm volatile("global_load_dwordx4 %[vdst], %[vaddr], off\n"
++                :[vdst]"=v"(v)
++                :[vaddr]"v"((char*)addr + voffset));
++    } else {
++        v = *(T*)((char*)addr + voffset);
++    }
++    return v;
++}
++
++__device__ void amdgcn_mfma_f32_16x16x16bf16(bfloat16x4 a, bfloat16x4 b, float32x4& c) {
++    c = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, c, 0, 0, 0);
++    // asm volatile("v_mfma_f32_16x16x16_bf16 %0, %1, %2, %3\n"
++    //             : "+v"(c)
++    //             : "v"(a), "v"(b), "v"(c)
++    //             :);
++}
++
++template<uint16_t cnt>
++__device__ void s_waitcnt_vmcnt() {
++    asm volatile ("s_waitcnt vmcnt(%0)\n"::"i"(cnt));
++}
++template<uint16_t cnt>
++__device__ void s_waitcnt_lgkmcnt() {
++    asm volatile ("s_waitcnt lgkmcnt(%0)\n"::"i"(cnt));
++}
++
++#ifndef HQ
++#define HQ 32 
++#define HK 4
++// #define HQ 12
++// #define HK 2
++#define S 256
++#define BLOCK_SIZE 1
++#define SCALE 1.0 
++#define KV_PART_SIZE 256
++#endif
++#define KV_MIN_PART_SIZE 256
++
++// This file is tuned for S=256 K/V tiling and write-back; do not mix S=128 when matching PyTorch reference.
++static_assert(S == 256, "pa.cpp: K/V LDS and fused write-back are only implemented for S=256");
++
++template<typename TS, typename TD>
++TD& cast(TS& t) {
++    return (TD&)t;
++}
++
++
++template<typename F, size_t... Is>
++constexpr void compile_time_loop_impl(F&& f, std::index_sequence<Is...>) {
++    (f(std::integral_constant<size_t, Is>{}), ...);
++}
++
++template<size_t N, typename F>
++constexpr void compile_time_loop(F&& f) {
++    compile_time_loop_impl(std::forward<F>(f), 
++                          std::make_index_sequence<N>{});
++}
++
++#define KV_PART_SIZE_WARP (KV_MIN_PART_SIZE / 4)
++
++struct share_buf_t {
++    __bf16* buf;
++    __device__ share_buf_t(__bf16* buf) : buf(buf) {}
++      // for output reduce: 4 warpx16xS
++    __device__ __bf16* get_out_buf(uint warp_id) {
++        return buf + 16 * S * warp_id;
++    }
++    // for key cache: 4 warpx16xS
++    __device__ __bf16* get_key_buf(uint warp_id) {
++        return buf + 16 * S * warp_id;
++    }
++    // for value cache: 4 warpx16xS
++    __device__ __bf16* get_value_buf(uint warp_id) {
++        return buf + 16 * S * warp_id;
++    }
++    // 4warp * (16m + 1)
++    __device__ float* get_max_buf(uint m, uint warp_id) {
++        return (float*)buf + m + warp_id * 16;
++    }
++    __device__ float* get_sum_buf(uint m, uint warp_id) {
++        return (float*)buf + m + warp_id * 16 + 64;
++    }
++    __device__ uint* get_idx_buf(uint warp_id) {
++        return (uint*)get_key_buf(warp_id);
++    }
++};
++
++__global__ void __launch_bounds__(NUM_THREADS, 2) pa(
++            __bf16* query,          // [B, HQ, S]
++            __bf16* key_cache,      // [BLOCK, BLOCK_SIZE, HK, S]
++            __bf16* value_cache,
++            uint* kv_indptr,        // [B + 1]
++            uint* kv_page_indices,  // [B * KV_LEN + 1]
++            __bf16* out_seg,        // [B, HQ, PART, S]
++            float* qk_ptr,          // [B, HK, HQ // HK, PART * KV_PART_SIZE]
++            float* max_out,         // [B, HQ, PART, 1]
++            float* sum_out) {       // [B, HQ, PART, 1]
++    // wg: B, HK, kv_part
++    uint b = blockIdx.x;
++    uint hk = blockIdx.y;
++    uint hq = hk * (HQ / HK);
++    uint kv_part = blockIdx.z;
++    uint lane_id = threadIdx.x % 64;
++    uint warp_id = threadIdx.x / 64;
++    const uint q_b_stride = HQ * S;
++    const uint q_h_stride = S;
++    query += b * q_b_stride + hq * q_h_stride;
++    key_cache += hk * S;
++    value_cache += hk * S;
++    if(!kv_indptr ||!query || !key_cache || !value_cache || !(kv_indptr + b + 1)) return; // add protection
++    if((int)kv_indptr[b + 1]<0 || (int)kv_indptr[b]<0) return; // add protection
++    uint last_kv_idx = kv_indptr[b + 1];
++    uint kv_len = last_kv_idx - kv_indptr[b];
++    if (kv_part * KV_PART_SIZE >= kv_len) return;
++    uint kv_len_start = std::min(kv_part * KV_PART_SIZE + warp_id * KV_PART_SIZE_WARP, kv_len);
++    uint kv_len_end = std::min(kv_part * KV_PART_SIZE + KV_PART_SIZE, kv_len);
++    kv_page_indices += kv_indptr[b];
++    if(!kv_page_indices) return; // add protection
++    out_seg += b * HQ * gridDim.z * S + hq * gridDim.z * S + kv_part * S;
++    max_out += b * HQ * gridDim.z * 1 + hq * gridDim.z * 1 + kv_part * 1;
++    sum_out += b * HQ * gridDim.z * 1 + hq * gridDim.z * 1 + kv_part * 1;
++    if(!out_seg || !max_out || !sum_out) return;// add protection
++
++    // stage1(q*k): [16, 32]x[64, 32]'
++    BufferResource q_buf(query, (HQ / HK) * S * sizeof(__bf16));
++    static_assert(HQ / HK <= 16, "use mfma16 requires M <= 16");
++    bfloat16x8 q_cur[S / 32];
++    // key load layout: 4rows x 16 cols
++    uint key_load_col_id = lane_id % 16; // 0 ~ 15
++    uint key_load_row_id = lane_id / 16; // 0 ~ 3
++    // mfma16x16 layout: 16rows x 4cols
++    uint fma_col_id = lane_id / 16;      // 0 ~ 3
++    uint fma_row_id = lane_id % 16;      // 0 ~ 15
++    float prev_max = - FLT_MAX;
++    float prev_sum = 0;
++
++    // query -> reg
++    if (fma_row_id < HQ / HK) {
++        #pragma unroll
++        for (uint k = 0; k < S; k += 32) {
++#if FAKE_Q
++            q_cur[k / 32] = __bf16(1.0f);
++#else
++            q_cur[k / 32] = buffer_load_dwordx4<bfloat16x8>(q_buf, k * sizeof(__bf16), (fma_row_id * q_h_stride + fma_col_id * 8) * sizeof(__bf16), false);
++#endif
++        }
++    }
++    //s_waitcnt_vmcnt<0>();
++    __shared__ __bf16 buff_lds[16 * S * 4];
++    share_buf_t share_buf(buff_lds);
++    float32x4 vout[S / 64 * 4] = {0};
++    auto cur_max = prev_max;
++    float cur_sum;
++
++    BufferResource idx_buf(kv_page_indices, kv_len * sizeof(uint));
++    uint k_idxs[KV_PART_SIZE_WARP / 4];
++    auto cur_kv_len_start = kv_len_start + 0 * KV_MIN_PART_SIZE;
++
++    uint* idx_lds = share_buf.get_idx_buf(warp_id);
++    uint idx_global = lane_id + cur_kv_len_start;
++    idx_lds[lane_id] = (idx_global < kv_len_end) ? kv_page_indices[idx_global] : 0;
++    // Keep commented: original raw buffer load to LDS path.
++    // On ROCm 7.2 this path appears ineffective (e.g. hipcc -O2 -c -std=c++20 --offload-arch=gfx942 -S -emit-llvm pa.cpp -o k72.ll):
++    // LLVM IR does not emit @llvm.amdgcn.raw.buffer.load.lds.
++    //llvm_amdgcn_raw_buffer_load_lds(idx_buf.descriptor, (as3_uint32_ptr)idx_lds, 4, (lane_id + cur_kv_len_start) * sizeof(uint), 0, 0, 0);
++    __builtin_amdgcn_sched_barrier(0);
++
++    #pragma unroll
++    for (uint part_idx = 0; part_idx < KV_PART_SIZE / KV_MIN_PART_SIZE; part_idx++) {
++        if (part_idx == 0)
++        if (BLOCK_SIZE == 1) {
++            for (uint n = 0; n < KV_PART_SIZE_WARP / 4; n++) {
++    // #if FAKE_K_IDX // unused debug path
++    //             uint global_row_id = n * 4 + key_load_row_id + cur_kv_len_start;
++    //             global_row_id = global_row_id < kv_len_end ? global_row_id : 0;
++    //             k_idxs[n] = global_row_id + 1 + kv_indptr[b];
++    // #else
++                //k_idxs[n] = buffer_load_dword<uint>(idx_buf, 0, (key_load_row_id + cur_kv_len_start) * sizeof(uint), n * 4 * sizeof(uint));
++            k_idxs[n] = idx_lds[n * 4 + key_load_row_id];
++    // #endif
++            }
++        }
++        // key -> reg
++        float32x4 acc[KV_PART_SIZE_WARP / 16] = {0};
++
++        bfloat16x8 k_reg_caches[KV_PART_SIZE_WARP / 4], k_reg_hi[KV_PART_SIZE_WARP / 4];
++        bfloat16x8 v_reg_caches[KV_PART_SIZE_WARP / 4], v_reg_hi[KV_PART_SIZE_WARP / 4];
++
++        if (part_idx == 0) {
++            for (uint n = 0; n < KV_PART_SIZE_WARP / 4; n++) {
++                auto offset = k_idxs[n] * (HK * S * sizeof(__bf16)) + 8 * sizeof(__bf16) * key_load_col_id;
++                k_reg_caches[n] = global_load_dwordx4<bfloat16x8>(key_cache, offset);
++                k_reg_hi[n] = global_load_dwordx4<bfloat16x8>(key_cache, offset + 128 * sizeof(__bf16));
++            }
++        }
++        for (uint n = 0; n < KV_PART_SIZE_WARP / 4; n++) {
++            auto offset = k_idxs[n] * (HK * S * sizeof(__bf16)) + 8 * sizeof(__bf16) * key_load_col_id;
++            v_reg_caches[n] = global_load_dwordx4<bfloat16x8>(value_cache, offset, false);
++            v_reg_hi[n] = global_load_dwordx4<bfloat16x8>(value_cache, offset + 128 * sizeof(__bf16), false);
++        }
++        __bf16* cur_k_buff_lds = share_buf.get_key_buf(warp_id);
++        //4 times
++        for (uint n = 0; n < KV_PART_SIZE_WARP / 16; n++) {
++            // swizzle: row ^ col
++            *(bfloat16x8*)(&cur_k_buff_lds[(key_load_row_id + 0 * 4) * S + (key_load_col_id ^ (key_load_row_id + 0)) * 8]) = k_reg_caches[4 * n + 0];
++            *(bfloat16x8*)(&cur_k_buff_lds[(key_load_row_id + 1 * 4) * S + (key_load_col_id ^ (key_load_row_id + 4)) * 8]) = k_reg_caches[4 * n + 1];
++            *(bfloat16x8*)(&cur_k_buff_lds[(key_load_row_id + 2 * 4) * S + (key_load_col_id ^ (key_load_row_id + 8)) * 8]) = k_reg_caches[4 * n + 2];
++            *(bfloat16x8*)(&cur_k_buff_lds[(key_load_row_id + 3 * 4) * S + (key_load_col_id ^ (key_load_row_id + 12))* 8]) = k_reg_caches[4 * n + 3];
++            *(bfloat16x8*)(&cur_k_buff_lds[(key_load_row_id + 0 * 4) * S + 128 + (key_load_col_id ^ (key_load_row_id + 0)) * 8]) = k_reg_hi[4 * n + 0];
++            *(bfloat16x8*)(&cur_k_buff_lds[(key_load_row_id + 1 * 4) * S + 128 + (key_load_col_id ^ (key_load_row_id + 4)) * 8]) = k_reg_hi[4 * n + 1];
++            *(bfloat16x8*)(&cur_k_buff_lds[(key_load_row_id + 2 * 4) * S + 128 + (key_load_col_id ^ (key_load_row_id + 8)) * 8]) = k_reg_hi[4 * n + 2];
++            *(bfloat16x8*)(&cur_k_buff_lds[(key_load_row_id + 3 * 4) * S + 128 + (key_load_col_id ^ (key_load_row_id + 12))* 8]) = k_reg_hi[4 * n + 3];
++
++            for (int k = 0; k < S / 32; k++) {
++                const uint half = (k < S / 64) ? 0u : 128u;
++                const uint kk = k & (S / 64 - 1);
++                auto k_cur = *(bfloat16x8*)(&cur_k_buff_lds[fma_row_id * S + half + (fma_row_id ^ (fma_col_id + 4 * kk)) * 8]);
++                amdgcn_mfma_f32_16x16x16bf16(k_cur.lo, q_cur[k].lo, acc[n]);
++                amdgcn_mfma_f32_16x16x16bf16(k_cur.hi, q_cur[k].hi, acc[n]);
++            }
++            acc[n] *= SCALE;
++        }
++    #if OUTPUT_QK
++        // for debug
++        if (qk_ptr) {
++            // [B, HK, HQ / HK, stride]
++            auto stride = (kv_len + KV_PART_SIZE - 1) / KV_PART_SIZE * KV_PART_SIZE;
++            if (fma_row_id < HQ / HK) {
++                for (int n = 0; n < KV_PART_SIZE_WARP / 16; n++) {
++                    auto cur_tmp_ptr = qk_ptr + b * HK * HQ / HK * stride + (hk * (HQ / HK) + fma_row_id) * stride + cur_kv_len_start + n * 16 + fma_col_id * 4;
++                    for (int i = 0; i < 4; i++)
++                        cur_tmp_ptr[i] = acc[n][i];
++                }
++            }
++        }
++    #endif
++
++        auto cur_kv_len_start_copy = cur_kv_len_start;
++        // --------------------------
++        cur_kv_len_start += KV_MIN_PART_SIZE;
++        if (part_idx != KV_PART_SIZE / KV_MIN_PART_SIZE - 1)
++        if (BLOCK_SIZE == 1) {
++            // llvm_amdgcn_raw_buffer_load_lds(idx_buf.descriptor, (as3_uint32_ptr)idx_lds, 4, (lane_id + kv_len_start) * sizeof(uint), (part_idx + 1) * KV_MIN_PART_SIZE * sizeof(uint), 0, 0);
++            for (uint n = 0; n < KV_PART_SIZE_WARP / 4; n++) {
++    #if FAKE_K_IDX
++                uint global_row_id = n * 4 + key_load_row_id + cur_kv_len_start;
++                global_row_id = global_row_id < kv_len_end ? global_row_id : 0;
++                k_idxs[n] = global_row_id + 1;
++    #else
++                k_idxs[n] = buffer_load_dword<uint>(idx_buf, 0, (key_load_row_id + cur_kv_len_start) * sizeof(uint), n * 4 * sizeof(uint));
++                // k_idxs[n] = idx_lds[n * 4 + key_load_row_id];
++    #endif
++            }
++        }
++        // -----------------------------
++        // sum(exp(acc-max))
++        for (uint n = 0; n < 4; n++) {
++            for (uint i = 0; i < 4; i++) {
++                auto tmp = n * 16 + fma_col_id * 4 + i + cur_kv_len_start_copy < kv_len_end ? acc[n][i] : -FLT_MAX;
++                cur_max = fmaxf(cur_max, tmp);
++            }
++        }
++        for(int mask = 64 / 2; mask >= 16; mask /= 2) {
++            cur_max = fmaxf(cur_max, __shfl_xor(cur_max, mask));
++        }
++        cur_sum = 0;
++        for (uint n = 0; n < 4; n++) {
++            for (uint i = 0; i < 4; i++) {
++                acc[n][i] = n * 16 + fma_col_id * 4 + i + cur_kv_len_start_copy < kv_len_end ? __expf(acc[n][i] - cur_max) : 0;
++                cur_sum += acc[n][i];
++            }
++        }
++        for(int mask = 64 / 2; mask >= 16; mask /= 2) {
++            cur_sum += __shfl_xor(cur_sum, mask);
++        }
++        // ----------------------------------
++        if (part_idx != KV_PART_SIZE / KV_MIN_PART_SIZE - 1) {
++            for (uint n = 0; n < KV_PART_SIZE_WARP / 4; n++) {
++                auto offset = k_idxs[n] * (HK * S * sizeof(__bf16)) + 8 * sizeof(__bf16) * key_load_col_id;
++                k_reg_caches[n] = global_load_dwordx4<bfloat16x8>(key_cache, offset);
++                k_reg_hi[n] = global_load_dwordx4<bfloat16x8>(key_cache, offset + 128 * sizeof(__bf16));
++            }
++        }
++        // ----------------------------------
++        auto fixed_sum = prev_sum * __expf(prev_max - cur_max);
++        cur_sum += fixed_sum;
++        const float inv_sum_scale = 1.f / (cur_sum + 1e-6f);
++        bfloat16x4 acc_low[KV_PART_SIZE_WARP / 16];
++        for (uint n = 0; n < 4; n++) {
++            for (uint i = 0; i < 4; i++) {
++                auto tmp = acc[n][i] * inv_sum_scale;
++                acc_low[n][i] = std::bit_cast<__bf16>((ushort)(std::bit_cast<uint>(tmp) >> 16));
++            }
++        }
++        // compensation prev vout
++        if (part_idx != 0) {
++            for (int k = 0; k < S / 64 * 4; k++) {
++                vout[k] = fixed_sum * inv_sum_scale * vout[k];
++            }
++        }
++        //s_waitcnt_vmcnt<0>();
++        __bf16* cur_v_buff_lds = share_buf.get_value_buf(warp_id);
++        //__bf16* cur_v_buff_lds = kv_buff_lds + warp_id * 16 * S;
++        for (uint n = 0; n < KV_PART_SIZE_WARP / 16; n++) {
++            *(bfloat16x8*)(&cur_v_buff_lds[(key_load_row_id + 0 * 4) * S + key_load_col_id * 8]) = v_reg_caches[4 * n + 0];
++            *(bfloat16x8*)(&cur_v_buff_lds[(key_load_row_id + 1 * 4) * S + key_load_col_id * 8]) = v_reg_caches[4 * n + 1];
++            *(bfloat16x8*)(&cur_v_buff_lds[(key_load_row_id + 2 * 4) * S + key_load_col_id * 8]) = v_reg_caches[4 * n + 2];
++            *(bfloat16x8*)(&cur_v_buff_lds[(key_load_row_id + 3 * 4) * S + key_load_col_id * 8]) = v_reg_caches[4 * n + 3];
++            *(bfloat16x8*)(&cur_v_buff_lds[(key_load_row_id + 0 * 4) * S + 128 + key_load_col_id * 8]) = v_reg_hi[4 * n + 0];
++            *(bfloat16x8*)(&cur_v_buff_lds[(key_load_row_id + 1 * 4) * S + 128 + key_load_col_id * 8]) = v_reg_hi[4 * n + 1];
++            *(bfloat16x8*)(&cur_v_buff_lds[(key_load_row_id + 2 * 4) * S + 128 + key_load_col_id * 8]) = v_reg_hi[4 * n + 2];
++            *(bfloat16x8*)(&cur_v_buff_lds[(key_load_row_id + 3 * 4) * S + 128 + key_load_col_id * 8]) = v_reg_hi[4 * n + 3];
++
++            // layout: [4tx4, 16tx4k]-> 16 tokens, 64 of head size used for one iter
++            // K/N 0 1 2 3   4 5 6 7   8 9 10 11  12 13 14 15 ...  56 57 58 59  60 61 62 63 
++            //   0 thread0   thread1   thread2    thread3          thread14     thread15
++            //   1
++            //   2
++            //   3
++            //   4 thread16  thread17  thread18   thread19         thread30     thread31
++            //   5
++            //   6
++            //   7
++            //   ...
++            //  12 thread48  thread49  thread50   thread51         thread62     thread63
++            //  13
++            //  14
++            //  15
++            bfloat16x4 v_curs[4], v_curs_tr[4];
++            auto transpose4x4 = [] (bfloat16x4 in[4], bfloat16x4 out[4]) {
++                #pragma unroll
++                for (int i = 0; i < 4; i++) {
++                    #pragma unroll
++                    for (int j = 0; j < 4; j++)
++                        out[i][j] = in[j][i];
++                }
++            };
++            for (int k = 0; k < S / 64; k++) {
++                v_curs[0] = *(bfloat16x4*)(&cur_v_buff_lds[(key_load_row_id * 4 + 0) * S + k * 64 + key_load_col_id * 4]);
++                v_curs[1] = *(bfloat16x4*)(&cur_v_buff_lds[(key_load_row_id * 4 + 1) * S + k * 64 + key_load_col_id * 4]);
++                v_curs[2] = *(bfloat16x4*)(&cur_v_buff_lds[(key_load_row_id * 4 + 2) * S + k * 64 + key_load_col_id * 4]);
++                v_curs[3] = *(bfloat16x4*)(&cur_v_buff_lds[(key_load_row_id * 4 + 3) * S + k * 64 + key_load_col_id * 4]);
++                transpose4x4(v_curs, v_curs_tr);
++                amdgcn_mfma_f32_16x16x16bf16(v_curs_tr[0], acc_low[n], vout[k * 4 + 0]);
++                amdgcn_mfma_f32_16x16x16bf16(v_curs_tr[1], acc_low[n], vout[k * 4 + 1]);
++                amdgcn_mfma_f32_16x16x16bf16(v_curs_tr[2], acc_low[n], vout[k * 4 + 2]);
++                amdgcn_mfma_f32_16x16x16bf16(v_curs_tr[3], acc_low[n], vout[k * 4 + 3]);
++            }
++        }
++        prev_max = cur_max;
++        prev_sum = cur_sum;
++    }
++    __syncthreads();
++    // cross max/sum
++    if (fma_col_id == 0) {
++        *share_buf.get_max_buf(fma_row_id, warp_id) = cur_max;
++        *share_buf.get_sum_buf(fma_row_id, warp_id) = cur_sum;
++    }
++    __syncthreads();
++    // Begin write-back
++    // each wave processes up to ceil(HQ/HK, 4) query tokens (TOKENS_PER_WARP); must match the write-back loop below
++    constexpr uint M = HQ / HK; // gqa ratio
++    constexpr uint TOKENS_PER_WARP = (M + 3) / 4; // ceil_div(M, 4): query tokens per warp
++
++    float maxs[4 * TOKENS_PER_WARP], sums[4 * TOKENS_PER_WARP];
++    float real_max[TOKENS_PER_WARP], real_sum[TOKENS_PER_WARP];
++
++    for (uint i = 0; i < TOKENS_PER_WARP; i++) {
++        uint m_token_id = TOKENS_PER_WARP * warp_id + i;
++        if (m_token_id < M) {
++            maxs[4 * i + 0] = *share_buf.get_max_buf(m_token_id, 0);
++            maxs[4 * i + 1] = *share_buf.get_max_buf(m_token_id, 1);
++            maxs[4 * i + 2] = *share_buf.get_max_buf(m_token_id, 2);
++            maxs[4 * i + 3] = *share_buf.get_max_buf(m_token_id, 3);
++            real_max[i] = fmaxf(
++                fmaxf(maxs[4 * i + 0], maxs[4 * i + 1]),
++                fmaxf(maxs[4 * i + 2], maxs[4 * i + 3]));
++
++            sums[4 * i + 0] = *share_buf.get_sum_buf(m_token_id, 0);
++            sums[4 * i + 1] = *share_buf.get_sum_buf(m_token_id, 1);
++            sums[4 * i + 2] = *share_buf.get_sum_buf(m_token_id, 2);
++            sums[4 * i + 3] = *share_buf.get_sum_buf(m_token_id, 3);
++            real_sum[i] = sums[4 * i + 0] * __expf(maxs[4 * i + 0] - real_max[i]) + 
++                          sums[4 * i + 1] * __expf(maxs[4 * i + 1] - real_max[i]) + 
++                          sums[4 * i + 2] * __expf(maxs[4 * i + 2] - real_max[i]) + 
++                          sums[4 * i + 3] * __expf(maxs[4 * i + 3] - real_max[i]);
++        }
++    }
++
++    bfloat16x4 vout_low[S / 64 * 4];
++    for (uint k = 0; k < S / 64 ; k++) {
++        for (uint i = 0; i < 4; i++)
++            for (uint j = 0; j < 4; j++)
++                vout_low[k * 4 + j][i] = std::bit_cast<__bf16>((ushort)(std::bit_cast<uint>(vout[k * 4 + i][j]) >> 16));
++    }
++    __syncthreads();
++
++    auto shared_out = share_buf.get_out_buf(warp_id) + fma_row_id * S;
++    for (int k = 0; k < S / 64; k++) {
++        // swizzle: row ^ col
++        ((bfloat16x4*)(shared_out + k * 64))[(fma_col_id * 4 + 0) ^ fma_row_id] = vout_low[k * 4 + 0];
++        ((bfloat16x4*)(shared_out + k * 64))[(fma_col_id * 4 + 1) ^ fma_row_id] = vout_low[k * 4 + 1];
++        ((bfloat16x4*)(shared_out + k * 64))[(fma_col_id * 4 + 2) ^ fma_row_id] = vout_low[k * 4 + 2];
++        ((bfloat16x4*)(shared_out + k * 64))[(fma_col_id * 4 + 3) ^ fma_row_id] = vout_low[k * 4 + 3];
++    }
++    __syncthreads();
++    for (uint i = 0; i < TOKENS_PER_WARP; i++) {
++        uint m_token_id = TOKENS_PER_WARP * warp_id + i;
++        if (m_token_id < M) {
++            const uint idx2 = (m_token_id ^ (lane_id / 2)) * 2 + (lane_id & 1);
++            float32x2 out_lo = {};
++            float32x2 out_hi = {};
++            for (int w = 0; w < 4; w++) {
++                bfloat16x2 t_lo = ((bfloat16x2*)(share_buf.get_out_buf(w) + m_token_id * S))[idx2];
++                bfloat16x2 t_hi = ((bfloat16x2*)(share_buf.get_out_buf(w) + m_token_id * S + 128))[idx2];
++                const float sw = sums[4 * i + w] * __expf(maxs[4 * i + w] - real_max[i]);
++                out_lo[0] += (float)t_lo[0] * sw;
++                out_lo[1] += (float)t_lo[1] * sw;
++                out_hi[0] += (float)t_hi[0] * sw;
++                out_hi[1] += (float)t_hi[1] * sw;
++            }
++            const float inv_sum_scale = 1.f / (real_sum[i] + 1e-6f);
++            out_lo[0] *= inv_sum_scale;
++            out_lo[1] *= inv_sum_scale;
++            out_hi[0] *= inv_sum_scale;
++            out_hi[1] *= inv_sum_scale;
++            bfloat16x2 tmp_lo;
++            tmp_lo[0] = std::bit_cast<__bf16>((ushort)(std::bit_cast<uint>(out_lo[0]) >> 16));
++            tmp_lo[1] = std::bit_cast<__bf16>((ushort)(std::bit_cast<uint>(out_lo[1]) >> 16));
++            bfloat16x2 tmp_hi;
++            tmp_hi[0] = std::bit_cast<__bf16>((ushort)(std::bit_cast<uint>(out_hi[0]) >> 16));
++            tmp_hi[1] = std::bit_cast<__bf16>((ushort)(std::bit_cast<uint>(out_hi[1]) >> 16));
++            __bf16* row_base = out_seg + m_token_id * gridDim.z * S;
++            ((bfloat16x2*)row_base)[lane_id] = tmp_lo;
++            ((bfloat16x2*)(row_base + 128))[lane_id] = tmp_hi;
++            max_out[m_token_id * gridDim.z] = real_max[i];
++            sum_out[m_token_id * gridDim.z] = real_sum[i];
++        }
++    }
++}
++
++__global__ void __launch_bounds__(NUM_THREADS, 2) pa_reduce(
++            uint* kv_indptr,        // [B + 1]
++            __bf16* out_seg,        // [B, HQ, PART, S]
++            float* max_out,         // [B, HQ, PART, 1]
++            float* sum_out,         // [B, HQ, PART, 1]
++            __bf16* out,            // [B, HQ, S]
++            uint max_part
++            ) {
++    // wg: B, HQ
++    uint b = blockIdx.x;
++    uint hq = blockIdx.y;
++    uint lane_id = threadIdx.x % 64;
++    uint warp_id = threadIdx.x / 64;
++    out += b * HQ * S + hq * S;
++    out_seg += b * HQ * max_part * S + hq * max_part * S;
++    max_out += b * HQ * max_part * 1 + hq * max_part * 1;
++    sum_out += b * HQ * max_part * 1 + hq * max_part * 1;
++    if(!kv_indptr ||!out_seg || !max_out || !sum_out || !(kv_indptr + b + 1) || !out) return;// add protection
++    if((int)kv_indptr[b + 1]<0 || (int)kv_indptr[b]<0) return; // add protection
++    uint kv_len = kv_indptr[b + 1] - kv_indptr[b];
++    uint part_num = (kv_len + KV_PART_SIZE - 1) / KV_PART_SIZE;
++    float real_max = -FLT_MAX;
++    for (uint i = lane_id; i < part_num; i += 64) {
++        real_max = fmaxf(real_max, max_out[i]);
++    }
++    for (uint mask = 64 / 2; mask >= 1; mask /= 2) {
++        real_max = fmaxf(real_max, __shfl_xor(real_max, mask));
++    }
++
++    float32x4 cur = {};
++    float warp_sum = 0;
++    for (uint i = warp_id; i < part_num; i += 4) {
++        auto cur_max = max_out[i];
++        auto cur_out_seg = out_seg + i * S;
++        auto v = ((bfloat16x4*)cur_out_seg)[lane_id];
++        float32x4 tmp;
++        tmp[0] = (float)v[0];
++        tmp[1] = (float)v[1];
++        tmp[2] = (float)v[2];
++        tmp[3] = (float)v[3];
++        const float w = sum_out[i] * __expf(cur_max - real_max);
++        cur[0] += tmp[0] * w;
++        cur[1] += tmp[1] * w;
++        cur[2] += tmp[2] * w;
++        cur[3] += tmp[3] * w;
++        warp_sum += sum_out[i] * __expf(cur_max - real_max);
++    }
++
++    __shared__ float out_lds[4 * S];
++    __shared__ float sum_lds[4];
++    if (lane_id == 0) {
++        sum_lds[warp_id] = warp_sum;
++    }
++    if (warp_id != 0) {
++        *(float32x4*)(&out_lds[warp_id * S + lane_id * 4 + 0]) = cur;
++    }
++    __syncthreads();
++    if (warp_id == 0) {
++        warp_sum += sum_lds[1] + sum_lds[2] + sum_lds[3];
++        for (int wi = 1; wi < 4; wi++) {
++            cur += *(float32x4*)(&out_lds[wi * S + lane_id * 4 + 0]);
++        }
++        const float inv_sum_scale = 1.f / (warp_sum + 1e-6f);
++        bfloat16x4 o;
++        o[0] = std::bit_cast<__bf16>((ushort)(std::bit_cast<uint>(cur[0] * inv_sum_scale) >> 16));
++        o[1] = std::bit_cast<__bf16>((ushort)(std::bit_cast<uint>(cur[1] * inv_sum_scale) >> 16));
++        o[2] = std::bit_cast<__bf16>((ushort)(std::bit_cast<uint>(cur[2] * inv_sum_scale) >> 16));
++        o[3] = std::bit_cast<__bf16>((ushort)(std::bit_cast<uint>(cur[3] * inv_sum_scale) >> 16));
++        ((bfloat16x4*)out)[lane_id] = o;
++    }
++}
+diff --git a/csrc/cpp_itfs/utils.h b/csrc/cpp_itfs/utils.h
+index ffcb1b8408d..b4cd4457144 100644
+--- a/csrc/cpp_itfs/utils.h
++++ b/csrc/cpp_itfs/utils.h
+@@ -162,10 +162,14 @@ __inline__ std::string get_default_func_name(const std::string& md_name, std::li
+     std::string args_str = fmt::format("{}", fmt::join(args, "_"));
+     std::transform(args_str.begin(), args_str.end(), args_str.begin(),
+     [](unsigned char c){ return std::tolower(c); });
+-    auto func_name = func_names->get(args_str);
++    // Must include md_name in the cache key. Otherwise two different entrypoints
++    // (e.g. pa_ragged vs pa_ragged_nhd) with the same arg list can alias and
++    // reuse the wrong func_name / lib.so.
++    const std::string cache_key = md_name + "|" + args_str;
++    auto func_name = func_names->get(cache_key);
+     if(!func_name){
+-        func_names->put(args_str, fmt::format("{}_{}", md_name, hash_signature(args_str)));
+-        func_name = func_names->get(args_str);
++        func_names->put(cache_key, fmt::format("{}_{}", md_name, hash_signature(cache_key)));
++        func_name = func_names->get(cache_key);
+     }
+     return *func_name;
+ }
+diff --git a/csrc/include/attention_ragged.h b/csrc/include/attention_ragged.h
+index 4a5068ff072..c4ce90b2ab1 100644
+--- a/csrc/include/attention_ragged.h
++++ b/csrc/include/attention_ragged.h
+@@ -22,3 +22,25 @@ void paged_attention_ragged(
+     const std::string &kv_cache_dtype, const std::string &kv_cache_layout,
+     float logits_soft_cap, torch::Tensor &k_scale, torch::Tensor &v_scale,
+     const std::optional<torch::Tensor> &fp8_out_scale, int64_t partition_size);
++
++void paged_attention_ragged_nhd(
++    torch::Tensor &out, // [num_seqs, num_heads, head_size]
++    torch::Tensor &exp_sums,   // float32 workspace for partition sums
++    torch::Tensor &max_logits, // float32 workspace for partition max
++    torch::Tensor &tmp_out,    // bf16 workspace for partial outputs (same layout as CK path)
++    torch::Tensor &query, // [num_seqs, num_heads, head_size]
++    torch::Tensor
++        &key_cache, // [num_blocks, num_heads, block_size, head_size] or
++                    // [num_blocks, block_size, num_heads, head_size]
++    torch::Tensor
++        &value_cache, // [num_blocks, num_heads, block_size, head_size] or
++                      // [num_blocks, block_size, num_heads, head_size]
++    double scale,
++    torch::Tensor &kv_indptr,                        // [num_seqs + 1]
++    torch::Tensor &kv_page_indices,                  // [max_num_blocks]
++    std::optional<torch::Tensor> &kv_last_page_lens, // [num_seqs]
++    int64_t block_size, int64_t max_num_partitions,
++    const std::optional<torch::Tensor> &alibi_slopes,
++    const std::string &kv_cache_dtype, const std::string &kv_cache_layout,
++    float logits_soft_cap, torch::Tensor &k_scale, torch::Tensor &v_scale,
++    const std::optional<torch::Tensor> &fp8_out_scale, int64_t partition_size);
+diff --git a/csrc/include/rocm_ops.hpp b/csrc/include/rocm_ops.hpp
+index d1c4a0360b8..d1e0585bf96 100644
+--- a/csrc/include/rocm_ops.hpp
++++ b/csrc/include/rocm_ops.hpp
+@@ -181,6 +181,18 @@ namespace py = pybind11;
+           "                int max_context_len,"                  \
+           "                Tensor? alibi_slopes,"                 \
+           "                str kv_cache_dtype,"                   \
++          "                float k_scale, float v_scale) -> ()"); \
++    m.def("paged_attention_ragged_nhd",                           \
++          &paged_attention_ragged_nhd,                            \
++          "paged_attention_ragged_nhd(Tensor! out, Tensor exp_sums,"  \
++          "                Tensor max_logits, Tensor tmp_out,"        \
++          "                Tensor query, Tensor key_cache,"           \
++          "                Tensor value_cache, int num_kv_heads,"     \
++          "                float scale, Tensor block_tables,"         \
++          "                Tensor context_lens, int block_size,"      \
++          "                int max_context_len,"                      \
++          "                Tensor? alibi_slopes,"                     \
++          "                str kv_cache_dtype,"                       \
+           "                float k_scale, float v_scale) -> ()");
+ 
+ #define ATTENTION_V1_PYBIND                                       \
+diff --git a/csrc/kernels/attention_ragged.cu b/csrc/kernels/attention_ragged.cu
+index 3bd8fa07110..ad5f5005127 100644
+--- a/csrc/kernels/attention_ragged.cu
++++ b/csrc/kernels/attention_ragged.cu
+@@ -388,6 +388,124 @@ void paged_attention_custom_launcher(torch::Tensor& out,
+     }
+ }
+ 
++// Same as paged_attention_custom_launcher but exp_sums / max_logits / tmp_out are separate tensors
++// (used by paged_attention_ragged_nhd PyBind entrypoint).
++template <typename T,
++          typename KVT,
++          vllm::Fp8KVCacheDataType KV_DTYPE,
++          int BLOCK_SIZE,
++          int HEAD_SIZE,
++          typename OUTT,
++          int PARTITION_SIZE_OLD,
++          bool ALIBI_ENABLED,
++          bool LOGITS_SOFT_CAP_ENABLED>
++void paged_attention_custom_launcher_split_ws(torch::Tensor& out,
++                                              torch::Tensor& exp_sums,
++                                              torch::Tensor& max_logits,
++                                              torch::Tensor& tmp_out,
++                                              torch::Tensor& query,
++                                              torch::Tensor& key_cache,
++                                              torch::Tensor& value_cache,
++                                              float scale,
++                                              torch::Tensor& kv_indptr,
++                                              torch::Tensor& kv_page_indices,
++                                              std::optional<torch::Tensor>& kv_last_page_lens,
++                                              int max_num_partitions,
++                                              const std::optional<torch::Tensor>& alibi_slopes,
++                                              const std::string& kv_cache_layout,
++                                              float logits_soft_cap,
++                                              torch::Tensor& k_scale,
++                                              torch::Tensor& v_scale,
++                                              const std::optional<torch::Tensor>& fp8_out_scale)
++{
++    const int num_kv_heads = kv_cache_layout == "HND" ? key_cache.size(1) : key_cache.size(2);
++    int num_seqs           = query.size(0);
++    int num_heads          = query.size(1);
++    int head_size          = query.size(2);
++    int q_stride           = query.stride(0);
++    int kv_block_stride    = key_cache.stride(0);
++    int kv_head_stride     = kv_cache_layout == "HND" ? key_cache.stride(1) : key_cache.stride(2);
++    int kv_seq_stride      = kv_cache_layout == "HND" ? key_cache.stride(2) : key_cache.stride(1);
++
++    const float* alibi_slopes_ptr =
++        alibi_slopes ? reinterpret_cast<const float*>(alibi_slopes.value().data_ptr()) : nullptr;
++
++    T* query_ptr             = reinterpret_cast<T*>(query.data_ptr());
++    KVT* key_cache_ptr       = reinterpret_cast<KVT*>(key_cache.data_ptr());
++    KVT* value_cache_ptr     = reinterpret_cast<KVT*>(value_cache.data_ptr());
++    int* kv_indptr_ptr       = kv_indptr.data_ptr<int>();
++    int* kv_page_indices_ptr = kv_page_indices.data_ptr<int>();
++    int* kv_last_page_lens_ptr =
++        BLOCK_SIZE > 1 ? kv_last_page_lens.value().data_ptr<int>() : nullptr;
++
++    const float* k_scale_ptr = reinterpret_cast<const float*>(k_scale.data_ptr());
++    const float* v_scale_ptr = reinterpret_cast<const float*>(v_scale.data_ptr());
++    const float* fp8_out_scale_ptr =
++        fp8_out_scale ? reinterpret_cast<const float*>(fp8_out_scale.value().data_ptr()) : nullptr;
++    OUTT* out_ptr = reinterpret_cast<OUTT*>(out.data_ptr());
++
++    const float logits_soft_cap_rcp = (LOGITS_SOFT_CAP_ENABLED ? 1.f / logits_soft_cap : 0.f);
++
++    // Template PSIZE matches Python `partition_size` (256 / 512 / 1024). Reduction uses this;
++    // the mfma16 attention kernel still uses a fixed T_PAR_SIZE in device code (see kernel above).
++    constexpr int PARTITION_SIZE = PARTITION_SIZE_OLD;
++    const int gqa_ratio          = num_heads / num_kv_heads;
++    assert(num_heads % num_kv_heads == 0);
++    assert(head_size == HEAD_SIZE);
++
++    TORCH_CHECK(exp_sums.scalar_type() == at::ScalarType::Float, "exp_sums must be float32");
++    TORCH_CHECK(max_logits.scalar_type() == at::ScalarType::Float, "max_logits must be float32");
++    float* exp_sums_ptr   = exp_sums.data_ptr<float>();
++    float* max_logits_ptr = max_logits.data_ptr<float>();
++    OUTT* tmp_out_ptr     = reinterpret_cast<OUTT*>(tmp_out.data_ptr());
++
++    ck_tile::ComposedAttention<LOGITS_SOFT_CAP_ENABLED * ck_tile::LOGITS_SOFT_CAP> variant;
++
++    constexpr int NTHR = 256;
++    dim3 grid(num_seqs, max_num_partitions, num_kv_heads);
++    dim3 block(NTHR);
++    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(query));
++    const hipStream_t stream = at::hip::getCurrentHIPStream();
++
++    switch(gqa_ratio)
++    {
++    case 1: LAUNCH_CUSTOM_ATTENTION_MFMA16(1); break;
++    case 2: LAUNCH_CUSTOM_ATTENTION_MFMA16(2); break;
++    case 3: LAUNCH_CUSTOM_ATTENTION_MFMA16(3); break;
++    case 4: LAUNCH_CUSTOM_ATTENTION_MFMA16(4); break;
++    case 5: LAUNCH_CUSTOM_ATTENTION_MFMA16(5); break;
++    case 6: LAUNCH_CUSTOM_ATTENTION_MFMA16(6); break;
++    case 7: LAUNCH_CUSTOM_ATTENTION_MFMA16(7); break;
++    case 8: LAUNCH_CUSTOM_ATTENTION_MFMA16(8); break;
++    case 9: LAUNCH_CUSTOM_ATTENTION_MFMA16(9); break;
++    case 10: LAUNCH_CUSTOM_ATTENTION_MFMA16(10); break;
++    case 11: LAUNCH_CUSTOM_ATTENTION_MFMA16(11); break;
++    case 12: LAUNCH_CUSTOM_ATTENTION_MFMA16(12); break;
++    case 13: LAUNCH_CUSTOM_ATTENTION_MFMA16(13); break;
++    case 14: LAUNCH_CUSTOM_ATTENTION_MFMA16(14); break;
++    case 15: LAUNCH_CUSTOM_ATTENTION_MFMA16(15); break;
++    case 16: LAUNCH_CUSTOM_ATTENTION_MFMA16(16); break;
++    default: TORCH_CHECK(false, "Unsupported gqa ratio: ", gqa_ratio); break;
++    }
++
++    dim3 reduce_grid(num_heads, num_seqs);
++    dim3 reduce_block(head_size);
++    const int npar_loops = DIVIDE_ROUND_UP(max_num_partitions, WARP_SIZE);
++    constexpr bool ENABLE_LAST_PAGE_LENS = BLOCK_SIZE > 1;
++    switch(npar_loops)
++    {
++    case 1: LAUNCH_CUSTOM_REDUCTION(1); break;
++    case 2: LAUNCH_CUSTOM_REDUCTION(2); break;
++    case 3: LAUNCH_CUSTOM_REDUCTION(3); break;
++    case 4: LAUNCH_CUSTOM_REDUCTION(4); break;
++    case 5: LAUNCH_CUSTOM_REDUCTION(5); break;
++    case 6: LAUNCH_CUSTOM_REDUCTION(6); break;
++    case 7: LAUNCH_CUSTOM_REDUCTION(7); break;
++    case 8: LAUNCH_CUSTOM_REDUCTION(8); break;
++    default: TORCH_CHECK(false, "Unsupported npar_loops: ", npar_loops); break;
++    }
++}
++
+ #define CALL_CUSTOM_LAUNCHER(                                                                   \
+     T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE, OUTT, PSIZE, ALIBI_ENABLED, LOGITS_SOFT_CAP_ENABLED) \
+     paged_attention_custom_launcher<T,                                                          \
+@@ -487,6 +605,87 @@ void paged_attention_custom_launcher(torch::Tensor& out,
+     default: TORCH_CHECK(false, "Unsupported head size: ", head_size); break; \
+     }
+ 
++#define CALL_CUSTOM_LAUNCHER_SPLIT(                                                                   \
++    T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE, OUTT, PSIZE, ALIBI_ENABLED, LOGITS_SOFT_CAP_ENABLED) \
++    paged_attention_custom_launcher_split_ws<T,                                                          \
++                                    KVT,                                                        \
++                                    KV_DTYPE,                                                   \
++                                    BLK_SIZE,                                                   \
++                                    HEAD_SIZE,                                                  \
++                                    OUTT,                                                       \
++                                    PSIZE,                                                      \
++                                    ALIBI_ENABLED,                                              \
++                                    LOGITS_SOFT_CAP_ENABLED>(out,                               \
++                                                             exp_sums,                  \
++                                                             max_logits,                  \
++                                                             tmp_out,                  \
++                                                             query,                             \
++                                                             key_cache,                         \
++                                                             value_cache,                       \
++                                                             scale,                             \
++                                                             kv_indptr,                         \
++                                                             kv_page_indices,                   \
++                                                             kv_last_page_lens,                 \
++                                                             max_num_partitions,                \
++                                                             alibi_slopes,                      \
++                                                             kv_cache_layout,                   \
++                                                             logits_soft_cap,                   \
++                                                             k_scale,                           \
++                                                             v_scale,                           \
++                                                             fp8_out_scale);
++
++#define CALL_CUSTOM_LAUNCHER_SOFT_CAP_SPLIT(                                                 \
++    T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE, OUTT, PSIZE, ALIBI_ENABLED)                 \
++    if(0.f < logits_soft_cap)                                                          \
++    {                                                                                  \
++        CALL_CUSTOM_LAUNCHER_SPLIT(                                                          \
++            T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE, OUTT, PSIZE, ALIBI_ENABLED, true);  \
++    }                                                                                  \
++    else if(logits_soft_cap == 0.f)                                                    \
++    {                                                                                  \
++        CALL_CUSTOM_LAUNCHER_SPLIT(                                                          \
++            T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE, OUTT, PSIZE, ALIBI_ENABLED, false); \
++    }                                                                                  \
++    else                                                                               \
++    {                                                                                  \
++        TORCH_CHECK(false, "logits_soft_cap must be non-negative");                    \
++    }
++
++// NHD entry (e.g. SGLang) always passes alibi_slopes=None; ALiBi template parameter fixed false.
++#define CALL_CUSTOM_LAUNCHER_PSIZE_SPLIT(T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE, OUTT)                    \
++    switch(partition_size)                                                                         \
++    {                                                                                              \
++    case 256: CALL_CUSTOM_LAUNCHER_SOFT_CAP_SPLIT(T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE, OUTT, 256, false); break; \
++    case 512: CALL_CUSTOM_LAUNCHER_SOFT_CAP_SPLIT(T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE, OUTT, 512, false); break; \
++    case 1024: CALL_CUSTOM_LAUNCHER_SOFT_CAP_SPLIT(T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE, OUTT, 1024, false); break; \
++    default: TORCH_CHECK(false, "Unsupported partition size (expected 256, 512, or 1024): ", partition_size); break; \
++    }
++
++#if defined(__HIPCC__) && defined(__gfx90a__)
++#define CALL_CUSTOM_LAUNCHER_OUT_SPLIT(T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE)       \
++    if(fp8_out_scale)                                                         \
++    {                                                                         \
++        TORCH_CHECK(false, "fp8 out scale unsupported for gfx90a");           \
++    }                                                                         \
++    else                                                                      \
++    {                                                                         \
++        CALL_CUSTOM_LAUNCHER_PSIZE_SPLIT(T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE, T); \
++    }
++#else
++#define CALL_CUSTOM_LAUNCHER_OUT_SPLIT(T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE)             \
++    if(fp8_out_scale)                                                               \
++    {                                                                               \
++        CALL_CUSTOM_LAUNCHER_PSIZE_SPLIT(T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE, uint8_t); \
++    }                                                                               \
++    else                                                                            \
++    {                                                                               \
++        CALL_CUSTOM_LAUNCHER_PSIZE_SPLIT(T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE, T);       \
++    }
++#endif
++// NHD PyBind path: block_size=1 and head_size=256 only (matches pa_ragged_nhd JIT constraints).
++#define CALL_CUSTOM_LAUNCHER_BLK_HEAD_SPLIT(T, KVT, KV_DTYPE) \
++    CALL_CUSTOM_LAUNCHER_OUT_SPLIT(T, KVT, KV_DTYPE, 1, 256)
++
+ void paged_attention_ragged(
+     torch::Tensor& out, // [num_seqs, num_heads, head_size]
+     torch::Tensor& workspace_buffer,
+@@ -549,6 +748,59 @@ void paged_attention_ragged(
+     }
+ }
+ 
++void paged_attention_ragged_nhd(
++    torch::Tensor& out,
++    torch::Tensor& exp_sums,
++    torch::Tensor& max_logits,
++    torch::Tensor& tmp_out,
++    torch::Tensor& query,
++    torch::Tensor& key_cache,
++    torch::Tensor& value_cache,
++    double scale,
++    torch::Tensor& kv_indptr,
++    torch::Tensor& kv_page_indices,
++    std::optional<torch::Tensor>& kv_last_page_lens,
++    int64_t block_size,
++    int64_t max_num_partitions,
++    const std::optional<torch::Tensor>& alibi_slopes,
++    const std::string& kv_cache_dtype,
++    const std::string& kv_cache_layout,
++    float logits_soft_cap,
++    torch::Tensor& k_scale,
++    torch::Tensor& v_scale,
++    const std::optional<torch::Tensor>& fp8_out_scale,
++    int64_t partition_size)
++{
++    const int head_size = query.size(2);
++    // NHD path matches ctypes JIT pa_ragged_nhd: bf16 KV only (kv_cache_dtype "auto"); no FP8 KV.
++    TORCH_CHECK(
++        kv_cache_dtype == "auto",
++        "paged_attention_ragged_nhd only supports kv_cache_dtype=\"auto\" (bf16 KV); got ",
++        kv_cache_dtype);
++    TORCH_CHECK(
++        !alibi_slopes.has_value(),
++        "paged_attention_ragged_nhd does not support alibi_slopes (pass None / omit)");
++    TORCH_CHECK(block_size == 1, "paged_attention_ragged_nhd expects block_size==1, got ", block_size);
++    TORCH_CHECK(head_size == 256, "paged_attention_ragged_nhd expects head_size==256, got ", head_size);
++    TORCH_CHECK(
++        partition_size == 256 || partition_size == 512 || partition_size == 1024,
++        "paged_attention_ragged_nhd expects partition_size in {256, 512, 1024}, got ",
++        partition_size);
++    if(query.dtype() == at::ScalarType::Half)
++    {
++        CALL_CUSTOM_LAUNCHER_BLK_HEAD_SPLIT(_Float16, _Float16, vllm::Fp8KVCacheDataType::kAuto);
++    }
++    else if(query.dtype() == at::ScalarType::BFloat16)
++    {
++        CALL_CUSTOM_LAUNCHER_BLK_HEAD_SPLIT(
++            __hip_bfloat16, __hip_bfloat16, vllm::Fp8KVCacheDataType::kAuto);
++    }
++    else
++    {
++        TORCH_CHECK(false, "Unsupported data type: ", query.dtype());
++    }
++}
++
+ #undef WARP_SIZE
+ #undef MAX
+ #undef MIN

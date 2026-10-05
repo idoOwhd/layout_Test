@@ -1,0 +1,326 @@
+diff --git a/python/sglang/srt/mem_cache/layout/transfer.py b/python/sglang/srt/mem_cache/layout/transfer.py
+new file mode 100644
+index 000000000000..8ccddd714534
+--- /dev/null
++++ b/python/sglang/srt/mem_cache/layout/transfer.py
+@@ -0,0 +1,70 @@
++"""Byte layouts for pieces of a page-major allocation.
++
++These describe payloads inside an already registered raw allocation. They are
++not separate registration regions: layer views overlap, and the stride between
++pages/slots is generally larger than an individual tensor's payload.
++"""
++
++from dataclasses import dataclass
++from math import prod
++from typing import Optional, Tuple
++
++
++@dataclass(frozen=True)
++class TransferTensor:
++    name: str
++    layer_id: int
++    offset_bytes: int
++    shape: Tuple[int, ...]
++    itemsize: int
++    slice_axis: Optional[int] = None
++    # Full (unsharded) dimensions of independently sharded conv components.
++    shard_groups: Optional[Tuple[int, ...]] = None
++
++    def __post_init__(self):
++        if self.offset_bytes < 0 or self.itemsize <= 0:
++            raise ValueError("Invalid transfer tensor offset or item size")
++        if not self.shape or any(dim <= 0 for dim in self.shape):
++            raise ValueError("Transfer tensors must have nonempty positive shapes")
++        if self.slice_axis is not None and not 0 <= self.slice_axis < len(self.shape):
++            raise ValueError("Transfer tensor slice axis is out of range")
++
++    @property
++    def row_bytes(self) -> int:
++        return prod(self.shape) * self.itemsize
++
++    @property
++    def slice_dim(self) -> int:
++        return 0 if self.slice_axis is None else self.shape[self.slice_axis]
++
++    @property
++    def outer_count(self) -> int:
++        return 1 if self.slice_axis is None else prod(self.shape[: self.slice_axis])
++
++
++@dataclass(frozen=True)
++class TransferLayout:
++    # Distance between physical pages (KV) or physical slots (state).
++    block_bytes: int
++    rows_per_block: int
++    tensors: Tuple[TransferTensor, ...]
++
++    def __post_init__(self):
++        if self.block_bytes <= 0 or self.rows_per_block <= 0 or not self.tensors:
++            raise ValueError("Invalid transfer block layout")
++        end = 0
++        for tensor in sorted(self.tensors, key=lambda t: t.offset_bytes):
++            if tensor.offset_bytes < end:
++                raise ValueError("Transfer tensor payloads overlap")
++            end = tensor.offset_bytes + self.rows_per_block * tensor.row_bytes
++        if end > self.block_bytes:
++            raise ValueError("Transfer tensor extends past its block")
++
++    def address(self, base: int, block: int, tensor: int, row: int = 0) -> int:
++        """Address a physical block; callers translate virtual IDs first."""
++        if block < 0 or not 0 <= row < self.rows_per_block:
++            raise ValueError("Invalid physical block or row")
++        entry = self.tensors[tensor]
++        return (
++            base + block * self.block_bytes + entry.offset_bytes + row * entry.row_bytes
++        )
+diff --git a/python/sglang/srt/mem_cache/unified_memory_pool.py b/python/sglang/srt/mem_cache/unified_memory_pool.py
+index f243a5a51bfc..0e5a5473f250 100644
+--- a/python/sglang/srt/mem_cache/unified_memory_pool.py
++++ b/python/sglang/srt/mem_cache/unified_memory_pool.py
+@@ -41,6 +41,7 @@
+     build_mla_views,
+     build_page_major_mamba_views,
+ )
++from sglang.srt.mem_cache.layout.transfer import TransferLayout, TransferTensor
+ from sglang.srt.mem_cache.memory_pool import (
+     HybridLinearKVPool,
+     HybridReqToTokenPool,
+@@ -229,6 +230,7 @@ class MambaSubPoolSpec(SubPoolSpec):
+     temporal_state_shape: Tuple[int, ...]
+     temporal_dtype: torch.dtype
+     conv_slice_axis: int = 0
++    conv_shard_groups: Optional[Tuple[int, ...]] = None
+ 
+     def __post_init__(self):
+         super().__post_init__()
+@@ -758,6 +760,27 @@ def get_contiguous_buf_infos(self):
+         raw = self._unified_buffer._raw
+         return [raw.data_ptr()], [raw.numel()], [self._page_bytes]
+ 
++    def get_transfer_layout(self, layer_ids: List[int]) -> TransferLayout:
++        """Describe latent rows without registering overlapping kernel views."""
++        if len(layer_ids) != self.layer_num:
++            raise ValueError("MLA transfer layer IDs must match the local layers")
++        raw = self._unified_buffer._raw
++        return TransferLayout(
++            block_bytes=self._page_bytes,
++            rows_per_block=self.page_size,
++            tensors=tuple(
++                TransferTensor(
++                    name="kv",
++                    layer_id=layer_id,
++                    offset_bytes=view.data_ptr() - raw.data_ptr(),
++                    shape=tuple(view.shape[1:]),
++                    itemsize=view.element_size(),
++                    # MLA latents are replicated across attention TP.
++                )
++                for layer_id, view in zip(layer_ids, self.kv_buffer)
++            ),
++        )
++
+     def _physical_to_kernel_indices(self, indices: torch.Tensor) -> torch.Tensor:
+         """Physical TOKEN ids -> the kernel-facing ids this class's `kv_buffer`
+         views are indexed by; the formula is the one in the class docstring."""
+@@ -854,7 +877,7 @@ def __init__(
+         self.replayssm_cache_base = None
+         self.replayssm_is_flush = None
+         self.debug_memory_pool = False
+-        self.conv_shard_groups = None
++        self.conv_shard_groups = spec.conv_shard_groups
+         self.conv_slice_axis = spec.conv_slice_axis
+ 
+         assert conv_views[0].shape[0] == self.num_mamba_layers, (
+@@ -938,6 +961,38 @@ def get_contiguous_buf_infos(self):
+         raw = self._unified_buffer._raw
+         return [raw.data_ptr()], [raw.numel()], [spec.entry_bytes()]
+ 
++    def get_transfer_layout(self) -> TransferLayout:
++        """Describe tensor pieces; the raw allocation stays registered once."""
++        raw = self._unified_buffer._raw
++        tensors = []
++        fields = [
++            (f"conv.{i}", view, self.conv_slice_axis, self.conv_shard_groups)
++            for i, view in enumerate(self.mamba_cache.conv)
++        ]
++        fields.append(("temporal", self.mamba_cache.temporal, 0, None))
++        for name, view, axis, groups in fields:
++            if view.numel() == 0:
++                continue
++            for layer, layer_id in enumerate(self.mamba_layer_ids):
++                tensors.append(
++                    TransferTensor(
++                        name=name,
++                        layer_id=layer_id,
++                        offset_bytes=view[layer].data_ptr() - raw.data_ptr(),
++                        shape=tuple(view.shape[2:]),
++                        itemsize=view.element_size(),
++                        slice_axis=axis,
++                        shard_groups=tuple(groups) if groups is not None else None,
++                    )
++                )
++        return TransferLayout(
++            block_bytes=self._unified_buffer.mamba_spec(
++                self._sub_pool_name
++            ).entry_bytes(),
++            rows_per_block=1,
++            tensors=tuple(tensors),
++        )
++
+     def get_state_dim_per_tensor(self):
+         return []
+ 
+@@ -1338,6 +1393,7 @@ def init_unified_mamba_pools(
+         temporal_state_shape=tuple(int(x) for x in cp.shape.temporal),
+         temporal_dtype=cp.dtype.temporal,
+         conv_slice_axis=getattr(cp.shape, "conv_slice_axis", 0),
++        conv_shard_groups=getattr(cp.shape, "conv_shard_groups", None),
+         grow_direction="up",
+     )
+     if unified_total_bytes is not None:
+diff --git a/test/registered/unit/mem_cache/test_unified_transfer_layout.py b/test/registered/unit/mem_cache/test_unified_transfer_layout.py
+new file mode 100644
+index 000000000000..4f92ba1b9679
+--- /dev/null
++++ b/test/registered/unit/mem_cache/test_unified_transfer_layout.py
+@@ -0,0 +1,140 @@
++"""Check PD byte addresses against actual page-major compute views."""
++
++import unittest
++
++import torch
++
++from sglang.srt.mem_cache.layout.transfer import TransferLayout, TransferTensor
++from sglang.srt.mem_cache.unified_memory_pool import (
++    MambaSubPoolSpec,
++    MLASubPoolSpec,
++    UnifiedKVPool,
++    UnifiedMambaPool,
++    UnifiedMLATokenToKVPool,
++)
++from sglang.test.ci.ci_register import register_cpu_ci
++
++register_cpu_ci(est_time=10, suite="base-a-test-cpu")
++
++
++def make_pools(page_size=4, conv_axis=1, groups=None):
++    full_spec = MLASubPoolSpec(
++        name="full",
++        layer_num=3,
++        grow_direction="down",
++        kv_lora_rank=6,
++        qk_rope_head_dim=2,
++        store_dtype=torch.bfloat16,
++    )
++    state_spec = MambaSubPoolSpec(
++        name="mamba",
++        layer_num=2,
++        grow_direction="up",
++        conv_state_shapes=((3, 16), (2, 8)) if conv_axis == 1 else ((16, 3),),
++        conv_dtype=torch.bfloat16,
++        temporal_state_shape=(4, 2, 2),
++        temporal_dtype=torch.float32,
++        conv_slice_axis=conv_axis,
++        conv_shard_groups=groups,
++    )
++    raw = UnifiedKVPool(
++        total_bytes=32768,
++        sub_pool_specs=[full_spec, state_spec],
++        device="cpu",
++        enable_memory_saver=False,
++        page_size=page_size,
++    )
++    full = UnifiedMLATokenToKVPool(
++        unified_buffer=raw,
++        sub_pool_name="full",
++        kv_cache_dtype=torch.bfloat16,
++        page_size=page_size,
++    )
++    state = UnifiedMambaPool(
++        unified_buffer=raw,
++        sub_pool_name="mamba",
++        spec_state_size=8,
++        mamba_layer_ids=[1, 4],
++    )
++    return raw, full, state
++
++
++class TestUnifiedTransferLayout(unittest.TestCase):
++    def test_mla_addresses_match_kernel_views_on_fragmented_pages(self):
++        for ps in (1, 4, 16):
++            raw, full, _ = make_pools(page_size=ps)
++            layout = full.get_transfer_layout([0, 2, 5])
++            for page in (7, 2, 9):
++                for layer, view in enumerate(full.kv_buffer):
++                    for row in range(ps):
++                        kernel_id = page * ps * full.layer_num + row
++                        expected = view[kernel_id].data_ptr()
++                        addr = layout.address(raw._raw.data_ptr(), page, layer, row)
++                        self.assertEqual(addr, expected)
++                        view[kernel_id].fill_(100 * layer + 10 * page + row)
++                        start = addr - raw._raw.data_ptr()
++                        payload = raw._raw[
++                            start : start + layout.tensors[layer].row_bytes
++                        ]
++                        self.assertTrue(
++                            torch.equal(
++                                payload.view(view.dtype), view[kernel_id].flatten()
++                            )
++                        )
++            # Transfer pieces are descriptions, never extra registrations.
++            self.assertEqual(
++                full.get_contiguous_buf_infos(),
++                ([raw._raw.data_ptr()], [raw._raw.numel()], [layout.block_bytes]),
++            )
++            self.assertTrue(all(t.slice_axis is None for t in layout.tensors))
++
++    def test_state_addresses_match_strided_views(self):
++        for axis, groups in ((1, None), (0, (8, 8, 16))):
++            raw, _, state = make_pools(conv_axis=axis, groups=groups)
++            layout = state.get_transfer_layout()
++            views = list(state.mamba_cache.conv) + [state.mamba_cache.temporal]
++            for slot in (5, 1, 8):
++                for tensor_index, view in enumerate(views):
++                    for layer in range(2):
++                        index = tensor_index * 2 + layer
++                        entry = layout.tensors[index]
++                        addr = layout.address(raw._raw.data_ptr(), slot, index)
++                        self.assertEqual(addr, view[layer, slot].data_ptr())
++                        self.assertEqual(
++                            entry.row_bytes,
++                            view[layer, slot].numel() * view.element_size(),
++                        )
++                        self.assertEqual(
++                            layout.block_bytes, view.stride(1) * view.element_size()
++                        )
++                        self.assertGreater(layout.block_bytes, entry.row_bytes)
++                        view[layer, slot].fill_(100 * tensor_index + 10 * layer + slot)
++                        start = addr - raw._raw.data_ptr()
++                        payload = raw._raw[start : start + entry.row_bytes]
++                        self.assertTrue(
++                            torch.equal(
++                                payload.view(view.dtype), view[layer, slot].flatten()
++                            )
++                        )
++            conv = layout.tensors[0]
++            self.assertEqual(conv.slice_dim, state.mamba_cache.conv[0].shape[2 + axis])
++            self.assertEqual(conv.outer_count, 3 if axis == 1 else 1)
++            self.assertEqual(conv.shard_groups, groups)
++            self.assertEqual(
++                state.get_contiguous_buf_infos(),
++                ([raw._raw.data_ptr()], [raw._raw.numel()], [layout.block_bytes]),
++            )
++            self.assertEqual(state.get_state_dim_per_tensor(), [])
++
++    def test_rejects_overlapping_or_out_of_block_pieces(self):
++        tensor = TransferTensor("kv", 0, 0, (8,), 2)
++        with self.assertRaisesRegex(ValueError, "overlap"):
++            TransferLayout(64, 2, (tensor, tensor))
++        with self.assertRaisesRegex(ValueError, "past its block"):
++            TransferLayout(16, 2, (tensor,))
++        with self.assertRaisesRegex(ValueError, "layer IDs"):
++            make_pools()[1].get_transfer_layout([0])
++
++
++if __name__ == "__main__":
++    unittest.main()

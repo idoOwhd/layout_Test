@@ -1,0 +1,2507 @@
+diff --git a/docs/developer_guide/transfer_analysis.md b/docs/developer_guide/transfer_analysis.md
+new file mode 100644
+index 0000000000..a2ccb3e64d
+--- /dev/null
++++ b/docs/developer_guide/transfer_analysis.md
+@@ -0,0 +1,103 @@
++# Transfer semantics and producer scheduling
++
++`src/transform/common/transfer_analysis.{h,cc}` separates three questions that
++used to share the `copy_stage` classification:
++
++1. What value and memory effects does the statement produce?
++2. Where should the scheduler place it?
++3. Which physical transfer instruction can implement it?
++
++## Shared semantic analysis
++
++`AnalyzeTransferValue` describes a source `BufferLoad`, optional zero-fill data
++predicate, and whether the value undergoes conversion. Pipeline planning and
++the CUDA/ROCm async injectors use the same matcher. Arithmetic, nonzero padding,
++negative floating-point zero and masked loads with unspecified fill semantics
++are not byte-preserving zero-fill transfers.
++
++`AnalyzeTransfers` summarizes a whole scheduling unit, including TileOps and
++ordinary loops. It traverses address and predicate dependencies as well as the
++stored value. Side effects, intra-producer shared/local reads and non-shared
++writes prevent treating the entire unit as an implicit async region. Mixed
++copy/compute regions remain synchronous rather than skipping their internal
++dependencies.
++
++An expression `if_then_else(p, load, 0)` writes zero when `p` is false. An
++`IfThenElse` statement may skip a write entirely. The latter is an execution
++guard and is not automatically assigned an async completion protocol.
++
++## Independent policy and capability
++
++`PipelineStageInfo::prefetch_stage` is an early-placement policy. Direct,
++converting and zero-fill transfers are preferred for prefetch. This policy is
++deliberately independent from `async_candidate`: conversion may be worth
++prefetching but cannot be implemented by byte-preserving async copy. Explicit
++manual stage assignments are retained even when a transfer is async-capable.
++
++Placement also considers consumers. A synchronous producer used only by direct
++shared-to-fragment copies stays with those consumers: advancing the entire
++load/convert/store relay can increase shared-buffer versioning and register
++lifetimes without useful overlap. Async-capable transfers, TMA, shared operands
++read by computation, and explicit schedules retain their existing policy.
++Dependency propagation follows this placement decision, so unrelated async
++transfers in the same loop remain pipelined. This is a cost policy, not an
++instruction-legality rule or a guarantee of improvement in every reuse context.
++
++An initial policy kept guarded transfers late to preserve the previous schedule.
++Paired measurements found a regression in automatic guarded GEMM. An independent
++early-placement ablation improved all four affected automatic configurations,
++including three convolutions, so the final policy removes that blanket exclusion.
++
++Manual and automatic pipelines consume the same capability facts. CUDA warp
++specialization uses the broader `IsSimtProducer` effect query for **role**
++placement: producer warps may execute synchronous arithmetic or conversions.
++That role is not a promise to emit `cp.async`.
++
++TMA im2col remains an opaque backend-owned transfer. SIMT im2col becomes ordinary
++guarded accesses through logical lowering, and receives no operator-name
++exception in producer analysis.
++
++## Completion dependencies and physical realization
++
++The existing per-statement producer/group annotations encode candidate
++completion regions. `InjectSoftwarePipeline` manages buffer versions and
++wait-before-use dependencies. A consumer can depend on producers in **multiple
++stages**; wait analysis visits every relevant producer stage instead of assuming
++a single owner. Per-stage commit counts are conservative on a shared hardware
++queue: commits from other stages cannot make these waits too weak, although
++they can cause more waiting than a globally optimized issue timeline would.
++
++Layout inference and physical loop lowering still precede backend instruction
++selection. CUDA/ROCm injectors check the transfer's physical width, indexing and
++target constraints. A candidate with illegal physical geometry remains ordinary
++loads/stores, with normal shared-memory synchronization. Empty commit groups
++retain their numbering; removing them locally would invalidate downstream
++inflight counts.
++
++This design reuses the existing completion representation and synchronization
++passes. It does not add a public transfer dialect, a second pipeline IR, or
++claim to implement global issue-timeline optimization.
++
++## Physical effects through vectorization and synchronization
++
++Vectorization widens declared access-pointer regions together with cp.async
++instruction counts. Later passes must see the whole transfer, not the scalar
++extent of its first element.
++
++ThreadSync compares pointer-involving accesses in physical bytes, including
++buffer strides, element offsets, vector lanes, packed subbyte types and shared
++alias offsets. Independent thread bindings and mutable-index snapshots remain
++independent; loop-carried comparisons advance both the next address and its
++constraints. Existing indexed-access ownership analysis remains in place.
++
++Known instructions own their actual access extent and direction: cp.async
++counts, vector atomic widths and matrix shared-row widths override stale
++pointer metadata. An unbounded `address_of` does not imply a one-element access.
++Unknown footprints cannot establish disjointness. These proofs remove barriers
++between disjoint regions, not completion waits or explicit synchronization.
++
++## Validation boundaries
++
++Changes to instruction eligibility must be measured on convolution as well as
++producer microbenchmarks; numerical
++correctness alone is not evidence that a new schedule is profitable.
+diff --git a/src/cuda/op/copy.cc b/src/cuda/op/copy.cc
+index f7bb0f58ec..4a1ed7ecbc 100644
+--- a/src/cuda/op/copy.cc
++++ b/src/cuda/op/copy.cc
+@@ -2813,6 +2813,8 @@ bool RegisterCudaIm2Col() {
+       },
+       100,
+       cuda::Im2Col::Lower,
++      nullptr,
++      true,
+   });
+   return true;
+ }
+diff --git a/src/cuda/transform/producer_consumer_ws.cc b/src/cuda/transform/producer_consumer_ws.cc
+index 5c29da76db..ca72d144de 100644
+--- a/src/cuda/transform/producer_consumer_ws.cc
++++ b/src/cuda/transform/producer_consumer_ws.cc
+@@ -46,6 +46,7 @@
+ #include "op/operator.h"
+ #include "op/utils.h"
+ #include "transform/common/mbarrier.h"
++#include "transform/common/transfer_analysis.h"
+ #include "ws_analysis.h"
+ 
+ namespace tvm {
+@@ -1544,8 +1545,20 @@ class ProducerConsumerWSRewriter : public StmtExprMutator {
+           simt_stmts_emitted = true;
+         }
+ 
++        bool prefix_writes_shared = false;
+         for (const auto &stmt : producer_loop_prefix_stmts[tma_idx]) {
+           producer_stmts.push_back(stmt);
++          prefix_writes_shared |= AnalyzeTransfers(stmt, target_).writes_shared;
++        }
++        if (prefix_writes_shared) {
++          // Synchronous copies moved to the producer must finish on every
++          // producer thread before an elected TMA thread can publish them.
++          // Their destinations need not overlap the TMA buffers, so ordinary
++          // shared-memory hazard analysis cannot supply this completion edge.
++          // ThreadPartialSync lowers this to the producer partition's barrier.
++          producer_stmts.push_back(
++              Evaluate(Call(DataType::Int(32), builtin::tvm_storage_sync(),
++                            {StringImm("shared")})));
+         }
+         // Convert copy → tma_copy with barrier, or annotate non-copy
+         // TMA tile-ops (e.g. im2col) with barrier reference.
+@@ -1595,7 +1608,9 @@ class ProducerConsumerWSRewriter : public StmtExprMutator {
+     // so the async copy completion drives the mbarrier arrival, allowing
+     // TMA and cp.async to overlap.  Other groups use MakeArriveBarrier.
+     if (has_simt_producer || has_cp_async_producer) {
+-      // Any SIMT producer will become cp.async after LowerTileOp.
++      // The group owns a completion protocol, not an instruction promise.
++      // LowerTileOp may retain synchronous stores for some or all SIMT work;
++      // an empty cp.async group still completes the barrier arrival.
+       bool group_has_async_copy = has_simt_producer || has_cp_async_producer;
+       for (int g = 0; g < num_producer_groups; ++g) {
+         int fwd_base = g * num_stages;
+diff --git a/src/cuda/transform/ptx_async_copy_injector.cc b/src/cuda/transform/ptx_async_copy_injector.cc
+index 267b8608dd..ee6983c9a8 100644
+--- a/src/cuda/transform/ptx_async_copy_injector.cc
++++ b/src/cuda/transform/ptx_async_copy_injector.cc
+@@ -21,6 +21,7 @@
+ #include "cuda/transform/ptx_async_copy_injector.h"
+ #include "op/utils.h"
+ #include "tir/ir/buffer_common.h"
++#include "transform/common/transfer_analysis.h"
+ 
+ namespace tvm {
+ namespace tl {
+@@ -249,12 +250,11 @@ class PTXAsyncCopyInjector : public StmtMutator {
+       return StmtMutator::VisitStmt_(store);
+     }
+ 
+-    Optional<PrimExpr> predicate = std::nullopt;
+-    const BufferLoadNode *load =
+-        MatchZeroFillBufferLoad(store->value, &predicate);
+-    if (load) {
++    auto transfer = AnalyzeTransferValue(store->value);
++    if (transfer && !transfer->converts_value) {
++      const auto &predicate = transfer->zero_fill_predicate;
+       Optional<Stmt> injected =
+-          TryInjectPTX(load, store, predicate.defined(),
++          TryInjectPTX(transfer->source.get(), store, predicate.defined(),
+                        predicate.defined() ? predicate.value() : PrimExpr());
+       if (injected.defined()) {
+         injected_ptx_async_copy_ = true;
+@@ -294,45 +294,6 @@ class PTXAsyncCopyInjector : public StmtMutator {
+   };
+ 
+   // ---- Copy candidate analysis helpers ----
+-  static bool IsZeroValue(const PrimExpr &expr) {
+-    if (const auto *broadcast = expr.as<BroadcastNode>()) {
+-      return IsZeroValue(broadcast->value);
+-    }
+-    if (const auto *float_imm = expr.as<FloatImmNode>()) {
+-      return float_imm->value == 0.0f;
+-    }
+-    if (const auto *int_imm = expr.as<IntImmNode>()) {
+-      return int_imm->value == 0;
+-    }
+-    return false;
+-  }
+-
+-  static const BufferLoadNode *
+-  MatchZeroFillBufferLoad(const PrimExpr &value,
+-                          Optional<PrimExpr> *predicate) {
+-    if (const auto *load = value.as<BufferLoadNode>()) {
+-      return load;
+-    }
+-
+-    const auto *call = value.as<CallNode>();
+-    if (!call || !call->op.same_as(builtin::if_then_else()) ||
+-        !IsZeroValue(call->args[2])) {
+-      return nullptr;
+-    }
+-
+-    const BufferLoadNode *load =
+-        MatchZeroFillBufferLoad(call->args[1], predicate);
+-    if (load == nullptr) {
+-      return nullptr;
+-    }
+-
+-    *predicate =
+-        predicate->defined()
+-            ? Optional<PrimExpr>(And(call->args[0], predicate->value()))
+-            : Optional<PrimExpr>(call->args[0]);
+-    return load;
+-  }
+-
+   static Optional<PrimExpr>
+   FlattenToLinearOffset(const Buffer &buf, const Array<PrimExpr> &indices) {
+     // Convert N-D indices (potentially with axis_separators) into a single
+diff --git a/src/cuda/transform/ws_analysis.cc b/src/cuda/transform/ws_analysis.cc
+index 72925c4288..6957113d53 100644
+--- a/src/cuda/transform/ws_analysis.cc
++++ b/src/cuda/transform/ws_analysis.cc
+@@ -16,6 +16,7 @@
+ #include "op/gemm_sp.h"
+ #include "op/operator.h"
+ #include "op/utils.h"
++#include "transform/common/transfer_analysis.h"
+ 
+ namespace tvm {
+ namespace tl {
+@@ -24,43 +25,6 @@ using namespace ffi;
+ 
+ namespace {
+ 
+-/// Detect if a statement is a SIMT global-to-shared memory copy.
+-/// Matches any statement that writes to shared memory and reads from global
+-/// memory, without reading shared or local buffers (which would indicate
+-/// consumer-side compute).  This is intentionally broader than "pure direct
+-/// copy" so that T.Parallel with complex indexing / if_then_else (later
+-/// lowered to cp.async) is also captured.
+-class SimtProducerDetector : public StmtExprVisitor {
+-public:
+-  static bool Detect(const Stmt &stmt) {
+-    SimtProducerDetector d;
+-    d(stmt);
+-    return d.writes_shared_ && d.reads_global_ && !d.reads_shared_local_;
+-  }
+-
+-private:
+-  void VisitStmt_(const BufferStoreNode *op) final {
+-    if (IsSharedBuffer(op->buffer)) {
+-      writes_shared_ = true;
+-    }
+-    StmtExprVisitor::VisitStmt_(op);
+-  }
+-
+-  void VisitExpr_(const BufferLoadNode *op) final {
+-    if (IsGlobalBuffer(op->buffer)) {
+-      reads_global_ = true;
+-    }
+-    if (IsSharedBuffer(op->buffer) || IsLocalBuffer(op->buffer, true)) {
+-      reads_shared_local_ = true;
+-    }
+-    StmtExprVisitor::VisitExpr_(op);
+-  }
+-
+-  bool writes_shared_{false};
+-  bool reads_global_{false};
+-  bool reads_shared_local_{false};
+-};
+-
+ class EvaluateCallInSimpleWrapperExtractor
+     : public StmtFunctor<Optional<Call>(const Stmt &)> {
+ public:
+@@ -271,10 +235,9 @@ TileStmtKind ClassifyStmt(const Stmt &stmt, Target target) {
+         if (auto *copy = tile_op.as<CopyNode>()) {
+           return ClassifyCopy(copy, target);
+         }
+-        // Im2Col lowers to tma_load_im2col on Hopper — treat as TMA
+-        // producer so it goes to the producer warp group.
++        // The selected implementation owns the completion protocol.
+         if (tile_op.as<Im2ColOpNode>()) {
+-          if (TargetIsHopper(target)) {
++          if (Im2ColUsesTMA(target)) {
+             return TileStmtKind::kTmaProducer;
+           }
+         }
+@@ -292,8 +255,9 @@ TileStmtKind ClassifyStmt(const Stmt &stmt, Target target) {
+       IsPtxWaitGroup(stmt)) {
+     return TileStmtKind::kCpAsyncRaw;
+   }
+-  // Non-tile-op: check for SIMT global-to-shared copy.
+-  if (SimtProducerDetector::Detect(stmt)) {
++  // Producer placement is an effect property, not an async capability.
++  // Arithmetic/casts can execute on producer warps using synchronous stores.
++  if (AnalyzeTransfers(stmt, target).IsSimtProducer()) {
+     return TileStmtKind::kSimtProducer;
+   }
+   return TileStmtKind::kConsumer;
+diff --git a/src/cuda/transform/ws_analysis.h b/src/cuda/transform/ws_analysis.h
+index 51588ffaed..20c9ebd367 100644
+--- a/src/cuda/transform/ws_analysis.h
++++ b/src/cuda/transform/ws_analysis.h
+@@ -34,7 +34,7 @@ enum class TileStmtKind {
+   kTmaProducer,     // TMA load (global->shared tile-op copy)
+   kCpAsyncProducer, // tile-op copy selecting cp.async
+   kCpAsyncRaw,      // raw ptx_cp_async / commit_group / wait_group statement
+-  kSimtProducer, // Non-tile-op SIMT copy: For loop writing shared from global
++  kSimtProducer, // SIMT producer role; may lower to async copy or sync compute
+   kTmaStore,     // TMA bulk store (shared->global tile-op copy)
+   kTcgen05Mma,   // tcgen05 GEMM accumulating in tensor memory
+   kConsumer,     // Everything else (compute, wgmma, plain copies)
+diff --git a/src/op/copy.cc b/src/op/copy.cc
+index e679f73567..19f8f2f0d6 100644
+--- a/src/op/copy.cc
++++ b/src/op/copy.cc
+@@ -173,13 +173,15 @@ const Im2ColImpl &ResolveIm2ColImpl(Target target) {
+ 
+ Stmt LowerIm2ColForTarget(const Im2ColOpNode &op, const LowerArgs &lower_args,
+                           arith::Analyzer *analyzer) {
+-  return ResolveIm2ColImpl(lower_args.target).lower(op, lower_args, analyzer);
++  const auto &impl = ResolveIm2ColImpl(lower_args.target);
++  ICHECK(impl.lower)
++      << "SIMT im2col must be logically lowered before scheduling";
++  return impl.lower(op, lower_args, analyzer);
+ }
+ 
+ bool MatchAnyIm2ColTarget(Target /*target*/) { return true; }
+ 
+-Stmt LowerIm2ColSIMT(const Im2ColOpNode &op, const LowerArgs &lower_args,
+-                     arith::Analyzer *analyzer) {
++Stmt LowerIm2ColLogical(const Im2ColOpNode &op, arith::Analyzer *analyzer) {
+   const Buffer &src = op.src_;
+   const Buffer &dst = op.dst_;
+   const BufferRegion &dst_region = op.dstRegion_;
+@@ -197,9 +199,10 @@ Stmt LowerIm2ColSIMT(const Im2ColOpNode &op, const LowerArgs &lower_args,
+   analyzer->Bind(i, Range::FromMinExtent(make_zero(i.dtype()), block_m));
+   analyzer->Bind(j, Range::FromMinExtent(make_zero(j.dtype()), block_k));
+ 
+-  PrimExpr h_dim = src->shape[1];
+-  PrimExpr w_dim = src->shape[2];
+-  PrimExpr c_dim = src->shape[3];
++  const auto &source = op.srcRegion_->region;
++  PrimExpr h_dim = source[1]->extent;
++  PrimExpr w_dim = source[2]->extent;
++  PrimExpr c_dim = source[3]->extent;
+   PrimExpr out_h =
+       FloorDiv(h_dim + 2 * op.padding_ - (op.kernel_ - 1) * op.dilation_ - 1,
+                op.stride_) +
+@@ -219,12 +222,18 @@ Stmt LowerIm2ColSIMT(const Im2ColOpNode &op, const LowerArgs &lower_args,
+                       FloorMod(FloorDiv(k, c_dim), op.kernel_) * op.dilation_ -
+                       op.padding_;
+ 
+-  PrimExpr in_bound = And(And(access_h >= make_zero(access_h.dtype()),
+-                              access_w >= make_zero(access_w.dtype())),
+-                          And(access_h < h_dim, access_w < w_dim));
+-
++  PrimExpr batch = FloorDiv(m, out_hw);
++  // Only coordinate arithmetic is eager; the load itself remains lazy.
++  PrimExpr in_bound = const_true();
++  for (const PrimExpr &condition :
++       Array<PrimExpr>{m >= 0, batch < source[0]->extent, k >= 0,
++                       k < op.kernel_ * op.kernel_ * c_dim, access_h >= 0,
++                       access_h < h_dim, access_w >= 0, access_w < w_dim}) {
++    in_bound = bitwise_and(in_bound, condition);
++  }
+   PrimExpr value = BufferLoad(
+-      src, {FloorDiv(m, out_hw), access_h, access_w, FloorMod(k, c_dim)});
++      src, {source[0]->min + batch, source[1]->min + access_h,
++            source[2]->min + access_w, source[3]->min + FloorMod(k, c_dim)});
+   value = if_then_else(in_bound, value, make_zero(dst->dtype));
+ 
+   Array<PrimExpr> dst_indices;
+@@ -242,26 +251,12 @@ Stmt LowerIm2ColSIMT(const Im2ColOpNode &op, const LowerArgs &lower_args,
+ 
+   Stmt body = BufferStore(dst, value, dst_indices);
+   body = For(j, make_zero(j.dtype()), block_k, ForKind::kParallel, body);
+-  body = For(i, make_zero(i.dtype()), block_m, ForKind::kParallel, body);
+-
+-  auto fused_loop = Downcast<For>(ParallelLoopFuser::Fuse(Downcast<For>(body)));
+-  auto par_op = ParallelOp(fused_loop);
+-  std::vector<InferLevel> levels = {InferLevel::kCommon, InferLevel::kStrict,
+-                                    InferLevel::kFree};
+-  for (auto level : levels) {
+-    par_op->InferLayout({lower_args.target,
+-                         lower_args.thread_bounds,
+-                         lower_args.layout_map,
+-                         analyzer,
+-                         lower_args.buffer_remap,
+-                         {}},
+-                        level);
++  Map<String, Any> annotations;
++  for (const auto &[key, value] : op.annotations_) {
++    annotations.Set(key, value);
+   }
+-  auto loop_layout = par_op->GetLoopLayout();
+-  return LowerParallelLoop(
+-      par_op->GetRoot(), loop_layout, lower_args.thread_index, analyzer,
+-      lower_args.layout_map, par_op->GetPredicate(lower_args.thread_index),
+-      /*parallel_loop=*/true, par_op->LoopLayoutRequiresPaddingGuard());
++  return For(i, make_zero(i.dtype()), block_m, ForKind::kParallel, body,
++             std::nullopt, annotations);
+ }
+ 
+ bool RegisterDefaultIm2Col() {
+@@ -269,7 +264,8 @@ bool RegisterDefaultIm2Col() {
+       "default.Im2Col",
+       MatchAnyIm2ColTarget,
+       0,
+-      LowerIm2ColSIMT,
++      nullptr,
++      LowerIm2ColLogical,
+   });
+   return true;
+ }
+@@ -278,6 +274,17 @@ const bool default_im2col_registered = RegisterDefaultIm2Col();
+ 
+ } // namespace
+ 
++bool Im2ColUsesTMA(Target target) { return ResolveIm2ColImpl(target).is_tma; }
++
++Optional<Stmt> Im2ColOpNode::LowerLogical(Target target,
++                                          arith::Analyzer *analyzer) const {
++  auto expand = ResolveIm2ColImpl(target).lower_logical;
++  if (expand) {
++    return expand(*this, analyzer);
++  }
++  return std::nullopt;
++}
++
+ void RegisterCopyImpl(CopyImpl impl) {
+   ICHECK(impl.name != nullptr);
+   ICHECK(impl.match_target != nullptr);
+@@ -289,7 +296,7 @@ void RegisterCopyImpl(CopyImpl impl) {
+ void RegisterIm2ColImpl(Im2ColImpl impl) {
+   ICHECK(impl.name != nullptr);
+   ICHECK(impl.match_target != nullptr);
+-  ICHECK(impl.lower != nullptr);
++  ICHECK((impl.lower != nullptr) != (impl.lower_logical != nullptr));
+   Im2ColImplRegistry().push_back(impl);
+ }
+ 
+diff --git a/src/op/copy.h b/src/op/copy.h
+index 9feb09b798..2548414d7a 100644
+--- a/src/op/copy.h
++++ b/src/op/copy.h
+@@ -175,6 +175,8 @@ class Copy : public TileOperator {
+  */
+ class Im2ColOpNode : public TileOperatorNode {
+ public:
++  Optional<Stmt> LowerLogical(Target target,
++                              arith::Analyzer *analyzer) const override;
+   BufferRegion srcRegion_, dstRegion_;
+   Buffer src_,
+       dst_;      // Source (input feature map) and destination (im2col matrix)
+@@ -228,12 +230,20 @@ struct Im2ColImpl {
+   CopyTargetPredicate match_target;
+   int priority;
+ 
++  // Exactly one lowering entry is provided: logical SIMT expansion or
++  // physical device instructions. Scheduling queries the selected protocol.
+   Stmt (*lower)(const Im2ColOpNode &op, const LowerArgs &lower_args,
+                 arith::Analyzer *analyzer);
++  Stmt (*lower_logical)(const Im2ColOpNode &op,
++                        arith::Analyzer *analyzer) = nullptr;
++  bool is_tma = false;
+ };
+ 
+ void RegisterIm2ColImpl(Im2ColImpl impl);
+ 
++// Query the selected implementation rather than assuming an architecture range.
++bool Im2ColUsesTMA(Target target);
++
+ class Im2ColOp : public TileOperator {
+ public:
+   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(Im2ColOp, TileOperator,
+diff --git a/src/op/operator.h b/src/op/operator.h
+index aed41be715..8d686ba27c 100644
+--- a/src/op/operator.h
++++ b/src/op/operator.h
+@@ -182,6 +182,16 @@ class TileOperator;
+ 
+ class TileOperatorNode : public ffi::Object {
+ public:
++  /*! \brief Expand a composite op into logical TIR before scheduling/layout.
++   * Return nullopt for implementations that require physical lowering.
++   * The result must retain one schedulable statement and must not assign
++   * threads, physical layouts, or asynchronous completion protocols.
++   */
++  virtual ffi::Optional<tirx::Stmt>
++  LowerLogical(Target target, arith::Analyzer *analyzer) const {
++    return std::nullopt;
++  }
++
+   virtual tirx::Stmt Lower(const LowerArgs &lower_args,
+                            arith::Analyzer *analyzer) const = 0;
+ 
+diff --git a/src/rocm/transform/async_copy_injector.cc b/src/rocm/transform/async_copy_injector.cc
+index 881715e4e1..c5a564ea9b 100644
+--- a/src/rocm/transform/async_copy_injector.cc
++++ b/src/rocm/transform/async_copy_injector.cc
+@@ -21,6 +21,7 @@
+ #include "rocm/op/builtin.h"
+ #include "rocm/transform/async_copy_injector.h"
+ #include "tir/ir/buffer_common.h"
++#include "transform/common/transfer_analysis.h"
+ 
+ namespace tvm {
+ namespace tl {
+@@ -250,12 +251,11 @@ class ROCmAsyncCopyInjector : public StmtMutator {
+       return StmtMutator::VisitStmt_(store);
+     }
+ 
+-    Optional<PrimExpr> predicate = std::nullopt;
+-    const BufferLoadNode *load =
+-        MatchZeroFillBufferLoad(store->value, &predicate);
+-    if (load) {
++    auto transfer = AnalyzeTransferValue(store->value);
++    if (transfer && !transfer->converts_value) {
++      const auto &predicate = transfer->zero_fill_predicate;
+       Optional<Stmt> injected = TryInjectROCmAsyncCopy(
+-          load, store, predicate.defined(),
++          transfer->source.get(), store, predicate.defined(),
+           predicate.defined() ? predicate.value() : PrimExpr());
+       if (injected.defined()) {
+         injected_rocm_async_copy_ = true;
+@@ -295,45 +295,6 @@ class ROCmAsyncCopyInjector : public StmtMutator {
+   };
+ 
+   // ---- Copy candidate analysis helpers ----
+-  static bool IsZeroValue(const PrimExpr &expr) {
+-    if (const auto *broadcast = expr.as<BroadcastNode>()) {
+-      return IsZeroValue(broadcast->value);
+-    }
+-    if (const auto *float_imm = expr.as<FloatImmNode>()) {
+-      return float_imm->value == 0.0f;
+-    }
+-    if (const auto *int_imm = expr.as<IntImmNode>()) {
+-      return int_imm->value == 0;
+-    }
+-    return false;
+-  }
+-
+-  static const BufferLoadNode *
+-  MatchZeroFillBufferLoad(const PrimExpr &value,
+-                          Optional<PrimExpr> *predicate) {
+-    if (const auto *load = value.as<BufferLoadNode>()) {
+-      return load;
+-    }
+-
+-    const auto *call = value.as<CallNode>();
+-    if (!call || !call->op.same_as(builtin::if_then_else()) ||
+-        !IsZeroValue(call->args[2])) {
+-      return nullptr;
+-    }
+-
+-    const BufferLoadNode *load =
+-        MatchZeroFillBufferLoad(call->args[1], predicate);
+-    if (load == nullptr) {
+-      return nullptr;
+-    }
+-
+-    *predicate =
+-        predicate->defined()
+-            ? Optional<PrimExpr>(And(call->args[0], predicate->value()))
+-            : Optional<PrimExpr>(call->args[0]);
+-    return load;
+-  }
+-
+   static Optional<PrimExpr>
+   FlattenToLinearOffset(const Buffer &buf, const Array<PrimExpr> &indices) {
+     // Convert N-D indices (potentially with axis_separators) into a single
+diff --git a/src/transform/common/pipeline_utils.h b/src/transform/common/pipeline_utils.h
+index b65c5fc262..a74e07e4f9 100644
+--- a/src/transform/common/pipeline_utils.h
++++ b/src/transform/common/pipeline_utils.h
+@@ -29,7 +29,12 @@ using namespace tirx;
+ /*! Per-statement TMA copy flag (1 = TMA eligible, 0 = not). */
+ static constexpr const char *kPipelineTmaCopies =
+     "software_pipeline_tma_copies";
+-/*! Per-statement async producer flag (1 = async copy producer, 0 = not). */
++/*! Per-statement async completion-region candidate.
++ * Planning establishes transfer semantics; physical lowering still selects the
++ * instruction and may retain synchronous stores. Commit-group numbering is
++ * preserved even for empty groups, and shared-memory visibility is handled by
++ * the ordinary synchronization passes. This flag does not assign a stage.
++ */
+ static constexpr const char *kPipelineAsyncProducers =
+     "software_pipeline_async_producers";
+ /*! Per-statement async producer group id (-1 = not an async producer). */
+diff --git a/src/transform/common/transfer_analysis.cc b/src/transform/common/transfer_analysis.cc
+new file mode 100644
+index 0000000000..1499d73efc
+--- /dev/null
++++ b/src/transform/common/transfer_analysis.cc
+@@ -0,0 +1,177 @@
++#include "transfer_analysis.h"
++
++#include <cmath>
++#include <tvm/tirx/builtin.h>
++#include <tvm/tirx/op.h>
++#include <tvm/tirx/op_attr_types.h>
++#include <tvm/tirx/stmt_functor.h>
++#include <utility>
++
++#include "op/copy.h"
++#include "op/operator.h"
++#include "op/parallel.h"
++#include "op/utils.h"
++
++namespace tvm {
++namespace tl {
++namespace {
++
++using namespace tirx;
++
++bool IsZeroFill(const PrimExpr &expr) {
++  if (const auto *broadcast = expr.as<BroadcastNode>()) {
++    return IsZeroFill(broadcast->value);
++  }
++  if (const auto *value = expr.as<FloatImmNode>()) {
++    // Hardware zero fill produces +0, not the distinct bit pattern of -0.
++    return value->value == 0.0 && !std::signbit(value->value);
++  }
++  if (const auto *value = expr.as<IntImmNode>()) {
++    return value->value == 0;
++  }
++  return false;
++}
++
++bool IsGlobalLike(const Buffer &buffer) {
++  return IsGlobalBuffer(buffer) || buffer.scope().empty();
++}
++
++class TransferAnalyzer : public StmtExprVisitor {
++public:
++  static TransferSummary Analyze(const Stmt &stmt, const Target &target) {
++    TransferAnalyzer analyzer(target);
++    analyzer(stmt);
++    return analyzer.summary_;
++  }
++
++private:
++  explicit TransferAnalyzer(Target target) : target_(std::move(target)) {}
++
++  void RecordTransfer(const Buffer &src, const Buffer &dst,
++                      bool converts_value) {
++    summary_.byte_preserving &= !converts_value;
++    summary_.has_global_to_shared |= IsGlobalLike(src) && IsSharedBuffer(dst);
++    summary_.only_transfers &=
++        IsGlobalLike(src) &&
++        (IsSharedBuffer(dst) || IsLocalBuffer(dst, /*allow_var=*/true));
++  }
++
++  void RecordRead(const Buffer &buffer) {
++    summary_.reads_global |= IsGlobalLike(buffer);
++    summary_.reads_shared_or_local |=
++        IsSharedBuffer(buffer) || IsLocalBuffer(buffer, /*allow_var=*/true);
++  }
++
++  void RecordWrite(const Buffer &buffer) {
++    summary_.writes_shared |= IsSharedBuffer(buffer);
++    summary_.writes_other |= !IsSharedBuffer(buffer);
++  }
++
++  void VisitStmt_(const BufferStoreNode *op) final {
++    RecordWrite(op->buffer);
++    auto value = AnalyzeTransferValue(op->value);
++    if (value) {
++      RecordTransfer(value->source->buffer, op->buffer, value->converts_value);
++    } else {
++      summary_.only_transfers = false;
++    }
++    // Include address and predicate dependencies, not just the loaded value.
++    StmtExprVisitor::VisitStmt_(op);
++  }
++
++  void VisitExpr_(const BufferLoadNode *op) final {
++    RecordRead(op->buffer);
++    StmtExprVisitor::VisitExpr_(op);
++  }
++
++  void VisitStmt_(const IfThenElseNode *op) final {
++    summary_.execution_guard = true;
++    StmtExprVisitor::VisitStmt_(op);
++  }
++
++  void VisitStmt_(const SBlockRealizeNode *op) final {
++    summary_.execution_guard |= !is_one(op->predicate);
++    StmtExprVisitor::VisitStmt_(op);
++  }
++
++  void VisitExpr_(const CallNode *op) final {
++    if (auto tile_op = ParseOperator(ffi::GetRef<Call>(op));
++        tile_op.defined()) {
++      if (const auto *parallel = tile_op.as<ParallelOpNode>()) {
++        VisitStmt(parallel->GetRoot());
++        return;
++      }
++      AccessRegions access = tile_op->GetAccessRegions();
++      for (const auto &region : access.reads) {
++        RecordRead(region->buffer);
++      }
++      for (const auto &region : access.writes) {
++        RecordWrite(region->buffer);
++      }
++      if (const auto *copy = tile_op.as<CopyNode>()) {
++        RecordTransfer(copy->src, copy->dst,
++                       copy->src->dtype != copy->dst->dtype);
++      } else if (const auto *im2col = tile_op.as<Im2ColOpNode>();
++                 im2col && Im2ColUsesTMA(target_)) {
++        RecordTransfer(im2col->src_, im2col->dst_, false);
++        summary_.tma = true;
++      } else {
++        summary_.only_transfers = false;
++        summary_.opaque_effect = true;
++      }
++      return;
++    }
++    // Inspect the call's own effect, not SideEffect(call), which would fold
++    // ordinary BufferLoad arguments into it. Unknown read-state calls also
++    // have dependencies that this transfer summary cannot resolve.
++    static auto effects = Op::GetAttrMap<TCallEffectKind>("TCallEffectKind");
++    auto callee = op->op.as<Op>();
++    summary_.opaque_effect |= !callee || !effects.count(callee.value()) ||
++                              effects[callee.value()]->value >
++                                  static_cast<int>(CallEffectKind::kPure);
++    StmtExprVisitor::VisitExpr_(op);
++  }
++
++  Target target_;
++  TransferSummary summary_;
++};
++
++} // namespace
++
++std::optional<TransferValue> AnalyzeTransferValue(const PrimExpr &value) {
++  using namespace tirx;
++  if (const auto *load = value.as<BufferLoadNode>()) {
++    // A masked BufferLoad has a separate contract; do not invent zero fill.
++    if (load->predicate.defined()) {
++      return std::nullopt;
++    }
++    return TransferValue{ffi::GetRef<BufferLoad>(load), std::nullopt, false};
++  }
++  if (const auto *cast = value.as<CastNode>()) {
++    auto transfer = AnalyzeTransferValue(cast->value);
++    if (transfer) {
++      transfer->converts_value |= cast->dtype != cast->value.dtype();
++    }
++    return transfer;
++  }
++  const auto *call = value.as<CallNode>();
++  if (!call || !call->op.same_as(builtin::if_then_else()) ||
++      !IsZeroFill(call->args[2])) {
++    return std::nullopt;
++  }
++  auto transfer = AnalyzeTransferValue(call->args[1]);
++  if (transfer) {
++    transfer->zero_fill_predicate =
++        transfer->zero_fill_predicate.defined()
++            ? And(call->args[0], transfer->zero_fill_predicate.value())
++            : call->args[0];
++  }
++  return transfer;
++}
++
++TransferSummary AnalyzeTransfers(const tirx::Stmt &stmt, const Target &target) {
++  return TransferAnalyzer::Analyze(stmt, target);
++}
++
++} // namespace tl
++} // namespace tvm
+diff --git a/src/transform/common/transfer_analysis.h b/src/transform/common/transfer_analysis.h
+new file mode 100644
+index 0000000000..8e49a38dff
+--- /dev/null
++++ b/src/transform/common/transfer_analysis.h
+@@ -0,0 +1,62 @@
++/*!
++ * \file transfer_analysis.h
++ * \brief Transfer semantics shared by scheduling and instruction selection.
++ */
++#ifndef TVM_TL_TRANSFORM_COMMON_TRANSFER_ANALYSIS_H_
++#define TVM_TL_TRANSFORM_COMMON_TRANSFER_ANALYSIS_H_
++
++#include <optional>
++#include <tvm/target/target.h>
++#include <tvm/tirx/expr.h>
++#include <tvm/tirx/stmt.h>
++
++namespace tvm {
++namespace tl {
++
++/*! A load, optionally converted and/or zero-filled. This describes values,
++ * not an instruction: vector width, alignment and target support are checked
++ * by the backend after layout lowering. A data predicate writes zero on its
++ * false path; it is not an execution predicate that skips the destination.
++ */
++struct TransferValue {
++  tirx::BufferLoad source;
++  ffi::Optional<PrimExpr> zero_fill_predicate;
++  bool converts_value = false;
++};
++
++std::optional<TransferValue> AnalyzeTransferValue(const PrimExpr &value);
++
++/*! Facts about an entire scheduling unit, without assigning it a stage.
++ *
++ * A producer can compute values without being a transfer. A transfer can be
++ * an async candidate without being profitable to prefetch. Neither property
++ * promises that an async instruction will survive physical lowering.
++ */
++struct TransferSummary {
++  bool reads_global = false;
++  bool writes_shared = false;
++  bool reads_shared_or_local = false;
++  bool writes_other = false;
++  bool has_global_to_shared = false;
++  bool only_transfers = true;
++  bool byte_preserving = true;
++  bool execution_guard = false;
++  bool opaque_effect = false;
++  bool tma = false;
++
++  bool IsSimtProducer() const {
++    return reads_global && writes_shared && !reads_shared_or_local &&
++           !writes_other && !opaque_effect;
++  }
++  bool IsAsyncCandidate() const {
++    return IsSimtProducer() && has_global_to_shared && only_transfers &&
++           byte_preserving && !execution_guard && !tma;
++  }
++};
++
++TransferSummary AnalyzeTransfers(const tirx::Stmt &stmt, const Target &target);
++
++} // namespace tl
++} // namespace tvm
++
++#endif // TVM_TL_TRANSFORM_COMMON_TRANSFER_ANALYSIS_H_
+diff --git a/src/transform/inject_pipeline.cc b/src/transform/inject_pipeline.cc
+index 120692f0d2..71b2535b70 100644
+--- a/src/transform/inject_pipeline.cc
++++ b/src/transform/inject_pipeline.cc
+@@ -2573,125 +2573,123 @@ class PipelineRewriter : public StmtExprMutator {
+         continue;
+       }
+ 
+-      int producer_stage_idx = -1;
+-      for (const BufferRegion &read_region : new_stmts[i].reads) {
+-        for (const auto &kv : async_states_) {
+-          if (kv.first <= new_stmts[i].stage &&
+-              kv.second.writes(read_region->buffer)) {
+-            ICHECK(producer_stage_idx == -1 || producer_stage_idx == kv.first)
+-                << "A dependency on multiple async stages is not supported";
+-            producer_stage_idx = kv.first;
+-          }
++      // A consumer depends on completion of every producer, independently of
++      // the stage chosen for each transfer. Queue-local wait counts count only
++      // that producer stage's commits: on a shared hardware queue they remain
++      // conservative (other stages can only add newer commits).
++      for (const auto &[producer_stage_idx, producer_state] : async_states_) {
++        if (producer_stage_idx > new_stmts[i].stage ||
++            std::none_of(new_stmts[i].reads.begin(), new_stmts[i].reads.end(),
++                         [&](const BufferRegion &read) {
++                           return producer_state.writes(read->buffer);
++                         })) {
++          continue;
+         }
+-      }
+ 
+-      if (producer_stage_idx == -1) {
+-        continue;
+-      }
+-
+-      auto &dep_local_state = (*async_states_local)[producer_stage_idx];
+-      int num_commit_group = dep_local_state.commit_groups.size();
+-
+-      if (num_commit_group == 0) {
+-        ICHECK(!dep_local_state.producer_head);
+-        const auto &global_state = async_states_[producer_stage_idx];
+-        PrimExpr tail_start =
+-            analyzer_.Simplify(pipeline_loop_->min + pipeline_loop_->extent -
+-                               PrimExpr(max_stage_));
+-        bool is_tail_consumer =
+-            ana_normalized->CanProve(new_stmts[i].access_index >= tail_start);
+-        if (is_tail_consumer && global_state.commit_group_count > 0) {
+-          int latest_group_id = global_state.commit_group_count - 1;
+-          PrimExpr latest_producer_head = analyzer_.Simplify(
+-              pipeline_loop_->min + pipeline_loop_->extent - PrimExpr(1));
+-          std::vector<bool> need_wait_count(global_state.commit_group_count,
+-                                            true);
+-          bool handled = false;
+-          for (const BufferRegion &read_region : new_stmts[i].reads) {
+-            if (!global_state.writes(read_region->buffer)) {
+-              continue;
+-            }
+-            auto it =
+-                global_state.buffer_to_commit_group.find(read_region->buffer);
+-            if (it == global_state.buffer_to_commit_group.end()) {
+-              handled = false;
+-              break;
++        auto &dep_local_state = (*async_states_local)[producer_stage_idx];
++        int num_commit_group = dep_local_state.commit_groups.size();
++
++        if (num_commit_group == 0) {
++          ICHECK(!dep_local_state.producer_head);
++          const auto &global_state = async_states_[producer_stage_idx];
++          PrimExpr tail_start =
++              analyzer_.Simplify(pipeline_loop_->min + pipeline_loop_->extent -
++                                 PrimExpr(max_stage_));
++          bool is_tail_consumer =
++              ana_normalized->CanProve(new_stmts[i].access_index >= tail_start);
++          if (is_tail_consumer && global_state.commit_group_count > 0) {
++            int latest_group_id = global_state.commit_group_count - 1;
++            PrimExpr latest_producer_head = analyzer_.Simplify(
++                pipeline_loop_->min + pipeline_loop_->extent - PrimExpr(1));
++            std::vector<bool> need_wait_count(global_state.commit_group_count,
++                                              true);
++            bool handled = false;
++            for (const BufferRegion &read_region : new_stmts[i].reads) {
++              if (!global_state.writes(read_region->buffer)) {
++                continue;
++              }
++              auto it =
++                  global_state.buffer_to_commit_group.find(read_region->buffer);
++              if (it == global_state.buffer_to_commit_group.end()) {
++                handled = false;
++                break;
++              }
++              int commit_group_id = it->second;
++              ICHECK_GE(commit_group_id, 0);
++              ICHECK_LT(commit_group_id, global_state.commit_group_count);
++              if (!need_wait_count[commit_group_id]) {
++                continue;
++              }
++              PrimExpr wait_count = analyzer_.Simplify(
++                  (latest_producer_head - new_stmts[i].access_index) *
++                      global_state.commit_group_count +
++                  (latest_group_id - commit_group_id));
++              if (!ana_normalized->CanProve(wait_count >= 0)) {
++                wait_count = PrimExpr(0);
++              }
++              record_pending_wait(&dep_local_state, commit_group_id,
++                                  static_cast<int>(i), wait_count);
++              need_wait_count[commit_group_id] = false;
++              handled = true;
+             }
+-            int commit_group_id = it->second;
+-            ICHECK_GE(commit_group_id, 0);
+-            ICHECK_LT(commit_group_id, global_state.commit_group_count);
+-            if (!need_wait_count[commit_group_id]) {
++            if (handled) {
+               continue;
+             }
+-            PrimExpr wait_count = analyzer_.Simplify(
+-                (latest_producer_head - new_stmts[i].access_index) *
+-                    global_state.commit_group_count +
+-                (latest_group_id - commit_group_id));
+-            if (!ana_normalized->CanProve(wait_count >= 0)) {
+-              wait_count = PrimExpr(0);
+-            }
+-            record_pending_wait(&dep_local_state, commit_group_id,
+-                                static_cast<int>(i), wait_count);
+-            need_wait_count[commit_group_id] = false;
+-            handled = true;
+           }
+-          if (handled) {
+-            continue;
++
++          PrimExpr wait_count = PrimExpr(0);
++          Optional<PrimExpr> producer_head =
++              async_states_[producer_stage_idx].producer_head;
++          if (producer_head &&
++              ana_normalized->CanProve(producer_head.value() >= 0)) {
++            wait_count = analyzer_.Simplify(producer_head.value() -
++                                            new_stmts[i].access_index);
+           }
++          record_pending_wait(&dep_local_state, -1, static_cast<int>(i),
++                              wait_count);
++          continue;
+         }
+ 
+-        PrimExpr wait_count = PrimExpr(0);
+-        Optional<PrimExpr> producer_head =
+-            async_states_[producer_stage_idx].producer_head;
+-        if (producer_head &&
+-            ana_normalized->CanProve(producer_head.value() >= 0)) {
+-          wait_count = analyzer_.Simplify(producer_head.value() -
+-                                          new_stmts[i].access_index);
++        ICHECK(dep_local_state.producer_head);
++        int latest_group_id = -1;
++        Optional<PrimExpr> latest_producer_head;
++        if (auto it = last_committed_group.find(producer_stage_idx);
++            it != last_committed_group.end()) {
++          latest_group_id = it->second;
++          latest_producer_head = dep_local_state.producer_head.value();
++        } else {
++          latest_group_id = num_commit_group - 1;
++          latest_producer_head = dep_local_state.producer_head.value() - 1;
+         }
+-        record_pending_wait(&dep_local_state, -1, static_cast<int>(i),
+-                            wait_count);
+-        continue;
+-      }
+-
+-      ICHECK(dep_local_state.producer_head);
+-      int latest_group_id = -1;
+-      Optional<PrimExpr> latest_producer_head;
+-      if (auto it = last_committed_group.find(producer_stage_idx);
+-          it != last_committed_group.end()) {
+-        latest_group_id = it->second;
+-        latest_producer_head = dep_local_state.producer_head.value();
+-      } else {
+-        latest_group_id = num_commit_group - 1;
+-        latest_producer_head = dep_local_state.producer_head.value() - 1;
+-      }
+ 
+-      std::vector<bool> need_wait_count(num_commit_group, true);
+-      for (const BufferRegion &read_region : new_stmts[i].reads) {
+-        if (!async_states_[producer_stage_idx].writes(read_region->buffer)) {
+-          continue;
+-        }
+-        auto commit_group_id = buffer_to_commit_group.at(read_region->buffer);
+-        ICHECK_GE(commit_group_id, 0);
+-        ICHECK_LT(commit_group_id, num_commit_group);
+-        if (!need_wait_count[commit_group_id]) {
+-          continue;
+-        }
++        std::vector<bool> need_wait_count(num_commit_group, true);
++        for (const BufferRegion &read_region : new_stmts[i].reads) {
++          if (!async_states_[producer_stage_idx].writes(read_region->buffer)) {
++            continue;
++          }
++          auto commit_group_id = buffer_to_commit_group.at(read_region->buffer);
++          ICHECK_GE(commit_group_id, 0);
++          ICHECK_LT(commit_group_id, num_commit_group);
++          if (!need_wait_count[commit_group_id]) {
++            continue;
++          }
+ 
+-        PrimExpr wait_count = PrimExpr(0);
+-        if (latest_producer_head &&
+-            ana_normalized->CanProve(latest_producer_head.value() >= 0)) {
+-          wait_count = analyzer_.Simplify(
+-              (latest_producer_head.value() - new_stmts[i].access_index) *
+-                  num_commit_group +
+-              (latest_group_id - commit_group_id));
+-          if (!ana_normalized->CanProve(wait_count >= 0)) {
+-            wait_count = PrimExpr(0);
++          PrimExpr wait_count = PrimExpr(0);
++          if (latest_producer_head &&
++              ana_normalized->CanProve(latest_producer_head.value() >= 0)) {
++            wait_count = analyzer_.Simplify(
++                (latest_producer_head.value() - new_stmts[i].access_index) *
++                    num_commit_group +
++                (latest_group_id - commit_group_id));
++            if (!ana_normalized->CanProve(wait_count >= 0)) {
++              wait_count = PrimExpr(0);
++            }
+           }
+-        }
+ 
+-        record_pending_wait(&dep_local_state, commit_group_id,
+-                            static_cast<int>(i), wait_count);
+-        need_wait_count[commit_group_id] = false;
++          record_pending_wait(&dep_local_state, commit_group_id,
++                              static_cast<int>(i), wait_count);
++          need_wait_count[commit_group_id] = false;
++        }
+       }
+     }
+   }
+diff --git a/src/transform/lower_tile_op.cc b/src/transform/lower_tile_op.cc
+index f75dba576f..8212592d28 100644
+--- a/src/transform/lower_tile_op.cc
++++ b/src/transform/lower_tile_op.cc
+@@ -1474,11 +1474,43 @@ namespace transform {
+ 
+ using namespace tirx::transform;
+ 
+-tvm::transform::Pass LowerTileOp() {
++// Logical expansion deliberately has no layout/thread state. Composite ops
++// participate in the same scheduling and layout solve as user-written loops.
++class LogicalTileOpLowerer : public arith::IRMutatorWithAnalyzer {
++public:
++  LogicalTileOpLowerer(Target target, arith::Analyzer *analyzer)
++      : arith::IRMutatorWithAnalyzer(analyzer), target_(std::move(target)) {}
++
++private:
++  Stmt VisitStmt_(const EvaluateNode *op) final {
++    auto tile_op = ParseOperator(GetRef<Stmt>(op));
++    if (tile_op.defined()) {
++      if (auto expanded = tile_op->LowerLogical(target_, analyzer_)) {
++        Stmt stmt = expanded.value();
++        StampSubtreeSpans(stmt, op->span);
++        return stmt;
++      }
++    }
++    return arith::IRMutatorWithAnalyzer::VisitStmt_(op);
++  }
++
++  Target target_;
++};
++
++tvm::transform::Pass LowerTileOp(bool logical_only) {
+   auto pass_func = [=](PrimFunc f, const IRModule &m, const PassContext &ctx) {
++    if (logical_only) {
++      arith::Analyzer analyzer;
++      LogicalTileOpLowerer lowerer(
++          f->GetAttr<Target>(tvm::attr::kTarget).value(), &analyzer);
++      f.CopyOnWrite()->body = lowerer(f->body);
++      return f;
++    }
+     return LowerTileOpPass::Substitute(std::move(f));
+   };
+-  return CreatePrimFuncPass(pass_func, 0, "tl.LowerTileOp", {});
++  return CreatePrimFuncPass(
++      pass_func, 0, logical_only ? "tl.LowerTileOpLogical" : "tl.LowerTileOp",
++      {});
+ }
+ 
+ TVM_FFI_STATIC_INIT_BLOCK() {
+diff --git a/src/transform/pipeline_planning.cc b/src/transform/pipeline_planning.cc
+index 484319c833..63b76662ee 100644
+--- a/src/transform/pipeline_planning.cc
++++ b/src/transform/pipeline_planning.cc
+@@ -25,6 +25,7 @@
+ #include "backend/common/target_utils.h"
+ #include "common/bind_utils.h"
+ #include "common/pipeline_utils.h"
++#include "common/transfer_analysis.h"
+ #include "tvm/ir/expr.h"
+ 
+ namespace tvm {
+@@ -35,32 +36,20 @@ using namespace ffi;
+ 
+ class BufferRegionCollector : public StmtExprVisitor {
+ public:
+-  BufferRegionCollector(Map<Var, Buffer> buffer_data_to_buffer, Target target);
++  explicit BufferRegionCollector(Map<Var, Buffer> buffer_data_to_buffer);
+ 
+   Array<BufferRegion> GetReads() const;
+   Array<BufferRegion> GetWrites() const;
+-  bool GetGlobalCopyPattern() const;
+-  bool GetTmaCopyPattern() const;
+-  bool HasNonCopyTileOp() const;
+ 
+ private:
+-  static bool IsGlobalLikeBuffer(const Buffer &buffer);
+-
+   void HandleTileOp(const TileOperator &tile_op);
+   void VisitStmt_(const BufferStoreNode *op) final;
+   void VisitExpr_(const BufferLoadNode *op) final;
+   void VisitExpr_(const CallNode *op) final;
+-  void VisitStmt_(const IfThenElseNode *op) final;
+ 
+   Map<Var, Buffer> buffer_data_to_buffer_;
+-  Target target_;
+   Array<BufferRegion> reads_;
+   Array<BufferRegion> writes_;
+-  bool is_global_read_ = false;
+-  bool is_global_copy_pattern_ = false;
+-  bool is_tma_copy_ = false;
+-  bool has_non_copy_tile_op_ = false;
+-  bool within_condition_expr_ = false;
+ };
+ 
+ /*!
+@@ -84,62 +73,26 @@ bool MayConflict(const Region &region1, const Region &region2) {
+ }
+ 
+ BufferRegionCollector::BufferRegionCollector(
+-    Map<Var, Buffer> buffer_data_to_buffer, Target target)
+-    : buffer_data_to_buffer_(buffer_data_to_buffer), target_(target) {}
++    Map<Var, Buffer> buffer_data_to_buffer)
++    : buffer_data_to_buffer_(std::move(buffer_data_to_buffer)) {}
+ 
+ Array<BufferRegion> BufferRegionCollector::GetReads() const { return reads_; }
+ 
+ Array<BufferRegion> BufferRegionCollector::GetWrites() const { return writes_; }
+ 
+-bool BufferRegionCollector::GetGlobalCopyPattern() const {
+-  return is_global_copy_pattern_;
+-}
+-
+-bool BufferRegionCollector::GetTmaCopyPattern() const { return is_tma_copy_; }
+-
+-bool BufferRegionCollector::HasNonCopyTileOp() const {
+-  return has_non_copy_tile_op_;
+-}
+-
+-bool BufferRegionCollector::IsGlobalLikeBuffer(const Buffer &buffer) {
+-  return IsGlobalBuffer(buffer) || (buffer.defined() && buffer.scope().empty());
+-}
+-
+ void BufferRegionCollector::HandleTileOp(const TileOperator &tile_op) {
+   if (const auto *parallel = tile_op.as<ParallelOpNode>()) {
+-    BufferRegionCollector nested(buffer_data_to_buffer_, target_);
++    BufferRegionCollector nested(buffer_data_to_buffer_);
+     nested(parallel->GetRoot());
+     reads_.insert(reads_.end(), nested.GetReads().begin(),
+                   nested.GetReads().end());
+     writes_.insert(writes_.end(), nested.GetWrites().begin(),
+                    nested.GetWrites().end());
+-    is_global_copy_pattern_ =
+-        is_global_copy_pattern_ || nested.GetGlobalCopyPattern();
+-    is_tma_copy_ = is_tma_copy_ || nested.GetTmaCopyPattern();
+-    has_non_copy_tile_op_ = has_non_copy_tile_op_ || nested.HasNonCopyTileOp();
+     return;
+   }
+   AccessRegions access = tile_op->GetAccessRegions();
+   reads_.insert(reads_.end(), access.reads.begin(), access.reads.end());
+   writes_.insert(writes_.end(), access.writes.begin(), access.writes.end());
+-  if (const auto *copy = tile_op.as<CopyNode>()) {
+-    if (IsGlobalLikeBuffer(copy->src) && IsSharedBuffer(copy->dst)) {
+-      is_global_copy_pattern_ = true;
+-    }
+-  }
+-  // Im2Col always uses TMA on Hopper.
+-  if (const auto *im2col = tile_op.as<Im2ColOpNode>()) {
+-    if (IsGlobalLikeBuffer(im2col->src_) && IsSharedBuffer(im2col->dst_)) {
+-      is_global_copy_pattern_ = true;
+-      if (TargetIsHopper(target_)) {
+-        is_tma_copy_ = true;
+-      }
+-    }
+-    return;
+-  }
+-  if (!tile_op.as<CopyNode>()) {
+-    has_non_copy_tile_op_ = true;
+-  }
+ }
+ 
+ void BufferRegionCollector::VisitStmt_(const BufferStoreNode *op) {
+@@ -153,12 +106,7 @@ void BufferRegionCollector::VisitStmt_(const BufferStoreNode *op) {
+   auto store_region = BufferRegion(store_buffer, region);
+   writes_.push_back(store_region);
+ 
+-  is_global_read_ = false;
+-  this->VisitExpr(op->value);
+-  if (is_global_read_ && IsSharedBuffer(store_buffer)) {
+-    is_global_copy_pattern_ = true;
+-  }
+-  is_global_read_ = false;
++  StmtExprVisitor::VisitStmt_(op);
+ }
+ 
+ void BufferRegionCollector::VisitExpr_(const BufferLoadNode *op) {
+@@ -172,13 +120,7 @@ void BufferRegionCollector::VisitExpr_(const BufferLoadNode *op) {
+   auto load_region = BufferRegion(load_buffer, region);
+   reads_.push_back(load_region);
+ 
+-  if (IsGlobalLikeBuffer(op->buffer) && !within_condition_expr_) {
+-    // skip condition expr of if_then_else node
+-    // shared[i] = T.if_then_else(global[i] < n, register_a[i], register_b[i])
+-    // is not a global read shared[i] = T.if_then_else(global[i] < n,
+-    // global_a[i], global_b[i]) is a global read
+-    is_global_read_ = true;
+-  }
++  StmtExprVisitor::VisitExpr_(op);
+ }
+ 
+ void BufferRegionCollector::VisitExpr_(const CallNode *op) {
+@@ -244,42 +186,21 @@ void BufferRegionCollector::VisitExpr_(const CallNode *op) {
+     for (size_t i = 2; i < op->args.size(); ++i) {
+       this->VisitExpr(op->args[i]);
+     }
+-  } else if (op->op.same_as(builtin::if_then_else())) {
+-    within_condition_expr_ = true;
+-    this->VisitExpr(op->args[0]);
+-    within_condition_expr_ = false;
+-    for (auto i = 1; i < op->args.size(); i++) {
+-      this->VisitExpr(op->args[i]);
+-    }
+   } else {
+     StmtExprVisitor::VisitExpr_(op);
+   }
+ }
+ 
+-void BufferRegionCollector::VisitStmt_(const IfThenElseNode *op) {
+-  within_condition_expr_ = true;
+-  this->VisitExpr(op->condition);
+-  within_condition_expr_ = false;
+-  this->VisitStmt(op->then_case);
+-  if (op->else_case.defined()) {
+-    within_condition_expr_ = true;
+-    this->VisitStmt(op->else_case.value());
+-    within_condition_expr_ = false;
+-  }
+-}
+-
+ class PipelinePlanningBodyAnalyzer {
+ public:
+-  PipelinePlanningBodyAnalyzer(Map<Var, Buffer> buffer_data_to_buffer,
+-                               Target target)
+-      : buffer_data_to_buffer_(std::move(buffer_data_to_buffer)),
+-        target_(std::move(target)) {}
++  explicit PipelinePlanningBodyAnalyzer(Map<Var, Buffer> buffer_data_to_buffer)
++      : buffer_data_to_buffer_(std::move(buffer_data_to_buffer)) {}
+ 
+   std::pair<Array<BufferRegion>, Array<BufferRegion>>
+   CollectStmtAccessRegions(const Stmt &stmt) const {
+     SBlock block(/*iter_vars=*/{}, /*reads=*/{}, /*writes=*/{},
+                  /*name_hint=*/"", /*body*/ stmt);
+-    auto collector = BufferRegionCollector(buffer_data_to_buffer_, target_);
++    auto collector = BufferRegionCollector(buffer_data_to_buffer_);
+     collector(block);
+     return {collector.GetReads(), collector.GetWrites()};
+   }
+@@ -400,7 +321,6 @@ class PipelinePlanningBodyAnalyzer {
+ 
+ private:
+   Map<Var, Buffer> buffer_data_to_buffer_;
+-  Target target_;
+ };
+ 
+ /*! \brief Information about a pipeline stage
+@@ -411,7 +331,7 @@ class PipelinePlanningBodyAnalyzer {
+  * before reordering \param order Current position of this stage in the
+  * pipeline after reordering (-1 if not yet assigned) \param stage Pipeline
+  * stage number this operation belongs to (-1 if not yet assigned) \param
+- * copy_stage Whether this stage is a memory copy operation \param
++ * prefetch_stage Whether policy places this stage early \param
+  * last_use_stmt_index Index of the last statement (in original order) that
+  * uses the results of this stage (-1 if not yet determined). This field is
+  * crucial for pipeline optimization:
+@@ -429,16 +349,18 @@ struct PipelineStageInfo {
+   std::unordered_set<const VarNode *> scalar_uses;
+   int original_stmt_index{};
+   int order = -1, stage = -1;
+-  bool copy_stage = false;
++  // Scheduling preference, independent of async instruction capability.
++  bool prefetch_stage = false;
++  bool async_candidate = false;
+   bool tma_copy = false; // true if this copy stage uses TMA (not cp.async)
+-  bool conditional_execution = false;
+   bool producer_for_copy = false;
++  bool register_materialization = false;
+   int last_use_stmt_index =
+       -1; // Initialized to -1, indicating no consumers found yet
+ 
+ public:
+-  bool IsFirstStage() const { return copy_stage || producer_for_copy; }
+-  bool IsCopyStage() const { return copy_stage; }
++  bool IsFirstStage() const { return prefetch_stage || producer_for_copy; }
++  bool IsPrefetchStage() const { return prefetch_stage; }
+   bool IsTmaCopy() const { return tma_copy; }
+   bool IsProducerForCopy() const { return producer_for_copy; }
+   bool IsLastUseStmtIndexValid() const { return last_use_stmt_index != -1; }
+@@ -451,6 +373,41 @@ class PipelineStageAnalyzer {
+       : buffer_data_to_buffer_(std::move(buffer_data_to_buffer)),
+         target_(std::move(target)), use_async_copy_(use_async_copy) {}
+ 
++  void SelectPrefetchStages(
++      std::vector<PipelineStageInfo> *pipeline_stage_infos) const {
++    for (auto &producer : *pipeline_stage_infos) {
++      if (!producer.IsPrefetchStage() || producer.async_candidate ||
++          producer.tma_copy) {
++        continue;
++      }
++      // Prefer to materialize a synchronous shared-to-fragment relay at use,
++      // rather than spend shared buffer versions and register live ranges on
++      // advancing its entire load/convert/store operation. True async transfers
++      // and shared operands consumed by computation retain their prefetch
++      // schedule. This is a cost policy, not an async capability check.
++      bool has_consumer = false;
++      bool only_register_materializations = true;
++      for (const auto &consumer : *pipeline_stage_infos) {
++        if (consumer.original_stmt_index == producer.original_stmt_index) {
++          continue;
++        }
++        for (const BufferRegion &read : consumer.reads) {
++          for (const BufferRegion &write : producer.writes) {
++            if (read->buffer.same_as(write->buffer) &&
++                MayConflict(read->region, write->region)) {
++              has_consumer = true;
++              only_register_materializations &=
++                  consumer.register_materialization;
++            }
++          }
++        }
++      }
++      if (has_consumer && only_register_materializations) {
++        producer.prefetch_stage = false;
++      }
++    }
++  }
++
+   class ScalarUseDefCollector : public StmtExprVisitor {
+   public:
+     static std::pair<std::unordered_set<const VarNode *>,
+@@ -474,167 +431,10 @@ class PipelineStageAnalyzer {
+     std::unordered_set<const VarNode *> scalar_uses_;
+   };
+ 
+-  bool MayBeConditionallyExecuted(const Stmt &stmt) const {
+-    bool conditional = false;
+-    PostOrderVisit(stmt, [&](const ObjectRef &node) {
+-      if (conditional) {
+-        return;
+-      }
+-      if (const auto *if_then_else = node.as<IfThenElseNode>()) {
+-        conditional = true;
+-        return;
+-      }
+-      if (const auto *realize = node.as<SBlockRealizeNode>()) {
+-        if (!is_one(realize->predicate)) {
+-          conditional = true;
+-        }
+-      }
+-    });
+-    return conditional;
+-  }
+-
+-  bool IsAsyncProducerCandidate(const PipelineStageInfo &pinfo) const {
+-    if (pinfo.conditional_execution) {
+-      return false;
+-    }
+-    if (pinfo.IsTmaCopy()) {
+-      return false;
+-    }
+-    return pinfo.IsCopyStage();
+-  }
+-
+-  bool IsPureCopyStmt(const Stmt &stmt) const {
+-    auto is_global_like_buffer = [](const Buffer &buffer) {
+-      return IsGlobalBuffer(buffer) ||
+-             (buffer.defined() && buffer.scope().empty());
+-    };
+-    auto is_pure_raw_copy_value = [&](const PrimExpr &expr,
+-                                      const auto &self) -> bool {
+-      if (const auto *load = expr.as<BufferLoadNode>()) {
+-        return is_global_like_buffer(load->buffer);
+-      }
+-      if (const auto *cast = expr.as<CastNode>()) {
+-        return self(cast->value, self);
+-      }
+-      return false;
+-    };
+-
+-    bool saw_copy = false;
+-    bool saw_non_copy_tile_op = false;
+-    bool saw_non_copy_buffer_store = false;
+-    PostOrderVisit(stmt, [&](const ObjectRef &node) {
+-      if (saw_non_copy_tile_op || saw_non_copy_buffer_store) {
+-        return;
+-      }
+-      if (const auto *store = node.as<BufferStoreNode>()) {
+-        saw_copy = true;
+-        if ((!IsSharedBuffer(store->buffer) &&
+-             !IsLocalBuffer(store->buffer, /*allow_var=*/true)) ||
+-            !is_pure_raw_copy_value(store->value, is_pure_raw_copy_value)) {
+-          saw_non_copy_buffer_store = true;
+-        }
+-        return;
+-      }
+-      const auto *call = node.as<CallNode>();
+-      if (call == nullptr) {
+-        return;
+-      }
+-      auto tile_op = ParseOperator(GetRef<Call>(call));
+-      if (!tile_op.defined()) {
+-        return;
+-      }
+-      if (const auto *parallel = tile_op.as<ParallelOpNode>()) {
+-        if (IsPureCopyStmt(parallel->GetRoot())) {
+-          saw_copy = true;
+-        } else {
+-          saw_non_copy_tile_op = true;
+-        }
+-        return;
+-      }
+-      if (tile_op.as<CopyNode>() || tile_op.as<Im2ColOpNode>()) {
+-        saw_copy = true;
+-      } else {
+-        saw_non_copy_tile_op = true;
+-      }
+-    });
+-    return saw_copy && !saw_non_copy_tile_op && !saw_non_copy_buffer_store;
+-  }
+-
+-  Optional<TileOperator> GetSinglePureCopyTileOp(const Stmt &stmt) const {
+-    Optional<TileOperator> copy_tile_op;
+-    bool saw_non_copy_tile_op = false;
+-    bool saw_multiple_copy_ops = false;
+-    PostOrderVisit(stmt, [&](const ObjectRef &node) {
+-      if (saw_non_copy_tile_op || saw_multiple_copy_ops) {
+-        return;
+-      }
+-      const auto *call = node.as<CallNode>();
+-      if (call == nullptr) {
+-        return;
+-      }
+-      auto tile_op = ParseOperator(GetRef<Call>(call));
+-      if (!tile_op.defined()) {
+-        return;
+-      }
+-      if (tile_op.as<CopyNode>() || tile_op.as<Im2ColOpNode>()) {
+-        if (copy_tile_op.defined()) {
+-          saw_multiple_copy_ops = true;
+-          copy_tile_op = Optional<TileOperator>();
+-        } else {
+-          copy_tile_op = tile_op;
+-        }
+-      } else {
+-        saw_non_copy_tile_op = true;
+-        copy_tile_op = Optional<TileOperator>();
+-      }
+-    });
+-    if (saw_non_copy_tile_op || saw_multiple_copy_ops) {
+-      return Optional<TileOperator>();
+-    }
+-    return copy_tile_op;
+-  }
+-
+-  static bool IsGlobalLikeBuffer(const Buffer &buffer) {
+-    return IsGlobalBuffer(buffer) ||
+-           (buffer.defined() && buffer.scope().empty());
+-  }
+-
+-  void ClassifyCopyLikeStage(const Stmt &stmt, PipelineStageInfo *pinfo) const {
+-    ICHECK(pinfo != nullptr);
+-    if (pinfo->conditional_execution) {
+-      return;
+-    }
+-
+-    if (pinfo->copy_stage) {
+-      return;
+-    }
+-
+-    auto copy_tile_op = GetSinglePureCopyTileOp(stmt);
+-    if (!copy_tile_op.defined()) {
+-      return;
+-    }
+-
+-    if (const auto *copy = copy_tile_op.value().as<CopyNode>()) {
+-      if (!IsGlobalLikeBuffer(copy->src) || !IsSharedBuffer(copy->dst)) {
+-        return;
+-      }
+-      pinfo->copy_stage = true;
+-      return;
+-    }
+-
+-    if (const auto *im2col = copy_tile_op.value().as<Im2ColOpNode>()) {
+-      if (!IsGlobalLikeBuffer(im2col->src_) || !IsSharedBuffer(im2col->dst_)) {
+-        return;
+-      }
+-      pinfo->copy_stage = true;
+-      pinfo->tma_copy = TargetIsHopper(target_);
+-    }
+-  }
+-
+   void AnalyzeCopyLastUse(
+       std::vector<PipelineStageInfo> *pipeline_stage_infos) const {
+     for (auto &pinfo : *pipeline_stage_infos) {
+-      if (!pinfo.IsFirstStage()) {
++      if (!pinfo.IsFirstStage() && !pinfo.async_candidate) {
+         continue;
+       }
+ 
+@@ -650,7 +450,7 @@ class PipelineStageAnalyzer {
+           }
+         }
+ 
+-        if (!pinfo.IsCopyStage()) {
++        if (!pinfo.IsPrefetchStage()) {
+           continue;
+         }
+ 
+@@ -702,7 +502,7 @@ class PipelineStageAnalyzer {
+     CopyStageDependencyReadsManager copy_stage_dependency_reads_mgr;
+ 
+     for (const auto &pinfo : *pipeline_stage_infos) {
+-      if (pinfo.IsCopyStage()) {
++      if (pinfo.IsPrefetchStage()) {
+         for (const BufferRegion &read : pinfo.reads) {
+           copy_stage_dependency_reads_mgr.AddUnique(read);
+         }
+@@ -713,7 +513,7 @@ class PipelineStageAnalyzer {
+     size_t iter_count = 0;
+ 
+     for (auto &pinfo : *pipeline_stage_infos) {
+-      if (!pinfo.IsCopyStage()) {
++      if (!pinfo.IsPrefetchStage()) {
+         continue;
+       }
+       auto original_copy_stmt_index = pinfo.original_stmt_index;
+@@ -721,7 +521,7 @@ class PipelineStageAnalyzer {
+       while (updated) {
+         updated = false;
+         for (auto &pinfo_inner : *pipeline_stage_infos) {
+-          if (pinfo_inner.IsCopyStage()) {
++          if (pinfo_inner.IsPrefetchStage()) {
+             continue;
+           }
+           if (pinfo_inner.original_stmt_index >= original_copy_stmt_index) {
+@@ -811,7 +611,7 @@ class PipelineStageAnalyzer {
+             continue;
+           }
+           auto &producer = (*pipeline_stage_infos)[it->second];
+-          if (producer.IsCopyStage()) {
++          if (producer.IsPrefetchStage()) {
+             continue;
+           }
+           updated |= update_producer(&producer, consumer.last_use_stmt_index);
+@@ -878,7 +678,7 @@ class PipelineStageAnalyzer {
+     std::map<std::pair<int, int>, int> implicit_group_ids;
+     for (int stmt_idx : stmt_indices_by_order) {
+       const auto &pinfo = pipeline_stage_infos[stmt_idx];
+-      if (!IsAsyncProducerCandidate(pinfo)) {
++      if (!pinfo.async_candidate) {
+         continue;
+       }
+       auto key = std::make_pair(pinfo.stage, pinfo.last_use_stmt_index);
+@@ -925,10 +725,10 @@ class PipelineStageAnalyzer {
+     return true;
+   }
+ 
+-  void MaybeAnnotateLegacyAsyncPipelineLoop(const Array<Stmt> &pipeline_stmts,
+-                                            const Array<Integer> &order_array,
+-                                            const Array<Integer> &stage_array,
+-                                            Map<String, Any> *annotations) {
++  void AnnotateExplicitAsyncPipeline(const Array<Stmt> &pipeline_stmts,
++                                     const Array<Integer> &order_array,
++                                     const Array<Integer> &stage_array,
++                                     Map<String, Any> *annotations) {
+     if (!TargetHasAsyncCopy(target_) || !use_async_copy_) {
+       return;
+     }
+@@ -939,29 +739,11 @@ class PipelineStageAnalyzer {
+     pipeline_stage_infos.reserve(pipeline_stmts.size());
+     for (size_t i = 0; i < pipeline_stmts.size(); ++i) {
+       auto pinfo = MakePipelineStageInfo(pipeline_stmts[i], i);
+-      ClassifyCopyLikeStage(pipeline_stmts[i], &pinfo);
+       pinfo.order = static_cast<int>(order_array[i]->value);
+       pinfo.stage = static_cast<int>(stage_array[i]->value);
+-      if (!pinfo.IsCopyStage() && !pinfo.conditional_execution &&
+-          pinfo.stage == 0) {
+-        bool reads_global = false;
+-        bool writes_shared = false;
+-        for (const BufferRegion &read : pinfo.reads) {
+-          if (IsGlobalLikeBuffer(read->buffer)) {
+-            reads_global = true;
+-            break;
+-          }
+-        }
+-        for (const BufferRegion &write : pinfo.writes) {
+-          if (IsSharedBuffer(write->buffer)) {
+-            writes_shared = true;
+-            break;
+-          }
+-        }
+-        if (reads_global && writes_shared) {
+-          pinfo.copy_stage = true;
+-        }
+-      }
++      // An explicit stage assignment does not change instruction capability.
++      // Reuse the same classification as automatic planning; global reads and
++      // shared writes alone also describe arbitrary synchronous computation.
+       pipeline_stage_infos.push_back(std::move(pinfo));
+     }
+ 
+@@ -973,7 +755,7 @@ class PipelineStageAnalyzer {
+     SBlock block(/*iter_vars=*/{}, /*reads=*/{}, /*writes=*/{},
+                  /*name_hint=*/"",
+                  /*body*/ std::move(stmt));
+-    auto collector = BufferRegionCollector(buffer_data_to_buffer_, target_);
++    auto collector = BufferRegionCollector(buffer_data_to_buffer_);
+     collector(block);
+     PipelineStageInfo pinfo;
+     pinfo.reads = std::move(collector.GetReads());
+@@ -983,13 +765,21 @@ class PipelineStageAnalyzer {
+     pinfo.scalar_defs = std::move(scalar_defs);
+     pinfo.scalar_uses = std::move(scalar_uses);
+     pinfo.original_stmt_index = idx;
+-    pinfo.conditional_execution = MayBeConditionallyExecuted(block->body);
+-    bool pure_copy_stage =
+-        collector.GetGlobalCopyPattern() && IsPureCopyStmt(block->body);
+-    pinfo.copy_stage = pure_copy_stage;
+-    pinfo.tma_copy = pure_copy_stage && !pinfo.conditional_execution &&
+-                     collector.GetTmaCopyPattern();
+-    ClassifyCopyLikeStage(block->body, &pinfo);
++    TransferSummary transfers = AnalyzeTransfers(block->body, target_);
++    // Prefetch transfers, including conversion and zero-fill. This is a
++    // scheduling policy, not an instruction promise: converting loads can
++    // benefit from early placement even though they execute synchronously.
++    pinfo.prefetch_stage = transfers.has_global_to_shared &&
++                           transfers.only_transfers && !transfers.opaque_effect;
++    pinfo.tma_copy =
++        pinfo.prefetch_stage && !transfers.execution_guard && transfers.tma;
++    pinfo.async_candidate = transfers.IsAsyncCandidate();
++    if (auto tile_op = ParseOperator(block->body); tile_op.defined()) {
++      if (const auto *copy = tile_op.as<CopyNode>()) {
++        pinfo.register_materialization =
++            IsSharedBuffer(copy->src) && IsFragmentBuffer(copy->dst);
++      }
++    }
+     return pinfo;
+   }
+ 
+@@ -1042,11 +832,11 @@ class PipelinePlanner : public StmtExprMutator {
+     MakeStageAnalyzer().ValidateScalarDependencies(pipeline_stage_infos);
+   }
+ 
+-  void MaybeAnnotateLegacyAsyncPipelineLoop(const Array<Stmt> &pipeline_stmts,
+-                                            const Array<Integer> &order_array,
+-                                            const Array<Integer> &stage_array,
+-                                            Map<String, Any> *annotations) {
+-    MakeStageAnalyzer().MaybeAnnotateLegacyAsyncPipelineLoop(
++  void AnnotateExplicitAsyncPipeline(const Array<Stmt> &pipeline_stmts,
++                                     const Array<Integer> &order_array,
++                                     const Array<Integer> &stage_array,
++                                     Map<String, Any> *annotations) {
++    MakeStageAnalyzer().AnnotateExplicitAsyncPipeline(
+         pipeline_stmts, order_array, stage_array, annotations);
+   }
+ 
+@@ -1066,7 +856,7 @@ class PipelinePlanner : public StmtExprMutator {
+   using SeqStmtFlattener = PipelinePlanningBodyAnalyzer::SeqStmtFlattener;
+ 
+   PipelinePlanningBodyAnalyzer MakeBodyAnalyzer() const {
+-    return PipelinePlanningBodyAnalyzer(buffer_data_to_buffer_, target_);
++    return PipelinePlanningBodyAnalyzer(buffer_data_to_buffer_);
+   }
+ 
+   ScheduledStmtAnalysis AnalyzeScheduledStmts(const Array<Stmt> &stmts) const {
+@@ -1094,13 +884,6 @@ class PipelinePlanner : public StmtExprMutator {
+           annotations.Set(key, value);
+         }
+       }
+-      if (TargetHasAsyncCopy(target_) && use_async_copy_) {
+-        // Legacy explicit stage/order annotations do not carry per-statement
+-        // async producer metadata yet, so keep the previous stage-level
+-        // behavior as a fallback for these loops.
+-        annotations.Set(s_tir::attr::software_pipeline_async_stages,
+-                        Array<Integer>{0});
+-      }
+       Array<Stmt> pipeline_body_stmts = NormalizePipelineBody(loop->body);
+       Array<Stmt> pipeline_stmts =
+           SeqStmtFlattener::Flatten(pipeline_body_stmts);
+@@ -1133,9 +916,9 @@ class PipelinePlanner : public StmtExprMutator {
+                           analysis.replayable_bind_mask);
+         }
+       }
+-      MaybeAnnotateLegacyAsyncPipelineLoop(analysis.scheduled_stmts,
+-                                           filtered_order_array,
+-                                           filtered_stage_array, &annotations);
++      AnnotateExplicitAsyncPipeline(analysis.scheduled_stmts,
++                                    filtered_order_array, filtered_stage_array,
++                                    &annotations);
+       auto for_node = GetRef<For>(loop);
+       auto *n = for_node.CopyOnWrite();
+       n->annotations = annotations;
+@@ -1188,6 +971,8 @@ class PipelinePlanner : public StmtExprMutator {
+       pipeline_stage_infos.push_back(std::move(pinfo));
+     }
+ 
++    MakeStageAnalyzer().SelectPrefetchStages(&pipeline_stage_infos);
++
+     // Some statements before a copy are not copy operations themselves, but
+     // they prepare buffers that the copy must read.  A common example is
+     // producer-side initialization before a conditional or partial copy:
+@@ -1271,7 +1056,7 @@ class PipelinePlanner : public StmtExprMutator {
+       for (auto &pinfo : pipeline_stage_infos) { // move copy to the beginning
+         pinfo.order =
+             (pinfo.order + copy_stage_at_end) % pipeline_stage_infos.size();
+-        if (!pinfo.IsCopyStage() && !pinfo.IsProducerForCopy())
++        if (!pinfo.IsPrefetchStage() && !pinfo.IsProducerForCopy())
+           pinfo.stage--;
+       }
+     }
+diff --git a/src/transform/thread_storage_sync.cc b/src/transform/thread_storage_sync.cc
+index bd79348c57..23389402ad 100644
+--- a/src/transform/thread_storage_sync.cc
++++ b/src/transform/thread_storage_sync.cc
+@@ -623,8 +623,6 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
+     /*! \brief The buffer variable, if any */
+     Array<PrimExpr> buffer_indices;
+     ConstrSet cset;
+-    /*! \brief The buffer ranges for pointer access */
+-    Array<Range> buffer_ranges;
+     Var buffer = NullValue<Var>();
+     Buffer buffer_name;
+     /*! \brief The access data type */
+@@ -634,6 +632,10 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
+      * Has one IntSet for each index in the buffer being accessed.
+      */
+     Array<arith::IntSet> touched;
++    /*! \brief Physical byte footprint, shared by pointer and indexed accesses.
++     * Undefined when the address cannot be represented as one linear range.
++     */
++    arith::IntSet touched_bytes;
+     /*! \brief The type of access */
+     AccessType type;
+     /*! \brief The storage scope */
+@@ -701,6 +703,63 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
+     }
+     return index + elem_offset;
+   }
++  arith::IntSet ByteFootprint(const Var &buffer_var, DataType dtype,
++                              const arith::IntSet &elements) const {
++    PrimExpr min = elements.min();
++    PrimExpr max = elements.max();
++    // Relaxed data-dependent indices can have symbolic infinity bounds.
++    if ((!min.dtype().is_int() && !min.dtype().is_uint()) ||
++        (!max.dtype().is_int() && !max.dtype().is_uint())) {
++      return {};
++    }
++    DataType index_dtype = DataType::Int(64);
++    PrimExpr element_bits =
++        make_const(index_dtype, dtype.bits() * dtype.lanes());
++    PrimExpr byte_offset = make_zero(index_dtype);
++    auto it = shared_memory_alias_byte_offsets_.find(buffer_var.get());
++    if (it != shared_memory_alias_byte_offsets_.end()) {
++      byte_offset = Cast(index_dtype, it->second);
++    }
++    // Round outwards for packed subbyte elements. Keep alias offsets in bytes:
++    // dividing an unaligned alias offset by the element size loses information.
++    PrimExpr first = floordiv(Cast(index_dtype, min) * element_bits, 8);
++    PrimExpr last =
++        floordiv((Cast(index_dtype, max) + 1) * element_bits + 7, 8) - 1;
++    return arith::IntSet::Interval(first + byte_offset, last + byte_offset);
++  }
++  arith::IntSet ByteFootprint(const Buffer &buffer,
++                              const Array<PrimExpr> &indices) const {
++    Array<PrimExpr> offsets = buffer->ElemOffset(indices);
++    if (offsets.size() != 1) {
++      return {};
++    }
++    return ByteFootprint(buffer->data, buffer->dtype,
++                         arith::IntSet::Vector(offsets[0]));
++  }
++  arith::IntSet PointerByteFootprint(const Var &buffer, DataType dtype,
++                                     const PrimExpr &offset,
++                                     const PrimExpr &declared_extent) const {
++    PrimExpr extent = pointer_access_.extent.value_or(declared_extent);
++    if (pointer_access_.extent_in_bytes) {
++      arith::IntSet start =
++          ByteFootprint(buffer, dtype, arith::IntSet::SinglePoint(offset));
++      if (!start.defined()) {
++        return {};
++      }
++      return arith::IntSet::Interval(
++          start.min(), start.min() + Cast(DataType::Int(64), extent) - 1);
++    }
++    return ByteFootprint(
++        buffer, dtype,
++        arith::IntSet::FromRange(Range::FromMinExtent(offset, extent)));
++  }
++  void VisitPointerArgument(const PrimExpr &pointer, const PrimExpr &extent,
++                            bool extent_in_bytes, int rw_mask) {
++    auto saved = pointer_access_;
++    pointer_access_ = {extent, extent_in_bytes, rw_mask};
++    this->VisitExpr(pointer);
++    pointer_access_ = saved;
++  }
+   void RecordSharedMemoryAlias(const Var &alias_var, const PrimExpr &value) {
+     const auto *call = value.as<CallNode>();
+     if (call == nullptr ||
+@@ -806,7 +865,6 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
+ 
+   void VisitExpr_(const BufferLoadNode *op) final {
+     Var buf = op->buffer->data;
+-    buffer_data_to_buffer_.Set(GetRef<Var>(buf.get()), op->buffer);
+     StorageScope scope = GetScope(buf);
+     if (Enabled(buf.get(), scope)) {
+       ICHECK(allow_append_)
+@@ -816,6 +874,7 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
+       e.buffer = buf;
+       e.buffer_name = op->buffer;
+       e.dtype = op->dtype.element_of();
++      e.touched_bytes = ByteFootprint(op->buffer, op->indices);
+       for (const auto &index : op->indices) {
+         PrimExpr physical_index =
+             AddAliasElemOffset(buf, op->buffer->dtype, index);
+@@ -835,7 +894,6 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
+     curr_stmt_.stmt = op;
+ 
+     Var buf = op->buffer->data;
+-    buffer_data_to_buffer_.Set(GetRef<Var>(buf.get()), op->buffer);
+     StorageScope scope = GetScope(buf);
+     if (Enabled(buf.get(), scope)) {
+       AccessEntry e{.cset = {constr_stack_}};
+@@ -843,6 +901,7 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
+       e.buffer = buf;
+       e.buffer_name = op->buffer;
+       e.dtype = op->value.dtype().element_of();
++      e.touched_bytes = ByteFootprint(op->buffer, op->indices);
+       for (const auto &index : op->indices) {
+         PrimExpr physical_index =
+             AddAliasElemOffset(buf, op->buffer->dtype, index);
+@@ -889,14 +948,6 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
+     auto let_prop = AnalyzeExprProperty(op->value);
+     let_var_properties_[op->var.get()] = let_prop;
+   }
+-  void VisitStmt_(const SBlockNode *op) final {
+-    auto block = Downcast<SBlock>(op);
+-    for (const auto &buffer : block->alloc_buffers) {
+-      ICHECK(buffer->IsInstance<BufferNode>());
+-      buffer_data_to_buffer_.Set(buffer->data, buffer);
+-    }
+-    ConstrVisitor::VisitStmt_(op);
+-  }
+   void VisitStmt_(const AttrStmtNode *op) override {
+     if (op->attr_key == tvm::tl::attr::coproc_scope) {
+       IterVar iv = Downcast<IterVar>(op->node);
+@@ -945,6 +996,9 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
+             new_touched.push_back(arith::EvalSet(touched, relax_map));
+           }
+           e.touched = std::move(new_touched);
++          if (e.touched_bytes.defined()) {
++            e.touched_bytes = arith::EvalSet(e.touched_bytes, relax_map);
++          }
+         }
+       }
+     }
+@@ -1165,13 +1219,35 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
+     }();
+     if (is_cp_async) {
+       cp_async_depth_++;
+-      for (const auto &a : op->args) {
+-        this->VisitExpr(a);
++      // The instruction's count is authoritative, including for explicit IR
++      // whose pointer metadata describes only the base element.
++      bool bytes = op->op.same_as(builtin::ptx_cp_async());
++      VisitPointerArgument(op->args[0], op->args[2], bytes, 2);
++      VisitPointerArgument(op->args[1], op->args[2], bytes, 1);
++      for (size_t i = 2; i < op->args.size(); ++i) {
++        this->VisitExpr(op->args[i]);
+       }
+       cp_async_depth_--;
+       return;
+     }
+ 
++    if (op->op.same_as(tl::ptx_ldmatrix()) ||
++        op->op.same_as(tl::ptx_stmatrix())) {
++      // Each participating lane supplies a 16-byte shared row address, not
++      // the per-thread register fragment's size. x1/x2/x4 changes how many
++      // lanes supply rows, not their width. Including inactive address lanes
++      // gives a superset of the collective instruction's footprint.
++      bool load = op->op.same_as(tl::ptx_ldmatrix());
++      for (size_t i = 0; i < op->args.size(); ++i) {
++        if (i == 2) {
++          VisitPointerArgument(op->args[i], Integer(16), true, load ? 1 : 2);
++        } else {
++          this->VisitExpr(op->args[i]);
++        }
++      }
++      return;
++    }
++
+     // Mark the pointer argument of atomic ops as atomic so the sync planner
+     // doesn't insert barriers between atomics.
+     auto is_atomic_op = [&]() {
+@@ -1192,8 +1268,14 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
+     }();
+     if (is_atomic_op) {
+       if (!op->args.empty()) {
++        int lanes = op->op.same_as(tl::atomic_addx4_elem_op())   ? 4
++                    : op->op.same_as(tl::atomic_addx2_elem_op()) ? 2
++                                                                 : 1;
++        int mask = op->op.same_as(tl::atomic_load_elem_op())    ? 1
++                   : op->op.same_as(tl::atomic_store_elem_op()) ? 2
++                                                                : 3;
+         atomic_dst_ptr_depth_++;
+-        this->VisitExpr(op->args[0]);
++        VisitPointerArgument(op->args[0], Integer(lanes), false, mask);
+         atomic_dst_ptr_depth_--;
+         for (size_t i = 1; i < op->args.size(); ++i) {
+           this->VisitExpr(op->args[i]);
+@@ -1207,19 +1289,7 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
+         Buffer buffer = load->buffer;
+         DataType dtype = buffer->dtype;
+         const VarNode *buffer_var = buffer->data.as<VarNode>();
+-        buffer_data_to_buffer_.Set(GetRef<Var>(buffer_var), buffer);
+         StorageScope scope = GetScope(GetRef<Var>(buffer_var));
+-        Array<Range> buffer_ranges;
+-        // from indices to buffer indices
+-        ICHECK(buffer->shape.size() == load->indices.size());
+-        // Use buffer shape and indices to compute the buffer_ranges for each
+-        // dimension.
+-        for (size_t i = 0; i < buffer->shape.size(); ++i) {
+-          PrimExpr min = AddAliasElemOffset(GetRef<Var>(buffer_var),
+-                                            buffer->dtype, load->indices[i]);
+-          PrimExpr extent = make_const(buffer->shape[i].dtype(), 1);
+-          buffer_ranges.push_back(Range::FromMinExtent(min, extent));
+-        }
+         if (Enabled(buffer_var, scope)) {
+           ICHECK(allow_append_);
+           AccessEntry e{.cset = {constr_stack_}};
+@@ -1227,7 +1297,14 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
+           e.dtype = dtype;
+           e.buffer = Downcast<Var>(buffer->data);
+           e.buffer_name = buffer;
+-          e.buffer_ranges = buffer_ranges;
++          // address_of describes an address, not an access extent. Only an
++          // enclosing instruction with a known footprint can supply one.
++          Array<PrimExpr> offsets = buffer->ElemOffset(load->indices);
++          if (pointer_access_.extent.defined() && offsets.size() == 1) {
++            e.touched_bytes =
++                PointerByteFootprint(buffer->data, dtype, offsets[0],
++                                     pointer_access_.extent.value());
++          }
+           for (const auto &index : load->indices) {
+             PrimExpr physical_index = AddAliasElemOffset(
+                 GetRef<Var>(buffer_var), buffer->dtype, index);
+@@ -1235,9 +1312,17 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
+           }
+           e.is_pointer_access = true;
+           e.is_atomic = (atomic_dst_ptr_depth_ > 0);
+-          e.type = kRead;
+           e.scope = scope;
+-          curr_stmt_.access.emplace_back(e);
++          int mask = pointer_access_.rw_mask ? pointer_access_.rw_mask : 1;
++          if (mask & 1) {
++            e.type = kRead;
++            curr_stmt_.access.emplace_back(e);
++          }
++          if (mask & 2) {
++            e.type = kWrite;
++            e.is_async_copy = (cp_async_depth_ > 0);
++            curr_stmt_.access.emplace_back(e);
++          }
+         }
+         ConstrVisitor::VisitExpr_(load);
+       } else {
+@@ -1255,63 +1340,25 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
+       // The buffer scope.
+       if (Enabled(buffer_var, scope)) {
+         ICHECK(allow_append_);
+-        Array<Range> buffer_ranges;
+-        if (buffer_data_to_buffer_.find(GetRef<Var>(buffer_var)) ==
+-            buffer_data_to_buffer_.end()) {
+-          // cannot find buffer map, use the default buffer
+-          buffer_ranges = {Range::FromMinExtent(offset, extent)};
+-        } else {
+-          Buffer buffer = buffer_data_to_buffer_.at(GetRef<Var>(buffer_var));
+-          auto buffer_shape = buffer->shape;
+-          // convert 1d offset to multi-dimensional index
+-          auto linear_to_indices = [](PrimExpr offset,
+-                                      const Array<PrimExpr> &shape) {
+-            Array<PrimExpr> indices;
+-            DataType index_dtype = offset.dtype();
+-            ICHECK(index_dtype.is_int() || index_dtype.is_uint())
+-                << "Expected integer offset dtype in tvm_access_ptr, but got "
+-                << index_dtype;
+-            PrimExpr remaining = std::move(offset);
+-            for (size_t i = 0; i < shape.size(); ++i) {
+-              PrimExpr stride = make_const(index_dtype, 1);
+-              for (size_t j = i + 1; j < shape.size(); ++j) {
+-                PrimExpr dim = shape[j];
+-                if (dim.dtype() != index_dtype) {
+-                  dim = tirx::Cast(index_dtype, dim);
+-                }
+-                stride = stride * dim;
+-              }
+-              PrimExpr idx = FloorDiv(remaining, stride);
+-              remaining = FloorMod(remaining, stride);
+-              indices.push_back(idx);
+-            }
+-            return indices;
+-          };
+-          Array<PrimExpr> start_indices =
+-              linear_to_indices(offset, buffer_shape);
+-          Array<PrimExpr> end_indices =
+-              linear_to_indices(offset + extent, buffer_shape);
+-          for (size_t i = 0; i < buffer_shape.size(); ++i) {
+-            buffer_ranges.push_back(Range::FromMinExtent(
+-                start_indices[i], end_indices[i] - start_indices[i]));
+-          }
+-        }
+         AccessEntry e{.cset = {constr_stack_}};
+         e.threads = env_threads();
+         e.dtype = dtype;
+         e.buffer = GetRef<Var>(buffer_var);
+-        e.buffer_ranges = buffer_ranges;
+         e.is_pointer_access = true;
+         e.is_atomic = (atomic_dst_ptr_depth_ > 0);
+         e.touched = {
+             arith::IntSet::FromRange(Range::FromMinExtent(offset, extent))};
++        e.touched_bytes =
++            PointerByteFootprint(e.buffer, dtype, op->args[2], extent);
+         e.scope = scope;
+-        if (flag->value & 1) {
++        int mask =
++            pointer_access_.rw_mask ? pointer_access_.rw_mask : flag->value;
++        if (mask & 1) {
+           e.type = kRead;
+           e.is_async_copy = (tma_depth_ > 0 || cp_async_depth_ > 0);
+           curr_stmt_.access.emplace_back(e);
+         }
+-        if (flag->value & 2) {
++        if (mask & 2) {
+           e.type = kWrite;
+           e.is_async_copy = (tma_depth_ > 0 || cp_async_depth_ > 0);
+           curr_stmt_.access.emplace_back(e);
+@@ -1344,10 +1391,6 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
+     }
+   }
+ 
+-  void SetBufferDataToBuffer(const Var &buffer_var, const Buffer &buffer) {
+-    buffer_data_to_buffer_.Set(buffer_var, buffer);
+-  }
+-
+   std::vector<AccessEntry> Summarize(std::vector<StmtEntry> seq,
+                                      const ForNode *loop) {
+     // Redirect all "shared.dyn" buffer access to the same buffer var
+@@ -1562,6 +1605,13 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
+   int tma_depth_{0};
+   // Nesting depth of cp.async calls (ptx_cp_async)
+   int cp_async_depth_{0};
++  // The enclosing instruction owns the actual extent and direction. Pointer
++  // metadata is used only when the caller does not supply that contract.
++  struct PointerAccess {
++    Optional<PrimExpr> extent;
++    bool extent_in_bytes{false};
++    int rw_mask{0};
++  } pointer_access_;
+   // Whether we're visiting the pointer argument expression of an atomic call
+   // (e.g., atomic_add/atomic_max/atomic_load). When > 0, accesses produced by
+   // the pointer metadata ops are tagged as atomic.
+@@ -1574,8 +1624,6 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
+   // current lexical scope.
+   std::unordered_map<const VarNode *, ConditionThreadProperty>
+       let_var_properties_;
+-  // The buffer map
+-  Map<Var, Buffer> buffer_data_to_buffer_;
+   // synchronization scope
+   StorageScope sync_scope_;
+   // warp size from target
+@@ -1586,70 +1634,58 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
+       return;
+     syncs_inserted_.insert(obj);
+   }
+-  bool PointerAccessIsDisjoint(const AccessEntry &lhs, const AccessEntry &rhs) {
+-    if (lhs.touched.size() != 1 || rhs.touched.size() != 1) {
++  bool ByteAccessIsDisjoint(const AccessEntry &lhs, const AccessEntry &rhs,
++                            const Optional<For> &loop) {
++    if (!lhs.touched_bytes.defined() || !rhs.touched_bytes.defined()) {
+       return false;
+     }
+-    ConstrSet prev_cset{lhs.cset};
+-    ConstrSet curr_cset{rhs.cset};
+-    arith::Analyzer analyzer;
+-
+-    struct ThreadVarInfo {
+-      const char *name_prev;
+-      const char *name_curr;
+-    } thread_vars[] = {
+-        {"tx1", "tx2"},
+-        {"ty1", "ty2"},
+-        {"tz1", "tz2"},
+-    };
+-    PrimExpr lhs_min = analyzer.Simplify(lhs.touched[0].min());
+-    PrimExpr lhs_max = analyzer.Simplify(lhs.touched[0].max());
+-    PrimExpr rhs_min = analyzer.Simplify(rhs.touched[0].min());
+-    PrimExpr rhs_max = analyzer.Simplify(rhs.touched[0].max());
+-    // A touched interval relaxed to (half-)unbounded carries TVM's symbolic
+-    // infinity sentinels, which are handle-typed vars: comparing them against
+-    // integer offsets throws a dtype mismatch inside tvm::less. An unbounded
+-    // side can never prove disjointness anyway (e.g. an atomic whose index is
+-    // a data-dependent load), so answer conservatively.
++    PrimExpr lhs_min = lhs.touched_bytes.min();
++    PrimExpr lhs_max = lhs.touched_bytes.max();
++    PrimExpr rhs_min = rhs.touched_bytes.min();
++    PrimExpr rhs_max = rhs.touched_bytes.max();
+     for (const PrimExpr &bound : {lhs_min, lhs_max, rhs_min, rhs_max}) {
+       if (!bound.dtype().is_int() && !bound.dtype().is_uint()) {
+         return false;
+       }
+     }
+-    Map<Var, PrimExpr> prev_sub, curr_sub;
+-    for (unsigned idx = 0; idx != 3; ++idx) {
+-      auto &info = thread_vars[idx];
+-      Var old_prev_var = lhs.threads[lhs.threads.size() + idx - 3]->var;
+-      Var old_curr_var = rhs.threads[rhs.threads.size() + idx - 3]->var;
+-      prev_sub.Set(old_prev_var, Var(info.name_prev, old_prev_var.dtype()));
+-      curr_sub.Set(old_curr_var, Var(info.name_curr, old_curr_var.dtype()));
+-    }
+-    // Two threads here as well, so every per-thread bind needs its own copy;
+-    // sharing one would force the two thread variables to agree. Ranges stay
+-    // shared: an enclosing iteration variable is the same for both sides.
+-    prev_cset = prev_cset.RenameFrom("<PREV>", prev_sub, std::nullopt,
+-                                     /*rename_ranges=*/false);
+-    curr_cset = curr_cset.RenameFrom("<CURR>", curr_sub, std::nullopt,
+-                                     /*rename_ranges=*/false);
+-    lhs_min = Substitute(lhs_min, prev_sub);
+-    lhs_max = Substitute(lhs_max, prev_sub);
+-    rhs_min = Substitute(rhs_min, curr_sub);
+-    rhs_max = Substitute(rhs_max, curr_sub);
+-    // Lower to predicates before merging so that a variable bound to different
+-    // values on the two sides does not trip the analyzer's re-bind check.
+-    prev_cset.ToConstraints()
+-        .Merge(curr_cset.ToConstraints())
+-        .Populate(analyzer);
+-
+-    if (analyzer.CanProve(lhs_max < rhs_min,
+-                          arith::ProofStrength::kSymbolicBound)) {
+-      return true;
++
++    // Model both sides independently. A per-thread bind cannot be shared by
++    // two threads, nor can a mutable index be assumed unchanged across them.
++    Map<Var, PrimExpr> lhs_sub, rhs_sub;
++    for (const IterVar &iv : lhs.threads) {
++      if (runtime::ThreadScope::Create(iv->thread_tag).rank == 1) {
++        lhs_sub.Set(iv->var,
++                    Var(iv->var->name_hint + "<PREV>", iv->var.dtype()));
++      }
+     }
+-    if (analyzer.CanProve(rhs_max < lhs_min,
+-                          arith::ProofStrength::kSymbolicBound)) {
+-      return true;
++    for (const IterVar &iv : rhs.threads) {
++      if (runtime::ThreadScope::Create(iv->thread_tag).rank == 1) {
++        rhs_sub.Set(iv->var,
++                    Var(iv->var->name_hint + "<CURR>", iv->var.dtype()));
++      }
+     }
+-    return false;
++    if (loop.defined()) {
++      const For &next = loop.value();
++      PrimExpr step =
++          next->step.value_or(make_const(next->loop_var.dtype(), 1));
++      rhs_sub.Set(next->loop_var, next->loop_var + step);
++    }
++    ConstrSet lhs_cset = lhs.cset.RenameFrom("<PREV>", lhs_sub, std::nullopt,
++                                             /*rename_ranges=*/false);
++    ConstrSet rhs_cset = rhs.cset.RenameFrom("<CURR>", rhs_sub, std::nullopt,
++                                             /*rename_ranges=*/false);
++    arith::Analyzer analyzer;
++    lhs_cset.ToConstraints().Merge(rhs_cset.ToConstraints()).Populate(analyzer);
++    FreshenMutableReads lhs_fresh(FreshenMutableReads::Mode::kSnapshot);
++    FreshenMutableReads rhs_fresh(FreshenMutableReads::Mode::kSnapshot);
++    lhs_min = lhs_fresh(Substitute(lhs_min, lhs_sub));
++    lhs_max = lhs_fresh(Substitute(lhs_max, lhs_sub));
++    rhs_min = rhs_fresh(Substitute(rhs_min, rhs_sub));
++    rhs_max = rhs_fresh(Substitute(rhs_max, rhs_sub));
++    // Prove the union of both orderings, not a globally fixed ordering: modulo
++    // buffer versions exchange sides on successive iterations.
++    return analyzer.CanProve(Or(lhs_max < rhs_min, rhs_max < lhs_min),
++                             arith::ProofStrength::kSymbolicBound);
+   }
+   void print_access_tentry(const AccessEntry &access,
+                            bool print_constr = false) {
+@@ -1709,15 +1745,8 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
+     }
+     output << "]\n";
+ 
+-    if (!access.buffer_ranges.empty()) {
+-      output << "  Buffer Ranges: [";
+-      for (size_t i = 0; i < access.buffer_ranges.size(); ++i) {
+-        if (i > 0)
+-          output << ", ";
+-        output << "[" << access.buffer_ranges[i]->min << ", "
+-               << access.buffer_ranges[i]->extent << "]";
+-      }
+-      output << "]\n";
++    if (access.touched_bytes.defined()) {
++      output << "  Byte footprint: " << access.touched_bytes << "\n";
+     }
+ 
+     if (!access.touched.empty()) {
+@@ -1778,21 +1807,14 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
+       return false;
+     }
+ 
+-    if (prev.buffer_indices.size() != curr.buffer_indices.size()) {
+-      // They are not the same indices, should be conflict.
+-      return true;
+-    }
+-
+     if (prev.is_pointer_access || curr.is_pointer_access) {
+-      // For accesses created via tvm_access_ptr we may still be able to prove
+-      // disjointness using their byte ranges. If both sides expose a touched
+-      // interval and we can show they don't overlap, skip the conflict.
+-      if (prev.is_pointer_access && curr.is_pointer_access &&
+-          PointerAccessIsDisjoint(prev, curr)) {
+-        return false;
+-      }
+-      // Otherwise fall back to the conservative answer: treat them as
+-      // overlapping.
++      // Pointer and indexed operations inhabit the same byte-addressed arena,
++      // even when their ranks, dtypes or shared-allocation aliases differ.
++      Optional<For> carry =
++          loop ? Optional<For>(GetRef<For>(loop)) : std::nullopt;
++      return !ByteAccessIsDisjoint(prev, curr, carry);
++    }
++    if (prev.buffer_indices.size() != curr.buffer_indices.size()) {
+       return true;
+     }
+ 
+@@ -2074,9 +2096,6 @@ PrimFunc TileLangThreadSync(PrimFunc func, const std::string &storage_scope) {
+                     .IntValue();
+   }
+   TileLangThreadSyncPlanner planner(sync_scope, warp_size);
+-  for (const auto &[_, buffer] : func->buffer_map) {
+-    planner.SetBufferDataToBuffer(buffer->data, buffer);
+-  }
+   planner(stmt);
+   stmt =
+       ThreadSyncInserter(sync_scope, planner.syncs_inserted_)(std::move(stmt));
+diff --git a/src/transform/vectorize_loop.cc b/src/transform/vectorize_loop.cc
+index 6f68f00be7..e6a1e40527 100644
+--- a/src/transform/vectorize_loop.cc
++++ b/src/transform/vectorize_loop.cc
+@@ -720,6 +720,26 @@ class TLVectorizer : public StmtMutator,
+ 
+     int total_count =
+         static_cast<int>(Downcast<IntImm>(count)->value) * vector_size;
++    // Widen the access regions together with the instruction. Keeping the old
++    // scalar extent hides most of the transfer from later alias/sync analysis.
++    auto widen_region = [&](const PrimExpr &pointer) {
++      auto bits = GetAccessPtrElementBits(pointer);
++      if (!bits.has_value()) {
++        // address_of and raw pointers do not declare an access region.
++        return pointer;
++      }
++      Call ptr = Downcast<Call>(pointer);
++      int element_bits = bits.value();
++      ICHECK_EQ(total_bits % element_bits, 0);
++      int extent_arg = ptr->op.same_as(builtin::tvm_access_ptr()) ? 3 : 1;
++      Array<PrimExpr> args = ptr->args;
++      args.Set(extent_arg,
++               make_const(args[extent_arg].dtype(), total_bits / element_bits));
++      return PrimExpr(
++          Call(ptr->dtype, ptr->op, args, ptr->annotations, ptr->span));
++    };
++    dst = widen_region(dst);
++    src = widen_region(src);
+     Array<PrimExpr> new_args{dst, src, IntImm(count.dtype(), total_count)};
+     if (predicate.defined()) {
+       new_args.push_back(predicate.value());
+diff --git a/testing/python/transform/test_tilelang_transform_im2col_fallback.py b/testing/python/transform/test_tilelang_transform_im2col_fallback.py
+index ebf77ba65b..b1213b057a 100644
+--- a/testing/python/transform/test_tilelang_transform_im2col_fallback.py
++++ b/testing/python/transform/test_tilelang_transform_im2col_fallback.py
+@@ -6,7 +6,7 @@
+ import tilelang.testing
+ 
+ 
+-def _make_im2col_kernel(use_deprecated_alias=False, channels=32, block_K=32, block_M=16, hw=8):
++def _make_im2col_kernel(use_deprecated_alias=False, channels=32, block_K=32, block_M=16, hw=8, num_stages=3):
+     N, C, H, W, F, K = 1, channels, hw, hw, 32, 3
+     S, D, P = 1, 1, 1
+     block_N = 32
+@@ -30,7 +30,7 @@ def conv(
+             out_flat = T.Tensor((N * OH * OW, F), T.float16, out.data)
+ 
+             T.clear(out_local)
+-            for k_iter in T.Pipelined(T.ceildiv(KH * KW * C, block_K), num_stages=3):
++            for k_iter in T.Pipelined(T.ceildiv(KH * KW * C, block_K), num_stages=num_stages):
+                 if use_deprecated_alias:
+                     T.c2d_im2col(data, data_shared, by, k_iter, KH, S, D, P)
+                 else:
+diff --git a/tilelang/backend/README.md b/tilelang/backend/README.md
+index 25f66d3d22..ed0d5d0aac 100644
+--- a/tilelang/backend/README.md
++++ b/tilelang/backend/README.md
+@@ -58,6 +58,26 @@ pipeline and codegen stages. It also records the selected shared execution
+ backend, which consumes the generated outputs. A later stage must not infer or
+ resolve either backend again.
+ 
++### Logical and physical tile-op lowering
++
++Native TIR pipelines run `LowerTileOp(logical_only=True)` before warp
++specialization, software-pipeline planning, and layout inference. A composite
++implementation's `TileOperatorNode::LowerLogical` returns logical TIR, without
++thread partitioning or physical layouts. Implementations requiring device
++instructions return no expansion and remain tile ops until `LowerTileOp()`.
++
++Logical expansion retains one scheduling unit and transfers operation
++annotations (including explicit WS operation ids) to that unit. SIMT im2col
++uses this path: its guarded parallel loads participate in the ordinary global
++layout solve and parallel-loop lowering, rather than running private layout
++inference during physical lowering. Its NHWC source region defines the image
++extent and origin; batch, spatial, and reduction tails are zero-filled. TMA
++im2col retains its specialized lowering and constraints.
++
++Memory-copy semantics alone do not imply an asynchronous completion protocol.
++Pipeline and WS analysis query the selected im2col implementation's TMA
++capability instead of guessing from its opcode or target architecture.
++
+ ### Terminology
+ 
+ - A **target backend**, such as CUDA, ROCm, CPU, Metal, or WebGPU, owns the
+diff --git a/tilelang/cpu/pipeline.py b/tilelang/cpu/pipeline.py
+index 155fee2443..87800ac321 100644
+--- a/tilelang/cpu/pipeline.py
++++ b/tilelang/cpu/pipeline.py
+@@ -33,6 +33,9 @@ def CPUPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
+     # loop bodies are still in source order and tile ops still declare
+     # their access regions.
+     mod = tilelang.transform.VerifyBufferInit()(mod)
++    # Expose logical accesses before scheduling and global layout inference.
++    mod = tilelang.transform.LowerTileOp(logical_only=True)(mod)
++    mod = tilelang.transform.Simplify()(mod)
+ 
+     mod = tilelang.transform.IfStmtBinding()(mod)
+     mod = tilelang.transform.Simplify()(mod)
+diff --git a/tilelang/cuda/pipeline.py b/tilelang/cuda/pipeline.py
+index 85f2e49046..5132931e65 100644
+--- a/tilelang/cuda/pipeline.py
++++ b/tilelang/cuda/pipeline.py
+@@ -96,6 +96,9 @@ def CUDAPassPipelineBodyPrologue(mod: IRModule, target: Target) -> IRModule:
+     # loop bodies are still in source order and tile ops still declare
+     # their access regions.
+     mod = tilelang.transform.VerifyBufferInit()(mod)
++    # Expose logical accesses before scheduling and global layout inference.
++    mod = tilelang.transform.LowerTileOp(logical_only=True)(mod)
++    mod = tilelang.transform.Simplify()(mod)
+ 
+     # @CUDA-specific
+     # Tile-level warp specialization: runs before layout inference so that
+diff --git a/tilelang/metal/pipeline.py b/tilelang/metal/pipeline.py
+index cad229d4f5..33a4abd5b9 100644
+--- a/tilelang/metal/pipeline.py
++++ b/tilelang/metal/pipeline.py
+@@ -38,6 +38,9 @@ def MetalPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
+     # loop bodies are still in source order and tile ops still declare
+     # their access regions.
+     mod = tilelang.transform.VerifyBufferInit()(mod)
++    # Expose logical accesses before scheduling and global layout inference.
++    mod = tilelang.transform.LowerTileOp(logical_only=True)(mod)
++    mod = tilelang.transform.Simplify()(mod)
+ 
+     mod = tilelang.transform.IfStmtBinding()(mod)
+     mod = tilelang.transform.PipelinePlanning()(mod)
+diff --git a/tilelang/rocm/pipeline.py b/tilelang/rocm/pipeline.py
+index ef04ae9855..030428a933 100644
+--- a/tilelang/rocm/pipeline.py
++++ b/tilelang/rocm/pipeline.py
+@@ -37,6 +37,9 @@ def ROCMPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
+     # loop bodies are still in source order and tile ops still declare
+     # their access regions.
+     mod = tilelang.transform.VerifyBufferInit()(mod)
++    # Expose logical accesses before scheduling and global layout inference.
++    mod = tilelang.transform.LowerTileOp(logical_only=True)(mod)
++    mod = tilelang.transform.Simplify()(mod)
+ 
+     mod = tilelang.transform.IfStmtBinding()(mod)
+     mod = tilelang.transform.PipelinePlanning()(mod)
+diff --git a/tilelang/transform/__init__.py b/tilelang/transform/__init__.py
+index f641f2a9fb..9fef8896c3 100644
+--- a/tilelang/transform/__init__.py
++++ b/tilelang/transform/__init__.py
+@@ -38,15 +38,19 @@ def LayoutInference():
+     return _ffi_api.LayoutInference()  # type: ignore
+ 
+ 
+-def LowerTileOp():
+-    """LowerTileOp
++def LowerTileOp(logical_only: bool = False):
++    """Lower tile operators.
++
++    With ``logical_only=True``, expand composite implementations into logical
++    TIR before scheduling and layout inference. Otherwise lower the remaining
++    operators and inferred parallel loops to physical device operations.
+ 
+     Returns
+     -------
+     fpass : tvm.transform.Pass
+         The result pass
+     """
+-    return _ffi_api.LowerTileOp()  # type: ignore
++    return _ffi_api.LowerTileOp(logical_only)  # type: ignore
+ 
+ 
+ def InjectSoftwarePipeline():
+diff --git a/tilelang/webgpu/pipeline.py b/tilelang/webgpu/pipeline.py
+index 320711246d..6241875cc5 100644
+--- a/tilelang/webgpu/pipeline.py
++++ b/tilelang/webgpu/pipeline.py
+@@ -39,6 +39,9 @@ def WebGPUPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
+     # loop bodies are still in source order and tile ops still declare
+     # their access regions.
+     mod = tilelang.transform.VerifyBufferInit()(mod)
++    # Expose logical accesses before scheduling and global layout inference.
++    mod = tilelang.transform.LowerTileOp(logical_only=True)(mod)
++    mod = tilelang.transform.Simplify()(mod)
+ 
+     mod = tilelang.transform.IfStmtBinding()(mod)
+     mod = tilelang.transform.PipelinePlanning()(mod)

@@ -1,0 +1,834 @@
+diff --git a/flashinfer/gdn_decode.py b/flashinfer/gdn_decode.py
+index fa61f13a234..b46ca2def3f 100644
+--- a/flashinfer/gdn_decode.py
++++ b/flashinfer/gdn_decode.py
+@@ -695,11 +695,12 @@ def gated_delta_rule_mtp(
+     output : torch.Tensor, optional
+         Pre-allocated output tensor of shape ``[B, T, HV, V]``.
+     intermediate_states_buffer : torch.Tensor, optional
+-        Buffer for caching intermediate states, shape ``[B, T, HV, V, K]``
+-        (first dim is indexed per-batch, not per-pool-slot — buffer must
+-        be at least ``B`` rows and contiguous; must be float32 when
+-        provided). When ``None``, intermediate states are not cached.
+-        Mutually exclusive with ``ssm_state_indices``.
++        Buffer for caching intermediate states, shape
++        ``[B, T, HV, V, K]`` (first dim is indexed per-batch, not per-pool
++        slot; must be float32 when provided). A leading slice of a larger
++        cache, for example ``cache[:, :T]``, is supported; its batch stride
++        determines the physical cache capacity. When ``None``, intermediate
++        states are not cached. Mutually exclusive with ``ssm_state_indices``.
+     ssm_state_indices : torch.Tensor, optional
+         Per-token pool scatter indices of shape ``[B, T]`` and dtype
+         ``torch.int32``.  When provided, the kernel writes each intermediate
+@@ -826,38 +827,56 @@ def gated_delta_rule_mtp(
+     else:
+         h0_source = initial_state.reshape(pool_size * HV, V, K)
+ 
+-    # Handle intermediate states. The kernel indexes the buffer by batch (i_n),
+-    # not by pool slot — see `flat_idx = i_n * T * HV + i_t * HV + i_hv` inside
+-    # the kernel. So the buffer's first dim MUST be at least B, and the buffer
+-    # MUST be contiguous so the reshape returns a free view. We make both
+-    # contracts explicit here to fail loudly on caller mistakes (the pre-existing
+-    # code silently did out-of-bounds writes when buffer.shape[0] < B).
++    # Handle intermediate states. The public shape remains [B, T, HV, V, K].
++    # A caller may reuse a [B, cache_steps, ...] allocation by passing the
++    # leading view `buffer[:, :T]`; stride(0), not shape(1), then carries the
++    # physical per-batch capacity used by the kernel's flat addressing.
+     cache_intermediate_states = intermediate_states_buffer is not None
+     if cache_intermediate_states:
+         buffer_size = intermediate_states_buffer.shape[0]
+-        cache_steps = intermediate_states_buffer.shape[1]
+ 
+         assert buffer_size >= B, (
+             f"intermediate_states_buffer first dim ({buffer_size}) must be "
+             f"at least B={B}: the kernel indexes it by batch (i_n in [0, B)), "
+             f"so a smaller buffer causes out-of-bounds writes."
+         )
+-        assert cache_steps >= T, (
+-            f"intermediate_states_buffer second dimension (cache_steps={cache_steps}) "
+-            f"must be at least T={T} to prevent out-of-bounds indexing"
++        assert tuple(intermediate_states_buffer.shape[1:]) == (T, HV, V, K), (
++            "intermediate_states_buffer must have logical shape "
++            f"[buffer_size, T={T}, HV={HV}, V={V}, K={K}], got "
++            f"{tuple(intermediate_states_buffer.shape)}"
+         )
+         assert intermediate_states_buffer.dtype == torch.float32, (
+             f"intermediate_states_buffer must be float32, "
+             f"got {intermediate_states_buffer.dtype}"
+         )
+-        assert intermediate_states_buffer.is_contiguous(), (
+-            "intermediate_states_buffer must be contiguous so the kernel writes "
+-            "land in the caller-owned tensor (reshape would otherwise materialize "
+-            "a throwaway copy)."
++        cache_step_stride = HV * V * K
++        expected_inner_strides = (cache_step_stride, V * K, K, 1)
++        assert (
++            tuple(intermediate_states_buffer.stride()[1:]) == expected_inner_strides
++        ), (
++            "intermediate_states_buffer must be contiguous within each batch; "
++            f"expected inner strides {expected_inner_strides}, got "
++            f"{tuple(intermediate_states_buffer.stride()[1:])}"
++        )
++        cache_batch_stride = intermediate_states_buffer.stride(0)
++        assert cache_batch_stride % cache_step_stride == 0, (
++            "intermediate_states_buffer batch stride must be a whole number "
++            f"of cache steps; got stride(0)={cache_batch_stride} and "
++            f"step size={cache_step_stride}"
++        )
++        cache_steps = cache_batch_stride // cache_step_stride
++        assert cache_steps >= T, (
++            f"intermediate_states_buffer batch stride encodes {cache_steps} "
++            f"cache steps, fewer than logical T={T}"
+         )
+ 
+-        intermediate_states = intermediate_states_buffer.view(
+-            buffer_size * cache_steps * HV, V, K
++        # Zero-copy compact alias over the backing storage. This deliberately
++        # spans the physical batch stride, including the hidden trailing cache
++        # slots of a `buffer[:, :T]` view.
++        intermediate_states = intermediate_states_buffer.as_strided(
++            size=(buffer_size * cache_steps * HV, V, K),
++            stride=(V * K, K, 1),
++            storage_offset=intermediate_states_buffer.storage_offset(),
+         )
+     else:
+         cache_steps = T
+@@ -922,10 +941,9 @@ def gated_delta_rule_mtp(
+         use_pool_indexing=pool_use_pool_indexing,
+     )
+ 
+-    # No post-kernel scatter step: the contiguity assert above guarantees
+-    # `intermediate_states` is a view of `intermediate_states_buffer`, and the
+-    # `use_pool_indexing=True` path makes the kernel write the strided pool
+-    # in place. Writes are visible to the caller directly.
++    # No post-kernel scatter step: `intermediate_states` aliases the caller's
++    # backing storage, and the pool-indexing path writes the strided pool in
++    # place. Writes are visible to the caller directly.
+ 
+     # Convert output to target dtype if needed
+     if output.dtype != target_dtype:
+diff --git a/flashinfer/gdn_kernels/gdn_decode_bf16_state.py b/flashinfer/gdn_kernels/gdn_decode_bf16_state.py
+index 9678211b53b..81be0479945 100644
+--- a/flashinfer/gdn_kernels/gdn_decode_bf16_state.py
++++ b/flashinfer/gdn_kernels/gdn_decode_bf16_state.py
+@@ -75,6 +75,47 @@ def _mark_index_dynamic(torch_t: torch.Tensor, *, assumed_align: int = 32):
+     ).mark_compact_shape_dynamic(mode=0, stride_order=stride_order, divisibility=1)
+ 
+ 
++def _flatten_intermediate_cache_view(
++    buffer: torch.Tensor,
++    *,
++    batch_size: int,
++    num_tokens: int,
++    num_v_heads: int,
++    v_dim: int,
++    k_dim: int,
++) -> tuple[torch.Tensor, int]:
++    """Return a zero-copy flat alias and its physical per-batch capacity."""
++    expected_shape = (batch_size, num_tokens, num_v_heads, v_dim, k_dim)
++    assert tuple(buffer.shape) == expected_shape, (
++        f"intermediate_states_buffer must have logical shape {expected_shape}, "
++        f"got {tuple(buffer.shape)}"
++    )
++    cache_step_stride = num_v_heads * v_dim * k_dim
++    expected_inner_strides = (cache_step_stride, v_dim * k_dim, k_dim, 1)
++    assert tuple(buffer.stride()[1:]) == expected_inner_strides, (
++        "intermediate_states_buffer must be contiguous within each batch; "
++        f"expected inner strides {expected_inner_strides}, got "
++        f"{tuple(buffer.stride()[1:])}"
++    )
++    cache_batch_stride = buffer.stride(0)
++    assert cache_batch_stride % cache_step_stride == 0, (
++        "intermediate_states_buffer batch stride must be a whole number of "
++        f"cache steps; got stride(0)={cache_batch_stride} and "
++        f"step size={cache_step_stride}"
++    )
++    cache_steps = cache_batch_stride // cache_step_stride
++    assert cache_steps >= num_tokens, (
++        f"intermediate_states_buffer batch stride encodes {cache_steps} cache "
++        f"steps, fewer than logical T={num_tokens}"
++    )
++    flat = buffer.as_strided(
++        size=(batch_size * cache_steps * num_v_heads, v_dim, k_dim),
++        stride=(v_dim * k_dim, k_dim, 1),
++        storage_offset=buffer.storage_offset(),
++    )
++    return flat, cache_steps
++
++
+ # ==============================================================================
+ # FMA WRAPPER FUNCTIONS (SM90 Compatibility)
+ # ==============================================================================
+@@ -136,7 +177,7 @@ def fma_pair(a1, a2, b1, b2, c1, c2):
+ @cute.kernel
+ def gdn_decode_bf16state_mtp_ilp4_kernel(
+     h0_source: cute.Tensor,  # [pool_size, HV, V, K] as BF16
+-    intermediate_states: cute.Tensor,  # [B * T * HV, V, K] as BF16 (or dummy)
++    intermediate_states: cute.Tensor,  # [B * cache_steps * HV, V, K] as BF16 (or dummy)
+     vec_size: cutlass.Constexpr[int],
+     num_v_tiles: cutlass.Constexpr[int],
+     tile_v: cutlass.Constexpr[int],
+@@ -157,6 +198,7 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
+     scale: cutlass.Constexpr[float],
+     HV: cutlass.Constexpr[int],
+     T: cutlass.Constexpr[int],
++    cache_steps: cutlass.Constexpr[int],
+     H: cutlass.Constexpr[int],
+     K: cutlass.Constexpr[int],
+     V: cutlass.Constexpr[int],
+@@ -771,11 +813,12 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
+                     # initial_state_indices points at slots >= B (i.e. any
+                     # realistic pool_size > B serving config). Fix mirrors
+                     # upstream PR #3145.
+-                    # Int64: intermediate_states is reshaped to [B*T*HV, V, K]
++                    # Int64: intermediate_states is reshaped to
++                    # [B*cache_steps*HV, V, K]
+                     # (BF16) with stride[0] = V*K = 16384 elements. flat_idx *
+                     # 16384 hits 2**31 at flat_idx >= 131072 (HV=64+T=8: i_n
+                     # >= 256). PR #3230.
+-                    flat_idx = i_n * T * HV + i_t * HV + i_hv
++                    flat_idx = cutlass.Int64(i_n) * cache_steps * HV + i_t * HV + i_hv
+                     ita = cute.local_tile(
+                         intermediate_states,
+                         (1, 1, vec_size),
+@@ -879,6 +922,7 @@ def gdn_wide_vec_kernel(
+     scale: cutlass.Constexpr[float],
+     HV: cutlass.Constexpr[int],
+     T: cutlass.Constexpr[int],
++    cache_steps: cutlass.Constexpr[int],
+     H: cutlass.Constexpr[int],
+     K: cutlass.Constexpr[int],
+     V: cutlass.Constexpr[int],
+@@ -1307,7 +1351,7 @@ def gdn_wide_vec_kernel(
+             o1 = cutlass.Float32(0.0)
+             o2 = cutlass.Float32(0.0)
+             o3 = cutlass.Float32(0.0)
+-            flat_idx = cutlass.Int32(0)
++            flat_idx = cutlass.Int64(0)
+             # FLA-flat predeclaration: Int64 so the Phase B loop's
+             # reassignment via Int64(pool_slot)*HV+i_hv keeps a consistent
+             # type. cute-DSL rejects type changes inside a dynamic for.
+@@ -1551,11 +1595,12 @@ def gdn_wide_vec_kernel(
+                     # initial_state_indices points at slots >= B (i.e. any
+                     # realistic pool_size > B serving config). Fix mirrors
+                     # upstream PR #3145.
+-                    # Int64: intermediate_states is reshaped to [B*T*HV, V, K]
++                    # Int64: intermediate_states is reshaped to
++                    # [B*cache_steps*HV, V, K]
+                     # (BF16) with stride[0] = V*K = 16384 elements. flat_idx *
+                     # 16384 hits 2**31 at flat_idx >= 131072 (HV=64+T=8: i_n
+                     # >= 256). PR #3230.
+-                    flat_idx = i_n * T * HV + i_t * HV + i_hv
++                    flat_idx = cutlass.Int64(i_n) * cache_steps * HV + i_t * HV + i_hv
+                     it0 = cute.local_tile(
+                         intermediate_states,
+                         (1, 1, vec),
+@@ -1864,11 +1909,12 @@ def gdn_wide_vec_kernel(
+                     cute.autovec_copy(r_hb2, it2)
+                     cute.autovec_copy(r_hb3, it3)
+                 elif cutlass.const_expr(cache_intermediate_states):
+-                    # Int64: intermediate_states is reshaped to [B*T*HV, V, K]
++                    # Int64: intermediate_states is reshaped to
++                    # [B*cache_steps*HV, V, K]
+                     # (BF16) with stride[0] = V*K = 16384 elements. flat_idx *
+                     # 16384 hits 2**31 at flat_idx >= 131072 (HV=64+T=8: i_n
+                     # >= 256). PR #3230.
+-                    flat_idx = i_n * T * HV + i_t * HV + i_hv
++                    flat_idx = cutlass.Int64(i_n) * cache_steps * HV + i_t * HV + i_hv
+                     it0 = cute.local_tile(
+                         intermediate_states,
+                         (1, 1, vec),
+@@ -1955,6 +2001,7 @@ def gdn_wide_vec_kernel_t1(
+     scale: cutlass.Constexpr[float],
+     HV: cutlass.Constexpr[int],
+     T: cutlass.Constexpr[int],
++    cache_steps: cutlass.Constexpr[int],
+     H: cutlass.Constexpr[int],
+     K: cutlass.Constexpr[int],
+     V: cutlass.Constexpr[int],
+@@ -2363,14 +2410,15 @@ def gdn_wide_vec_kernel_t1(
+                         r_hb1[i] = cutlass.BFloat16(r_h[1, i])
+                         r_hb2[i] = cutlass.BFloat16(r_h[2, i])
+                         r_hb3[i] = cutlass.BFloat16(r_h[3, i])
+-                    # The intermediate_states buffer is sized [B, T, HV, V, K]
++                    # The intermediate_states buffer is sized
++                    # [B, cache_steps, HV, V, K]
+                     # (batch-scoped, NOT pool-scoped), so this index uses i_n
+                     # (the per-call batch index) and not cache_idx (the pool
+                     # slot). Using cache_idx here writes OOB whenever
+                     # initial_state_indices points at slots >= B (i.e. any
+                     # realistic pool_size > B serving config). Fix mirrors
+                     # upstream PR #3145. Int64 widening per PR #3230.
+-                    flat_idx = i_n * T * HV + i_t * HV + i_hv
++                    flat_idx = cutlass.Int64(i_n) * cache_steps * HV + i_t * HV + i_hv
+                     it0 = cute.local_tile(
+                         intermediate_states,
+                         (1, 1, vec),
+@@ -2425,7 +2473,7 @@ def gdn_wide_vec_kernel_t1(
+ @cute.jit
+ def run_gdn_decode_bf16state_mtp_ilp4(
+     h0_source: cute.Tensor,  # [pool_size, HV, V, K] BF16
+-    intermediate_states: cute.Tensor,  # [B * T * HV, V, K] BF16 (or dummy)
++    intermediate_states: cute.Tensor,  # [B * cache_steps * HV, V, K] BF16 (or dummy)
+     A_log: cute.Tensor,
+     a: cute.Tensor,
+     dt_bias: cute.Tensor,
+@@ -2443,6 +2491,7 @@ def run_gdn_decode_bf16state_mtp_ilp4(
+     scale: cutlass.Constexpr[float],
+     HV: cutlass.Constexpr[int],
+     T: cutlass.Constexpr[int],
++    cache_steps: cutlass.Constexpr[int],
+     H: cutlass.Constexpr[int],
+     K: cutlass.Constexpr[int],
+     V: cutlass.Constexpr[int],
+@@ -2500,6 +2549,7 @@ def run_gdn_decode_bf16state_mtp_ilp4(
+         scale,
+         HV,
+         T,
++        cache_steps,
+         H,
+         K,
+         V,
+@@ -2546,6 +2596,7 @@ def _run_wide_vec(
+     scale: cutlass.Constexpr[float],
+     HV: cutlass.Constexpr[int],
+     T: cutlass.Constexpr[int],
++    cache_steps: cutlass.Constexpr[int],
+     H: cutlass.Constexpr[int],
+     K: cutlass.Constexpr[int],
+     V: cutlass.Constexpr[int],
+@@ -2593,6 +2644,7 @@ def _run_wide_vec(
+         scale,
+         HV,
+         T,
++        cache_steps,
+         H,
+         K,
+         V,
+@@ -2640,6 +2692,7 @@ def _run_wide_vec_t1(
+     scale: cutlass.Constexpr[float],
+     HV: cutlass.Constexpr[int],
+     T: cutlass.Constexpr[int],
++    cache_steps: cutlass.Constexpr[int],
+     H: cutlass.Constexpr[int],
+     K: cutlass.Constexpr[int],
+     V: cutlass.Constexpr[int],
+@@ -2678,6 +2731,7 @@ def _run_wide_vec_t1(
+         scale,
+         HV,
+         T,
++        cache_steps,
+         H,
+         K,
+         V,
+@@ -3037,24 +3091,17 @@ def gated_delta_rule_mtp_wide_vec(
+     )
+ 
+     cache_intermediate_states = intermediate_states_buffer is not None
++    cache_steps = T_val
+     if cache_intermediate_states:
+-        # The cache buffer is BATCH-scoped: shape [B, T, HV, V, K]. The kernel
+-        # indexes it by i_n (the per-call batch index), NOT by cache_idx (the
+-        # pool slot), so a pool_size-sized buffer would be OOB-prone. Fix
+-        # mirrors upstream PR #3145.
+-        buffer_size = intermediate_states_buffer.shape[0]
+-        cache_steps = intermediate_states_buffer.shape[1]
+-        assert buffer_size == B_val, (
+-            f"intermediate_states_buffer dim 0 ({buffer_size}) must equal "
+-            f"batch size B={B_val}; the buffer is batch-scoped, not pool-scoped"
+-        )
+-        assert cache_steps >= T_val
+         assert intermediate_states_buffer.dtype == torch.bfloat16
+-        intermediate_states = intermediate_states_buffer.reshape(
+-            B_val * cache_steps * HV_val, V_val, K_val
++        intermediate_states, cache_steps = _flatten_intermediate_cache_view(
++            intermediate_states_buffer,
++            batch_size=B_val,
++            num_tokens=T_val,
++            num_v_heads=HV_val,
++            v_dim=V_val,
++            k_dim=K_val,
+         )
+-        if not intermediate_states.is_contiguous():
+-            intermediate_states = intermediate_states.contiguous()
+         # Skip the redundant final writeback when caching is on.
+         effective_disable_final = True
+     elif per_token_pool_scatter_flat:
+@@ -3153,6 +3200,7 @@ def gated_delta_rule_mtp_wide_vec(
+     cache_key = (
+         "v3_mtp_bf16_tiled_dynB",
+         T_val,
++        cache_steps,
+         H_val,
+         HV_val,
+         K_val,
+@@ -3246,6 +3294,7 @@ def gated_delta_rule_mtp_wide_vec(
+                 scale,
+                 HV_val,
+                 T_val,
++                cache_steps,
+                 H_val,
+                 K_val,
+                 V_val,
+@@ -3395,26 +3444,19 @@ def gated_delta_rule_t1_wide_vec(
+ 
+     cache_intermediate_states = intermediate_states_buffer is not None
+     if cache_intermediate_states:
+-        # The cache buffer is BATCH-scoped: shape [B, T, HV, V, K]. The kernel
+-        # indexes it by i_n (the per-call batch index), NOT by cache_idx (the
+-        # pool slot), so a pool_size-sized buffer would be OOB-prone. Fix
+-        # mirrors upstream PR #3145.
+-        buffer_size = intermediate_states_buffer.shape[0]
+-        cache_steps = intermediate_states_buffer.shape[1]
+-        assert buffer_size == B_val, (
+-            f"intermediate_states_buffer dim 0 ({buffer_size}) must equal "
+-            f"batch size B={B_val}; the buffer is batch-scoped, not pool-scoped"
+-        )
+-        assert cache_steps >= T_val
+         assert intermediate_states_buffer.dtype == torch.bfloat16
+-        intermediate_states = intermediate_states_buffer.reshape(
+-            B_val * cache_steps * HV_val, V_val, K_val
++        intermediate_states, cache_steps = _flatten_intermediate_cache_view(
++            intermediate_states_buffer,
++            batch_size=B_val,
++            num_tokens=T_val,
++            num_v_heads=HV_val,
++            v_dim=V_val,
++            k_dim=K_val,
+         )
+-        if not intermediate_states.is_contiguous():
+-            intermediate_states = intermediate_states.contiguous()
+         # Skip the redundant final writeback when caching is on.
+         effective_disable_final = True
+     else:
++        cache_steps = T_val
+         intermediate_states = h0_source[:1, :1, :1]
+         effective_disable_final = disable_state_update
+ 
+@@ -3440,6 +3482,7 @@ def gated_delta_rule_t1_wide_vec(
+     cache_key = (
+         "v3_mtp_bf16_tiled_dynB",
+         T_val,
++        cache_steps,
+         H_val,
+         HV_val,
+         K_val,
+@@ -3513,6 +3556,7 @@ def gated_delta_rule_t1_wide_vec(
+                 scale,
+                 HV_val,
+                 T_val,
++                cache_steps,
+                 H_val,
+                 K_val,
+                 V_val,
+@@ -3608,11 +3652,12 @@ def gated_delta_rule_mtp(
+         initial_state_indices: [B] int32 - indices into state pool (read)
+         output_state_indices: Optional [B] int32 - indices for writing updated state.
+             Defaults to initial_state_indices when None.
+-        intermediate_states_buffer: Optional [B, T, HV, V, K] bf16. Note: this
+-            buffer is BATCH-scoped, not pool-scoped — the kernel indexes it by
+-            the per-call batch index (i_n), not by the pool slot. Sizing it
+-            larger than B silently wastes memory; sizing it smaller than B
+-            triggers an assertion (see the OOB fix mirroring upstream PR #3145).
++        intermediate_states_buffer: Optional
++            [B, T, HV, V, K] bf16. This buffer is BATCH-scoped, not
++            pool-scoped — the kernel indexes it by the per-call batch index
++            (i_n), not by the pool slot. A leading slice of a larger cache,
++            for example ``cache[:, :T]``, is supported; its batch stride
++            determines the physical cache capacity.
+         disable_state_update: bool - if True, don't update initial state
+         scale: Optional, default 1/sqrt(K)
+         output: Optional pre-allocated output tensor [B, T, HV, V] bf16
+@@ -3653,27 +3698,20 @@ def gated_delta_rule_mtp(
+     # padded pool) work without a silent .contiguous() clone. See PR #3268.
+     h0_source = initial_state_source
+ 
+-    # Handle intermediate states. The cache buffer is BATCH-scoped: shape
+-    # [B, T, HV, V, K]. The kernel indexes it by i_n (per-call batch index),
+-    # NOT by cache_idx (pool slot), so a pool_size-sized buffer would be
+-    # OOB-prone. Fix mirrors upstream PR #3145.
++    # The public cache shape is [B, T, HV, V, K]. A leading slice of a larger
++    # allocation carries its physical per-batch capacity in stride(0).
+     cache_intermediate_states = intermediate_states_buffer is not None
++    cache_steps = T
+     if cache_intermediate_states:
+-        buffer_size = intermediate_states_buffer.shape[0]
+-        cache_steps = intermediate_states_buffer.shape[1]
+-        assert buffer_size == B, (
+-            f"intermediate_states_buffer dim 0 ({buffer_size}) must equal "
+-            f"batch size B={B}; the buffer is batch-scoped, not pool-scoped"
+-        )
+-        assert cache_steps >= T, (
+-            f"intermediate_states_buffer dim 1 ({cache_steps}) must be >= T={T}"
+-        )
+         assert intermediate_states_buffer.dtype == torch.bfloat16
+-        intermediate_states = intermediate_states_buffer.reshape(
+-            B * cache_steps * HV, V, K
++        intermediate_states, cache_steps = _flatten_intermediate_cache_view(
++            intermediate_states_buffer,
++            batch_size=B,
++            num_tokens=T,
++            num_v_heads=HV,
++            v_dim=V,
++            k_dim=K,
+         )
+-        if not intermediate_states.is_contiguous():
+-            intermediate_states = intermediate_states.contiguous()
+         per_token_pool_scatter_flat = False
+     elif ssm_state_indices is not None and tuple(
+         int(s) for s in h0_source.stride()
+@@ -3813,6 +3851,7 @@ def gated_delta_rule_mtp(
+     cache_key = (
+         "mtp_bf16_dynB",
+         T,
++        cache_steps,
+         H,
+         HV,
+         K,
+@@ -3906,6 +3945,7 @@ def gated_delta_rule_mtp(
+                 scale,
+                 HV,
+                 T,
++                cache_steps,
+                 H,
+                 K,
+                 V,
+diff --git a/flashinfer/gdn_kernels/gdn_decode_mtp.py b/flashinfer/gdn_kernels/gdn_decode_mtp.py
+index 08f5c4fd114..31fbe2b5f96 100644
+--- a/flashinfer/gdn_kernels/gdn_decode_mtp.py
++++ b/flashinfer/gdn_kernels/gdn_decode_mtp.py
+@@ -198,7 +198,7 @@ def fma_pair(a1, a2, b1, b2, c1, c2):
+ @cute.kernel
+ def gdn_verify_kernel_mtp(
+     h0_source: cute.Tensor,  # 3D [pool*HV, V, K] when use_pool_indexing=False; 4D [pool, HV, V, K] when True
+-    intermediate_states: cute.Tensor,  # [pool_size * T * HV, V, K] - intermediate state cache
++    intermediate_states: cute.Tensor,  # [B * cache_steps * HV, V, K] - intermediate state cache
+     vec_size: cutlass.Constexpr[int],
+     num_v_tiles: cutlass.Constexpr[int],
+     tile_v: cutlass.Constexpr[int],  # TILE_V - configurable for batch size
+@@ -219,6 +219,7 @@ def gdn_verify_kernel_mtp(
+     scale: cutlass.Constexpr[float],
+     HV: cutlass.Constexpr[int],
+     T: cutlass.Constexpr[int],
++    cache_steps: cutlass.Constexpr[int],
+     H: cutlass.Constexpr[int],
+     K: cutlass.Constexpr[int],
+     V: cutlass.Constexpr[int],
+@@ -682,7 +683,7 @@ def gdn_verify_kernel_mtp(
+ 
+                         # Cache intermediate state if needed
+                         if cache_intermediate_states:
+-                            flat_idx = i_n * T * HV + i_t * HV + i_hv
++                            flat_idx = i_n * cache_steps * HV + i_t * HV + i_hv
+                             it0 = cute.local_tile(
+                                 intermediate_states,
+                                 (1, 1, vec_size),
+@@ -1240,7 +1241,7 @@ def gdn_verify_kernel_mtp(
+                         # Cache intermediate state LAST in timestep (fire-and-forget stores
+                         # overlap with next timestep's compute)
+                         if cache_intermediate_states:
+-                            flat_idx = i_n * T * HV + i_t * HV + i_hv
++                            flat_idx = i_n * cache_steps * HV + i_t * HV + i_hv
+                             inter_tile_a = cute.local_tile(
+                                 intermediate_states,
+                                 (1, 1, vec_size),
+@@ -1411,7 +1412,7 @@ def gdn_verify_kernel_mtp(
+ 
+                         # Cache intermediate state if needed
+                         if cache_intermediate_states:
+-                            flat_idx = i_n * T * HV + i_t * HV + i_hv
++                            flat_idx = i_n * cache_steps * HV + i_t * HV + i_hv
+                             inter_tile_a = cute.local_tile(
+                                 intermediate_states,
+                                 (1, 1, vec_size),
+@@ -1530,6 +1531,7 @@ def run_gdn_verify_kernel_mtp(
+     scale: cutlass.Constexpr[float],
+     HV: cutlass.Constexpr[int],
+     T: cutlass.Constexpr[int],
++    cache_steps: cutlass.Constexpr[int],
+     H: cutlass.Constexpr[int],
+     K: cutlass.Constexpr[int],
+     V: cutlass.Constexpr[int],
+@@ -1597,6 +1599,7 @@ def run_gdn_verify_kernel_mtp(
+         scale,
+         HV,
+         T,
++        cache_steps,
+         H,
+         K,
+         V,
+@@ -1623,7 +1626,7 @@ def run_gdn_verify_kernel_mtp(
+ @cute.kernel
+ def gdn_verify_kernel_mtp_inline(
+     h0_source: cute.Tensor,  # 3D [pool*HV, V, K] when use_pool_indexing=False; 4D [pool, HV, V, K] when True
+-    intermediate_states: cute.Tensor,  # [pool_size * T * HV, V, K] - intermediate state cache
++    intermediate_states: cute.Tensor,  # [B * cache_steps * HV, V, K] - intermediate state cache
+     vec_size: cutlass.Constexpr[int],
+     num_v_tiles: cutlass.Constexpr[int],
+     tile_v: cutlass.Constexpr[int],  # TILE_V - configurable for batch size
+@@ -1644,6 +1647,7 @@ def gdn_verify_kernel_mtp_inline(
+     scale: cutlass.Constexpr[float],
+     HV: cutlass.Constexpr[int],
+     T: cutlass.Constexpr[int],
++    cache_steps: cutlass.Constexpr[int],
+     H: cutlass.Constexpr[int],
+     K: cutlass.Constexpr[int],
+     V: cutlass.Constexpr[int],
+@@ -1967,7 +1971,7 @@ def gdn_verify_kernel_mtp_inline(
+ 
+                         # Cache intermediate state if needed
+                         if cache_intermediate_states:
+-                            flat_idx = i_n * T * HV + i_t * HV + i_hv
++                            flat_idx = i_n * cache_steps * HV + i_t * HV + i_hv
+                             inter_tile_a = cute.local_tile(
+                                 intermediate_states,
+                                 (1, 1, vec_size),
+@@ -2301,7 +2305,7 @@ def gdn_verify_kernel_mtp_inline(
+ 
+                         # Cache intermediate state
+                         if cache_intermediate_states:
+-                            flat_idx = i_n * T * HV + i_t * HV + i_hv
++                            flat_idx = i_n * cache_steps * HV + i_t * HV + i_hv
+                             inter_tile_a = cute.local_tile(
+                                 intermediate_states,
+                                 (1, 1, vec_size),
+@@ -2417,6 +2421,7 @@ def run_gdn_verify_kernel_mtp_inline(
+     scale: cutlass.Constexpr[float],
+     HV: cutlass.Constexpr[int],
+     T: cutlass.Constexpr[int],
++    cache_steps: cutlass.Constexpr[int],
+     H: cutlass.Constexpr[int],
+     K: cutlass.Constexpr[int],
+     V: cutlass.Constexpr[int],
+@@ -2477,6 +2482,7 @@ def run_gdn_verify_kernel_mtp_inline(
+         scale,
+         HV,
+         T,
++        cache_steps,
+         H,
+         K,
+         V,
+@@ -2794,6 +2800,7 @@ def run_mtp_decode(
+                 scale=scale,
+                 HV=HV,
+                 T=T,
++                cache_steps=cache_steps,
+                 H=H,
+                 K=K,
+                 V=V,
+@@ -2834,6 +2841,7 @@ def run_mtp_decode(
+                 scale=scale,
+                 HV=HV,
+                 T=T,
++                cache_steps=cache_steps,
+                 H=H,
+                 K=K,
+                 V=V,
+diff --git a/tests/gdn/test_decode_delta_rule.py b/tests/gdn/test_decode_delta_rule.py
+index 1e155ed24f0..5872807299d 100644
+--- a/tests/gdn/test_decode_delta_rule.py
++++ b/tests/gdn/test_decode_delta_rule.py
+@@ -50,6 +50,7 @@
+     from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
+         gated_delta_rule as gdn_decode_bf16_state,
+         gated_delta_rule_mtp as gdn_decode_bf16_state_mtp,
++        gated_delta_rule_t1_wide_vec as gdn_decode_bf16_state_t1_wide_vec,
+     )
+ 
+     GDN_DECODE_BF16_STATE_AVAILABLE = True
+@@ -3501,6 +3502,195 @@ def test_gdn_decode_bf16_state_mtp_pool_larger_than_batch(
+         )
+ 
+ 
++# ==============================================================================
++# Cache-step stride regression: a logical T view may have a larger batch stride.
++# ==============================================================================
++
++
++@pytest.mark.parametrize(
++    "state_dtype,batch_size,num_v_heads,num_tokens",
++    [
++        pytest.param(torch.float32, 2, 64, 2, id="fp32-inline"),
++        pytest.param(torch.float32, 3, 64, 2, id="fp32-warp"),
++        pytest.param(torch.bfloat16, 2, 32, 2, id="bf16-ilp4"),
++        pytest.param(torch.bfloat16, 2, 64, 2, id="bf16-wide-vec"),
++        pytest.param(torch.bfloat16, 2, 64, 1, id="bf16-t1-wide-vec"),
++    ],
++)
++def test_gdn_decode_mtp_cache_steps_stride(
++    state_dtype: torch.dtype,
++    batch_size: int,
++    num_v_heads: int,
++    num_tokens: int,
++):
++    """Honor the physical cache stride of ``cache[:, :T]``.
++
++    The old flat index used ``i_n * T * HV`` and ignored the larger batch
++    stride carried by a leading view of reusable backing storage. For B > 1
++    that packed batch 1 into batch 0's trailing slots and left batch 1's
++    requested slots unwritten. Compare against an exact-T cache and require
++    the hidden trailing slots to remain bit-exact sentinels across every
++    FP32/BF16 MTP kernel route.
++    """
++    _skip_if_not_sm90_or_later()
++    if state_dtype == torch.bfloat16 and not GDN_DECODE_BF16_STATE_AVAILABLE:
++        pytest.skip("BF16 state kernel not available")
++
++    torch.manual_seed(0)
++    device = torch.device("cuda")
++    B, T, cache_steps = batch_size, num_tokens, 4
++    H, HV, K, V = 16, num_v_heads, 128, 128
++
++    q = torch.randn(B, T, H, K, dtype=torch.bfloat16, device=device)
++    k = torch.randn(B, T, H, K, dtype=torch.bfloat16, device=device)
++    v = torch.randn(B, T, HV, V, dtype=torch.bfloat16, device=device)
++    a = torch.randn(B, T, HV, dtype=torch.bfloat16, device=device)
++    b = torch.randn(B, T, HV, dtype=torch.bfloat16, device=device)
++    A_log = torch.randn(HV, dtype=torch.float32, device=device)
++    dt_bias = torch.randn(HV, dtype=torch.float32, device=device)
++    initial_state = torch.randn(B, HV, V, K, dtype=state_dtype, device=device)
++    initial_state_indices = torch.arange(B, dtype=torch.int32, device=device)
++
++    cache_exact = torch.zeros(B, T, HV, V, K, dtype=state_dtype, device=device)
++    sentinel = 7.0
++    cache_backing = torch.full(
++        (B, cache_steps, HV, V, K), sentinel, dtype=state_dtype, device=device
++    )
++    cache_view = cache_backing[:, :T]
++    assert cache_view.shape == cache_exact.shape
++    assert cache_view.stride(0) == cache_steps * HV * V * K
++    assert not cache_view.is_contiguous()
++
++    common = dict(
++        A_log=A_log,
++        a=a,
++        dt_bias=dt_bias,
++        q=q,
++        k=k,
++        v=v,
++        b=b,
++        initial_state_indices=initial_state_indices,
++        scale=K**-0.5,
++        disable_state_update=False,
++    )
++
++    if state_dtype == torch.float32:
++        out_exact, _ = gated_delta_rule_mtp(
++            **common,
++            initial_state=initial_state.clone(),
++            intermediate_states_buffer=cache_exact,
++            use_qk_l2norm=True,
++        )
++        out_padded, _ = gated_delta_rule_mtp(
++            **common,
++            initial_state=initial_state.clone(),
++            intermediate_states_buffer=cache_view,
++            use_qk_l2norm=True,
++        )
++    elif T == 1:
++        out_exact = gdn_decode_bf16_state_t1_wide_vec(
++            **common,
++            initial_state_source=initial_state.clone(),
++            intermediate_states_buffer=cache_exact,
++            use_qk_l2norm_in_kernel=True,
++        )
++        out_padded = gdn_decode_bf16_state_t1_wide_vec(
++            **common,
++            initial_state_source=initial_state.clone(),
++            intermediate_states_buffer=cache_view,
++            use_qk_l2norm_in_kernel=True,
++        )
++    else:
++        out_exact = gdn_decode_bf16_state_mtp(
++            **common,
++            initial_state_source=initial_state.clone(),
++            intermediate_states_buffer=cache_exact,
++            use_qk_l2norm_in_kernel=True,
++        )
++        out_padded = gdn_decode_bf16_state_mtp(
++            **common,
++            initial_state_source=initial_state.clone(),
++            intermediate_states_buffer=cache_view,
++            use_qk_l2norm_in_kernel=True,
++        )
++
++    torch.cuda.synchronize()
++    torch.testing.assert_close(out_padded, out_exact, atol=1e-2, rtol=1e-2)
++    torch.testing.assert_close(cache_view, cache_exact, atol=1e-2, rtol=1e-2)
++    torch.testing.assert_close(
++        cache_backing[:, T:],
++        torch.full_like(cache_backing[:, T:], sentinel),
++        atol=0,
++        rtol=0,
++    )
++
++
++def test_gdn_decode_bf16_dense_cache_int64_boundary():
++    """Dense BF16 cache addressing must remain 64-bit beyond 2**31 elements."""
++    _skip_if_not_sm90_or_later()
++    if not GDN_DECODE_BF16_STATE_AVAILABLE:
++        pytest.skip("BF16 state kernel not available")
++
++    torch.manual_seed(0)
++    device = torch.device("cuda")
++    B, T, cache_steps = 257, 1, 8
++    H, HV, K, V = 1, 64, 128, 128
++
++    q = torch.randn(B, T, H, K, dtype=torch.bfloat16, device=device)
++    k = torch.randn(B, T, H, K, dtype=torch.bfloat16, device=device)
++    v = torch.randn(B, T, HV, V, dtype=torch.bfloat16, device=device)
++    a = torch.randn(B, T, HV, dtype=torch.bfloat16, device=device)
++    b = torch.randn(B, T, HV, dtype=torch.bfloat16, device=device)
++    A_log = torch.randn(HV, dtype=torch.float32, device=device)
++    dt_bias = torch.randn(HV, dtype=torch.float32, device=device)
++    state = torch.randn(1, HV, V, K, dtype=torch.bfloat16, device=device)
++    state_indices = torch.zeros(B, dtype=torch.int32, device=device)
++
++    # At batch index 256, flat_idx * V * K reaches 2**31 elements. Keep the
++    # state pool compact and leave the 4.02 GiB cache uninitialized so the test
++    # exercises the boundary without unnecessary initialization traffic.
++    cache_backing = torch.empty(
++        B, cache_steps, HV, V, K, dtype=torch.bfloat16, device=device
++    )
++    cache = cache_backing[:, :T]
++    output = gdn_decode_bf16_state_t1_wide_vec(
++        A_log=A_log,
++        a=a,
++        dt_bias=dt_bias,
++        q=q,
++        k=k,
++        v=v,
++        b=b,
++        initial_state_source=state,
++        initial_state_indices=state_indices,
++        intermediate_states_buffer=cache,
++        disable_state_update=False,
++        use_qk_l2norm_in_kernel=True,
++        scale=K**-0.5,
++    )
++
++    ref_cache = torch.empty(1, T, HV, V, K, dtype=torch.bfloat16, device=device)
++    ref_output = gdn_decode_bf16_state_t1_wide_vec(
++        A_log=A_log,
++        a=a[-1:],
++        dt_bias=dt_bias,
++        q=q[-1:],
++        k=k[-1:],
++        v=v[-1:],
++        b=b[-1:],
++        initial_state_source=state,
++        initial_state_indices=state_indices[:1],
++        intermediate_states_buffer=ref_cache,
++        disable_state_update=False,
++        use_qk_l2norm_in_kernel=True,
++        scale=K**-0.5,
++    )
++    torch.cuda.synchronize()
++
++    torch.testing.assert_close(output[-1:], ref_output, atol=1e-2, rtol=1e-2)
++    torch.testing.assert_close(cache[-1:, :T], ref_cache, atol=1e-2, rtol=1e-2)
++
++
+ # ==============================================================================
+ # BF16 state FLA-style per-token pool scatter (ssm_state_indices)
+ # ==============================================================================

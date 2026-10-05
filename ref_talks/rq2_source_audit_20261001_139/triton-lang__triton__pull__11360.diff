@@ -1,0 +1,663 @@
+diff --git a/python/triton_kernels/tests/test_tensor.py b/python/triton_kernels/tests/test_tensor.py
+index 701b544c5fe7..19db12e88ffb 100644
+--- a/python/triton_kernels/tests/test_tensor.py
++++ b/python/triton_kernels/tests/test_tensor.py
+@@ -126,8 +126,9 @@ def test_ragged_layout_storage_shape():
+ 
+ 
+ @pytest.mark.parametrize("major_dim", [-1, -2])
+-def test_strided_layout_rejects_odd_fp4_packing_dim(major_dim):
+-    shape = [2, 2]
++@pytest.mark.parametrize("other_size", [0, 2])
++def test_strided_layout_rejects_odd_fp4_packing_dim(major_dim, other_size):
++    shape = [other_size, other_size]
+     shape[major_dim] = 1
+ 
+     with pytest.raises(ValueError):
+@@ -212,6 +213,33 @@ def test_convert_layout_converts_different_parameterized_layout(storage_shape, l
+     assert convert_layout(converted, different_layout) is not converted
+ 
+ 
++@pytest.mark.parametrize("layout", [HopperMXValueLayout(-2, 3), BlackwellMX4ValueShuffledLayout()])
++@pytest.mark.parametrize("inverse", [False, True])
++def test_convert_layout_uses_input_device(layout, inverse):
++    if torch.cuda.device_count() < 2:
++        pytest.skip("requires two CUDA devices")
++
++    data = torch.arange(2 * 258 * 257, dtype=torch.int32, device="cpu").to(torch.uint8).reshape(2, 258, 257)
++    canonical = wrap_torch_tensor(data, dtype=FP4, shape=[2, 258, 514])
++    source = convert_layout(canonical, layout) if inverse else canonical
++    destination = StridedLayout() if inverse else layout
++    expected = convert_layout(source, destination)
++
++    stream = torch.cuda.Stream(device=1)
++    with torch.cuda.stream(stream), torch.cuda.device(0):
++        source_cuda = wrap_torch_tensor(source.storage.data.to("cuda:1"), dtype=FP4, shape=source.shape,
++                                        layout=source.storage.layout)
++        actual = convert_layout(source_cuda, destination)
++
++        assert torch.cuda.current_device() == 0
++        assert torch.cuda.current_stream(1) == stream
++        assert actual.device == torch.device("cuda:1")
++        assert actual.shape == expected.shape
++        assert actual.storage.data.stride() == expected.storage.data.stride()
++        stream.synchronize()
++        assert torch.equal(actual.storage.data.cpu(), expected.storage.data)
++
++
+ @pytest.mark.parametrize("n_slices", [1, 7, 33, 911, 1025])
+ def test_make_ragged_tensor_metadata(n_slices):
+     torch.manual_seed(0)
+diff --git a/python/triton_kernels/tests/test_tensor_details/test_layout_blackwell.py b/python/triton_kernels/tests/test_tensor_details/test_layout_blackwell.py
+index 5283c124b100..32e208f24091 100644
+--- a/python/triton_kernels/tests/test_tensor_details/test_layout_blackwell.py
++++ b/python/triton_kernels/tests/test_tensor_details/test_layout_blackwell.py
+@@ -8,7 +8,7 @@
+     StridedLayout,
+ )
+ from triton_kernels.tensor_details.dtype import FP4
+-from triton_kernels.tensor import make_ragged_tensor_metadata, make_ragged_tensor_metadata_torch, wrap_torch_tensor, convert_layout
++from triton_kernels.tensor import make_ragged_tensor_metadata, make_ragged_tensor_metadata_torch, wrap_torch_tensor, convert_layout, empty
+ 
+ # ------------------------------------------------------------
+ # Torch tests
+@@ -29,7 +29,7 @@ def test_act_scale_storage_preservation():
+ 
+ @pytest.mark.parametrize("shape", ZERO_SIZED_SHAPES)
+ @pytest.mark.parametrize("layout", [BlackwellMXScaleLayout(), BlackwellActMXScaleLayout(None)])
+-@pytest.mark.parametrize("device", ["cpu", "meta"])
++@pytest.mark.parametrize("device", ["cpu", "meta", "cuda"])
+ def test_scale_zero_sized_roundtrip(shape, layout, device):
+     x = torch.empty(shape, dtype=torch.uint8, device=device)
+     src = wrap_torch_tensor(x)
+@@ -40,21 +40,123 @@ def test_scale_zero_sized_roundtrip(shape, layout, device):
+     assert roundtrip.storage.data.shape == x.shape
+ 
+ 
+-@pytest.mark.parametrize("shape", ZERO_SIZED_SHAPES)
+-@pytest.mark.parametrize("layout", [BlackwellMXValueLayout(), BlackwellMX4ValueShuffledLayout()])
+-@pytest.mark.parametrize("device", ["cpu", "meta"])
+-def test_value_zero_sized_roundtrip(shape, layout, device):
+-    x = torch.empty(shape, dtype=torch.uint8, device=device)
+-    src = wrap_torch_tensor(x, dtype=FP4)
+-
+-    swizzled = convert_layout(src, layout)
+-    roundtrip = convert_layout(swizzled, src.storage.layout)
+-
+-    assert roundtrip.storage.data.shape == x.shape
++@pytest.mark.parametrize(("shape", "major_dim"),
++                         [(shape[:-1] + (2 * shape[-1], ), -1) for shape in ZERO_SIZED_SHAPES] + [((2, 0, 6, 8), -2)])
++@pytest.mark.parametrize("layouts", [
++    (BlackwellMXValueLayout(), ),
++    (BlackwellMX4ValueShuffledLayout(), BlackwellMX4ValueShuffledLayout(block_k=256, block_n=128)),
++])
++@pytest.mark.parametrize("device", ["cpu", "meta", "cuda"])
++def test_value_zero_sized_roundtrip(shape, major_dim, layouts, device):
++    src_layout = StridedLayout(major_dim)
++    src = empty(shape, dtype=FP4, device=device, layout=src_layout)
++
++    converted = src
++    for layout in layouts:
++        converted = convert_layout(converted, layout)
++        transformation = layout.make_transformation(list(shape), True)
++        canonical = transformation.unswizzle_data(converted.data)
++        assert converted.shape == list(shape)
++        assert list(converted.data.shape) == transformation.storage_shape
++        assert canonical.shape == (*shape[:-1], shape[-1] // 2)
++    roundtrip = convert_layout(converted, src_layout)
++
++    assert src.shape == roundtrip.shape == list(shape)
++    assert roundtrip.data.shape == src.data.shape
++
++
++@pytest.mark.parametrize("k", [1, 3])
++@pytest.mark.parametrize("n", [0, 64])
++def test_mxfp4_value_shuffled_rejects_odd_k(k, n):
++    src = empty((k, n), dtype=FP4, device="cuda")
++    with pytest.raises(ValueError, match="packing dimension -2 must have an even size"):
++        convert_layout(src, BlackwellMX4ValueShuffledLayout())
++
++
++@pytest.mark.parametrize("k", [0, 2])
++def test_mxfp4_value_shuffled_retile_rejects_odd_n(k):
++    shape = [k, 3]
++    layout = BlackwellMX4ValueShuffledLayout(block_n=128)
++    data = torch.full(layout.storage_shape(shape, True), 0x11, dtype=torch.uint8, device="cuda")
++    src = wrap_torch_tensor(data, dtype=FP4, shape=shape, layout=layout)
++    with pytest.raises(ValueError, match="packing dimension -1 must have an even size"):
++        convert_layout(src, BlackwellMX4ValueShuffledLayout())
++
++
++@pytest.mark.parametrize("shape", [(256, 256), (258, 129), (2, 66, 33), (2, 3, 130, 65)])
++@pytest.mark.parametrize("block_k", [128, 256])
++@pytest.mark.parametrize("block_n", [128, 256])
++@pytest.mark.parametrize("step", [1, 2])
++def test_mxfp4_value_shuffled_matches_torch(shape, block_k, block_n, step):
++    input_shape = tuple(step * size for size in shape[:-1]) + shape[-1:]
++    data_cpu = torch.randint(0, 256, input_shape, dtype=torch.uint8, generator=torch.Generator().manual_seed(0))
++    data_cuda = data_cpu.cuda()
++    index = (slice(step - 1, None, step), ) * (len(shape) - 1) + (slice(None), )
++    data_cpu, data_cuda = data_cpu[index], data_cuda[index]
++    logical_shape = list(data_cpu.shape)
++    logical_shape[-1] *= 2
++    layout = BlackwellMX4ValueShuffledLayout(block_k, block_n)
++    transformation = layout.make_transformation(logical_shape, is_fp4=True)
++
++    swizzled_cpu = transformation.swizzle_data(data_cpu)
++    swizzled_cuda = transformation.swizzle_data(data_cuda)
++
++    assert swizzled_cuda.is_contiguous()
++    assert torch.equal(swizzled_cuda.cpu(), swizzled_cpu)
++    if step == 2:
++        swizzled_cpu = torch.stack((swizzled_cpu, swizzled_cpu), dim=-1)[..., 1]
++        swizzled_cuda = torch.stack((swizzled_cuda, swizzled_cuda), dim=-1)[..., 1]
++    restored_cpu = transformation.unswizzle_data(swizzled_cpu)
++    restored_cuda = transformation.unswizzle_data(swizzled_cuda)
++    assert restored_cuda.is_contiguous()
++    assert torch.equal(restored_cuda.cpu(), restored_cpu)
++    assert torch.equal(restored_cpu, data_cpu)
++
++
++@pytest.mark.parametrize("shape", [(256, 128), (2, 258, 65)])
++def test_mxfp4_value_shuffled_convert_layout_matches_torch(shape):
++    data_cpu = torch.randint(0, 256, shape, dtype=torch.uint8)
++    data_cuda = data_cpu.cuda()
++    data_cpu, data_cuda = data_cpu.mT, data_cuda.mT
++    src_cpu = wrap_torch_tensor(data_cpu, dtype=FP4)
++    src_cuda = wrap_torch_tensor(data_cuda, dtype=FP4)
++    layout = BlackwellMX4ValueShuffledLayout()
++
++    expected = convert_layout(src_cpu, layout)
++    actual = convert_layout(src_cuda, layout)
++    roundtrip = convert_layout(actual, src_cuda.storage.layout)
++
++    assert actual.storage.data.is_contiguous()
++    assert torch.equal(actual.storage.data.cpu(), expected.storage.data)
++    assert torch.equal(roundtrip.storage.data, data_cuda)
++
++
++@pytest.mark.parametrize("inverse", [False, True])
++def test_mxfp4_value_shuffled_peak_allocation(inverse):
++    data = torch.empty((2048, 2048), dtype=torch.uint8, device="cuda")
++    layout = BlackwellMX4ValueShuffledLayout()
++    transformation = layout.make_transformation([2048, 4096], is_fp4=True)
++    if inverse:
++        data = transformation.swizzle_data(data)
++        convert = transformation.unswizzle_data
++    else:
++        convert = transformation.swizzle_data
++    warm = convert(data)
++    torch.cuda.synchronize(data.device)
++    del warm
++    baseline = torch.cuda.memory_allocated(data.device)
++    torch.cuda.reset_peak_memory_stats(data.device)
++
++    actual = convert(data)
++    torch.cuda.synchronize(data.device)
++    peak = torch.cuda.max_memory_allocated(data.device) - baseline
++
++    # Shuffling should allocate its output, not another whole weight tensor.
++    assert peak <= actual.nbytes + 1024**2
+ 
+ 
+ @pytest.mark.parametrize(("slice_sizes", "shape"), [([0], (0, 64)), ([2, 0], (2, 0))])
+-@pytest.mark.parametrize("device", ["cpu", "meta"])
++@pytest.mark.parametrize("device", ["cpu", "meta", "cuda"])
+ def test_act_scale_zero_sized_ragged_roundtrip(slice_sizes, shape, device):
+     metadata = make_ragged_tensor_metadata_torch(torch.tensor(slice_sizes, dtype=torch.int32), shape[0])
+     x = torch.empty(shape, device=device)
+diff --git a/python/triton_kernels/tests/test_tensor_details/test_layout_hopper.py b/python/triton_kernels/tests/test_tensor_details/test_layout_hopper.py
+index f40d437266f3..6f4a927134ac 100644
+--- a/python/triton_kernels/tests/test_tensor_details/test_layout_hopper.py
++++ b/python/triton_kernels/tests/test_tensor_details/test_layout_hopper.py
+@@ -1,6 +1,5 @@
+ import pytest
+-from triton._internal_testing import is_cuda
+-from triton_kernels.tensor import wrap_torch_tensor, convert_layout, FP4
++from triton_kernels.tensor import wrap_torch_tensor, convert_layout, empty, FP4
+ from triton_kernels.tensor_details.layout import HopperMXScaleLayout, HopperMXValueLayout, StridedLayout
+ from triton_kernels.numerics_details.mxfp import downcast_to_mxfp, upcast_from_mxfp
+ from triton_kernels.tensor_details.layout_details.hopper_value import mxfp4_to_bf16_triton
+@@ -37,6 +36,32 @@ def test_mxfp4_value_roundtrip(shape, trans, mx_axis, mma_version):
+     assert (res == x).all()
+ 
+ 
++@pytest.mark.parametrize("shape", [(64, 128), (130, 66), (2, 34, 18), (2, 3, 66, 34)])
++@pytest.mark.parametrize("step", [1, 2])
++@pytest.mark.parametrize("trans", [False, True])
++@pytest.mark.parametrize("mx_axis", [-2, -1])
++@pytest.mark.parametrize("mma_version", [2, 3])
++def test_mxfp4_value_swizzle_matches_torch(shape, step, trans, mx_axis, mma_version):
++    data_cpu = torch.randint(0, 256, tuple(step * size for size in shape), dtype=torch.uint8,
++                             generator=torch.Generator().manual_seed(0))
++    data_cuda = data_cpu.cuda()
++    index = (slice(step - 1, None, step), ) * len(shape)
++    data_cpu, data_cuda = data_cpu[index], data_cuda[index]
++    if trans:
++        data_cpu, data_cuda = data_cpu.mT, data_cuda.mT
++    logical_shape = list(data_cpu.shape)
++    logical_shape[-1] *= 2
++    layout = HopperMXValueLayout(mx_axis, mma_version)
++    transformation = layout.make_transformation(logical_shape, is_fp4=True)
++
++    expected = transformation.swizzle_data(data_cpu)
++    actual = transformation.swizzle_data(data_cuda)
++
++    assert actual.stride() == expected.stride()
++    assert torch.equal(actual.cpu(), expected)
++    assert torch.equal(transformation.unswizzle_data(actual).cpu(), data_cpu)
++
++
+ def test_mxfp4_value_storage_shape_matches_swizzle():
+     x = torch.randint(0, 256, (64, 128), dtype=torch.uint8)
+     transformation = HopperMXValueLayout(-1, 3).make_transformation([64, 256], is_fp4=True)
+@@ -48,19 +73,25 @@ def test_mxfp4_value_storage_shape_matches_swizzle():
+     assert torch.equal(transformation.unswizzle_data(swizzled), x)
+ 
+ 
+-@pytest.mark.parametrize("shape", ZERO_SIZED_SHAPES)
++@pytest.mark.parametrize(("shape", "major_dim"),
++                         [(shape[:-1] + (2 * shape[-1], ), -1) for shape in ZERO_SIZED_SHAPES] + [((2, 0, 6, 8), -2)])
+ @pytest.mark.parametrize("mx_axis", [-2, -1])
+ @pytest.mark.parametrize("mma_version", [2, 3])
+-@pytest.mark.parametrize("device", ["cpu", "meta"])
+-def test_mxfp4_value_zero_sized_roundtrip(shape, mx_axis, mma_version, device):
+-    x = torch.empty(shape, dtype=torch.uint8, device=device)
+-    src = wrap_torch_tensor(x, dtype=FP4)
++@pytest.mark.parametrize("device", ["cpu", "meta", "cuda"])
++def test_mxfp4_value_zero_sized_roundtrip(shape, major_dim, mx_axis, mma_version, device):
++    src_layout = StridedLayout(major_dim)
++    src = empty(shape, dtype=FP4, device=device, layout=src_layout)
+     layout = HopperMXValueLayout(mx_axis=mx_axis, mma_version=mma_version)
++    transformation = layout.make_transformation(list(shape), True)
+ 
+     swizzled = convert_layout(src, layout)
+-    roundtrip = convert_layout(swizzled, src.storage.layout)
++    canonical = transformation.unswizzle_data(swizzled.data)
++    roundtrip = convert_layout(swizzled, src_layout)
+ 
+-    assert roundtrip.storage.data.shape == x.shape
++    assert src.shape == swizzled.shape == roundtrip.shape == list(shape)
++    assert list(swizzled.data.shape) == transformation.storage_shape
++    assert canonical.shape == (*shape[:-1], shape[-1] // 2)
++    assert roundtrip.data.shape == src.data.shape
+ 
+ 
+ @pytest.mark.parametrize("mx_axis", [-2, -1])
+@@ -75,6 +106,47 @@ def test_mxfp4_value_convert_layout_roundtrip(mx_axis):
+     assert torch.equal(roundtrip.storage.data, x)
+ 
+ 
++@pytest.mark.parametrize("shape", [(64, 64), (2, 34, 18)])
++@pytest.mark.parametrize("trans", [False, True])
++@pytest.mark.parametrize("mx_axis", [-2, -1])
++@pytest.mark.parametrize("mma_version", [2, 3])
++def test_mxfp4_value_convert_layout_matches_torch(shape, trans, mx_axis, mma_version):
++    data_cpu = torch.randint(0, 256, shape, dtype=torch.uint8)
++    data_cuda = data_cpu.cuda()
++    if trans:
++        data_cpu, data_cuda = data_cpu.mT, data_cuda.mT
++    src_cpu = wrap_torch_tensor(data_cpu, dtype=FP4)
++    src_cuda = wrap_torch_tensor(data_cuda, dtype=FP4)
++    layout = HopperMXValueLayout(mx_axis, mma_version)
++
++    expected = convert_layout(src_cpu, layout)
++    actual = convert_layout(src_cuda, layout)
++    roundtrip = convert_layout(actual, src_cuda.storage.layout)
++
++    assert actual.storage.data.stride() == expected.storage.data.stride()
++    assert torch.equal(actual.storage.data.cpu(), expected.storage.data)
++    assert torch.equal(roundtrip.storage.data, data_cuda)
++
++
++@pytest.mark.parametrize("mx_axis", [-2, -1])
++def test_mxfp4_value_swizzle_peak_allocation(mx_axis):
++    data = torch.empty((2048, 2048), dtype=torch.uint8, device="cuda")
++    layout = HopperMXValueLayout(mx_axis, 3)
++    transformation = layout.make_transformation([2048, 4096], is_fp4=True)
++    warm = transformation.swizzle_data(data)
++    torch.cuda.synchronize(data.device)
++    del warm
++    baseline = torch.cuda.memory_allocated(data.device)
++    torch.cuda.reset_peak_memory_stats(data.device)
++
++    swizzled = transformation.swizzle_data(data)
++    torch.cuda.synchronize(data.device)
++    peak = torch.cuda.max_memory_allocated(data.device) - baseline
++
++    # Allow overlapping byte buffers, but not whole-tensor int32 intermediates.
++    assert peak <= 2 * swizzled.nbytes + 1024**2
++
++
+ @pytest.mark.parametrize("mx_axis", [0, 1])
+ @pytest.mark.parametrize("num_warps", [4, 8])
+ @pytest.mark.parametrize("shape", [(256, 64), (256, 128), (256, 256)])
+@@ -89,7 +161,7 @@ def test_mxfp4_scale_roundtrip(shape, mx_axis, num_warps):
+ @pytest.mark.parametrize("shape", ZERO_SIZED_SHAPES)
+ @pytest.mark.parametrize("mx_axis", [-2, -1])
+ @pytest.mark.parametrize("num_warps", [4, 8])
+-@pytest.mark.parametrize("device", ["cpu", "meta"])
++@pytest.mark.parametrize("device", ["cpu", "meta", "cuda"])
+ def test_mxfp4_scale_zero_sized_roundtrip(shape, mx_axis, num_warps, device):
+     x = torch.empty(shape, dtype=torch.uint8, device=device)
+     src = wrap_torch_tensor(x)
+@@ -132,7 +204,6 @@ def _upcast_mxfp4_to_bf16(Y, X, XScale, x_stride_m, x_stride_n, x_scale_stride_m
+     tl.store(Y + offs_y, y)
+ 
+ 
+-@pytest.mark.skipif(not is_cuda(), reason="Only supported on cuda")
+ @pytest.mark.skipif(not cuda_capability_geq(9), reason="Only supported for capability >= 9")
+ @pytest.mark.parametrize("num_warps", [4, 8])
+ @pytest.mark.parametrize("mx_axis", [0, 1])
+diff --git a/python/triton_kernels/triton_kernels/tensor_details/layout_details/blackwell_value_shuffled.py b/python/triton_kernels/triton_kernels/tensor_details/layout_details/blackwell_value_shuffled.py
+index ad5ef83bcdf0..4ec6601a3546 100644
+--- a/python/triton_kernels/triton_kernels/tensor_details/layout_details/blackwell_value_shuffled.py
++++ b/python/triton_kernels/triton_kernels/tensor_details/layout_details/blackwell_value_shuffled.py
+@@ -1,6 +1,10 @@
+ import math
+ from dataclasses import dataclass
++
+ import torch
++import triton
++import triton.language as tl
++
+ from .base import Layout, LayoutTransformation
+ from .torch_utils import repack
+ 
+@@ -65,56 +69,80 @@ class BlackwellMX4ValueShuffledTransformation(LayoutTransformation):
+     def storage_shape(self) -> list[int]:
+         if not self.is_fp4:
+             raise ValueError("BlackwellMX4ValueShuffledLayout only supports fp4 values")
++        if self.shape[-2] % 2:
++            raise ValueError(f"FP4 packing dimension -2 must have an even size, got {self.shape[-2]}")
+         E = math.prod(self.shape[:-2])
+         K_packed = self.shape[-2] // 2
+         N = self.shape[-1]
+-        tile_k_packed, tile_n, _, _, num_tiles_k, num_tiles_n = self._compute_params(E, K_packed, N)
++        tile_k_packed, tile_n, _, _, num_tiles_k, num_tiles_n = self._compute_params(K_packed, N)
+         return [E, num_tiles_k, num_tiles_n, tile_n, tile_k_packed]
+ 
+-    def _compute_params(self, E, K_packed, N):
++    def _compute_params(self, K_packed, N):
+         """Compute tiling parameters from the physical shape."""
+-        packed_block_k = self.block_k // 2
+-        tile_k_packed = packed_block_k
++        tile_k_packed = self.block_k // 2
+         tile_n = self.block_n
+ 
+-        # lcm(128, tile_k_packed): 128 is the TMA alignment requirement in bytes
+-        align_k = (128 * tile_k_packed) // math.gcd(128, tile_k_packed)
++        # 128 is the TMA alignment requirement in bytes.
++        align_k = math.lcm(128, tile_k_packed)
+         padded_K_packed = ((K_packed + align_k - 1) // align_k) * align_k
+-        num_tiles_k = (padded_K_packed + tile_k_packed - 1) // tile_k_packed
++        num_tiles_k = padded_K_packed // tile_k_packed
+         num_tiles_n = (N + tile_n - 1) // tile_n
+         padded_N = num_tiles_n * tile_n
+ 
+         return tile_k_packed, tile_n, padded_K_packed, padded_N, num_tiles_k, num_tiles_n
+ 
+-    def _canonical_to_physical(self, data: torch.Tensor) -> torch.Tensor:
+-        """Repack canonical [..., K, N_packed] storage to physical [E, K_packed, N]."""
+-        if not self.is_fp4:
+-            raise ValueError("BlackwellMX4ValueShuffledLayout only supports fp4 values")
++    def swizzle_data(self, data: torch.Tensor) -> torch.Tensor:
++        """Convert canonical [..., K, N_packed] bytes to shuffled 5D storage."""
+         assert data.stride(-1) == 1
+-        out_shape = list(data.shape)
+-        out_shape[-1] *= 2
+-        out_shape[-2] //= 2
+-        out = torch.empty(out_shape, dtype=data.dtype, device=data.device)
+-        return repack(data, -1, -2, self.is_fp4, out=out)
+-
+-    def _physical_to_canonical(self, data: torch.Tensor) -> torch.Tensor:
+-        """Repack physical [E, K_packed, N] storage to canonical [..., K, N_packed]."""
+-        if not self.is_fp4:
+-            raise ValueError("BlackwellMX4ValueShuffledLayout only supports fp4 values")
+-        out_shape = list(data.shape)
+-        out_shape[-2] *= 2
+-        out_shape[-1] //= 2
+-        out = torch.empty(out_shape, dtype=data.dtype, device=data.device)
+-        return repack(data, -2, -1, self.is_fp4, out=out)
++        return self._convert_data(data, inverse=False)
+ 
+-    def swizzle_data(self, data: torch.Tensor) -> torch.Tensor:
++    def unswizzle_data(self, data: torch.Tensor) -> torch.Tensor:
++        """Convert shuffled 5D storage back to canonical packed bytes."""
++        return self._convert_data(data, inverse=True)
++
++    def _convert_data(self, data: torch.Tensor, inverse: bool) -> torch.Tensor:
++        storage_shape = self.storage_shape
++        # The canonical intermediate packs N, while shuffled storage packs K.
++        if self.shape[-1] % 2:
++            raise ValueError(f"FP4 packing dimension -1 must have an even size, got {self.shape[-1]}")
++        if data.device.type != "cuda" or data.dtype != torch.uint8:
++            return self._unswizzle_data_torch(data) if inverse else self._swizzle_data_torch(data)
++
++        canonical_shape = [*self.shape[:-1], self.shape[-1] // 2]
++        out = torch.empty(canonical_shape if inverse else storage_shape, dtype=data.dtype, device=data.device)
++        canonical, shuffled = (out, data) if inverse else (data, out)
++        E, num_tiles_k, num_tiles_n, tile_n, tile_k = storage_shape
++        K_packed, N_packed = self.shape[-2] // 2, self.shape[-1] // 2
++        K_pad, N_pad = num_tiles_k * tile_k, num_tiles_n * tile_n
++        block_k, block_n = 64, 128
++        grid_k = triton.cdiv(K_packed if inverse else K_pad, block_k)
++        grid_n = triton.cdiv(2 * N_packed if inverse else N_pad, 2 * block_n)
++        # Keep indexing divisors valid even when the launch grid is empty.
++        with torch.cuda.device(data.device):
++            _convert_shuffled_mxfp4[(E * grid_k * grid_n, )](
++                canonical,
++                shuffled,
++                tuple(canonical_shape),
++                tuple(storage_shape),
++                canonical.stride(),
++                shuffled.stride(),
++                GRID_K=max(grid_k, 1),
++                GRID_N=max(grid_n, 1),
++                INVERSE=inverse,
++                BLOCK_K=block_k,
++                BLOCK_N=block_n,
++                num_warps=4,
++            )
++        return out
++
++    def _swizzle_data_torch(self, data: torch.Tensor) -> torch.Tensor:
+         """
+         Convert data from canonical [..., K, N_packed] to 5D shuffled layout.
+ 
+         Target layout: [E, num_tiles_k, num_tiles_n, tile_n, tile_k_packed]
+         This matches the baseline TMA block shape [block_n, packed_block_k] after swapping.
+         """
+-        data = self._canonical_to_physical(data)
++        data = repack(data, -1, -2, True)
+         E, num_tiles_k, num_tiles_n, tile_n, tile_k_packed = self.storage_shape
+         K_packed, N = data.shape[-2:]
+         data = data.reshape(E, K_packed, N)
+@@ -139,7 +167,7 @@ def swizzle_data(self, data: torch.Tensor) -> torch.Tensor:
+         data = data.permute(0, 3, 1, 2, 4).contiguous()
+         return self._validate_storage_shape(data)
+ 
+-    def unswizzle_data(self, data: torch.Tensor) -> torch.Tensor:
++    def _unswizzle_data_torch(self, data: torch.Tensor) -> torch.Tensor:
+         """
+         Convert data from shuffled back to canonical [..., K, N_packed].
+ 
+@@ -148,10 +176,10 @@ def unswizzle_data(self, data: torch.Tensor) -> torch.Tensor:
+         E = data.shape[0]
+         leading_shape = self.shape[:-2]
+         # Recover original shape from self.shape (the logical shape passed to convert_layout)
+-        orig_K_packed = self.shape[-2] // 2 if self.is_fp4 else self.shape[-2]
++        orig_K_packed = self.shape[-2] // 2
+         orig_N = self.shape[-1]
+         tile_k_packed, tile_n, padded_K_packed, padded_N, num_tiles_k, num_tiles_n = \
+-            self._compute_params(E, orig_K_packed, orig_N)
++            self._compute_params(orig_K_packed, orig_N)
+ 
+         # Inverse of permute(0, 3, 1, 2, 4) is permute(0, 2, 3, 1, 4)
+         # [E, num_tiles_k, num_tiles_n, tile_n, tile_k_packed] ->
+@@ -166,7 +194,68 @@ def unswizzle_data(self, data: torch.Tensor) -> torch.Tensor:
+ 
+         # Trim padding back to original shape
+         data = data[:, :orig_K_packed, :orig_N].contiguous()
+-        data = self._physical_to_canonical(data)
++        data = repack(data, -2, -1, True)
+         if not leading_shape:
+             return data.squeeze(0)
+         return data.reshape(*leading_shape, data.shape[-2], data.shape[-1])
++
++
++@triton.jit
++def _convert_shuffled_mxfp4(
++    Canonical,
++    Shuffled,
++    CANONICAL_SHAPE: tl.constexpr,
++    SHUFFLED_SHAPE: tl.constexpr,
++    CANONICAL_STRIDES: tl.constexpr,
++    SHUFFLED_STRIDES: tl.constexpr,
++    GRID_K: tl.constexpr,
++    GRID_N: tl.constexpr,
++    INVERSE: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++):
++    K_PACKED: tl.constexpr = CANONICAL_SHAPE[-2] // 2
++    N_PACKED: tl.constexpr = CANONICAL_SHAPE[-1]
++    TILE_K: tl.constexpr = SHUFFLED_SHAPE[-1]
++    TILE_N: tl.constexpr = SHUFFLED_SHAPE[-2]
++    K_PAD: tl.constexpr = SHUFFLED_SHAPE[1] * TILE_K
++    N_PAD: tl.constexpr = SHUFFLED_SHAPE[2] * TILE_N
++    pid = tl.program_id(0).to(tl.int64)
++    batch = pid // (GRID_K * GRID_N)
++    k = (pid // GRID_N % GRID_K) * BLOCK_K + tl.arange(0, BLOCK_K)
++    n = (pid % GRID_N) * BLOCK_N + tl.arange(0, BLOCK_N)
++
++    # Keep leading strides instead of flattening a possibly noncontiguous input.
++    batch_offset = tl.full((), 0, tl.int64)
++    batch_index = batch
++    for axis in tl.static_range(len(CANONICAL_SHAPE) - 3, -1, -1):
++        batch_offset += (batch_index % max(CANONICAL_SHAPE[axis], 1)) * CANONICAL_STRIDES[axis]
++        batch_index //= max(CANONICAL_SHAPE[axis], 1)
++    canonical_k = 2 * k * CANONICAL_STRIDES[-2]
++    canonical_even = Canonical + batch_offset + canonical_k[:, None] + n[None, :] * CANONICAL_STRIDES[-1]
++    canonical_odd = canonical_even + CANONICAL_STRIDES[-2]
++
++    shuffled_k = k // TILE_K * SHUFFLED_STRIDES[1] + k % TILE_K * SHUFFLED_STRIDES[4]
++    even_n, odd_n = 2 * n, 2 * n + 1
++    shuffled_even = Shuffled + batch * SHUFFLED_STRIDES[0] + shuffled_k[:, None] + \
++        (even_n // TILE_N * SHUFFLED_STRIDES[2] + even_n % TILE_N * SHUFFLED_STRIDES[3])[None, :]
++    shuffled_odd = Shuffled + batch * SHUFFLED_STRIDES[0] + shuffled_k[:, None] + \
++        (odd_n // TILE_N * SHUFFLED_STRIDES[2] + odd_n % TILE_N * SHUFFLED_STRIDES[3])[None, :]
++    mask = (k[:, None] < K_PACKED) & (n[None, :] < N_PACKED)
++
++    if INVERSE:
++        a = tl.load(shuffled_even, mask, other=0).to(tl.uint32)
++        b = tl.load(shuffled_odd, mask, other=0).to(tl.uint32)
++    else:
++        a = tl.load(canonical_even, mask, other=0).to(tl.uint32)
++        b = tl.load(canonical_odd, mask, other=0).to(tl.uint32)
++    # Transposing a 2x2 group of FP4 nibbles is its own inverse.
++    lo = (a & 0x0F) | ((b & 0x0F) << 4)
++    hi = (a >> 4) | (b & 0xF0)
++
++    if INVERSE:
++        tl.store(canonical_even, lo, mask)
++        tl.store(canonical_odd, hi, mask)
++    else:
++        tl.store(shuffled_even, lo, (k[:, None] < K_PAD) & (even_n[None, :] < N_PAD))
++        tl.store(shuffled_odd, hi, (k[:, None] < K_PAD) & (odd_n[None, :] < N_PAD))
+diff --git a/python/triton_kernels/triton_kernels/tensor_details/layout_details/hopper_value.py b/python/triton_kernels/triton_kernels/tensor_details/layout_details/hopper_value.py
+index 392896f33762..62b5fa819846 100644
+--- a/python/triton_kernels/triton_kernels/tensor_details/layout_details/hopper_value.py
++++ b/python/triton_kernels/triton_kernels/tensor_details/layout_details/hopper_value.py
+@@ -159,13 +159,13 @@ def swizzle_data(self, data):
+         assert data.shape[-2] == init_shape[-2] // 4
+         assert data.shape[-1] == init_shape[-1] * 4
+         # twiddle the bits
+-        data = _pack_bits(data, self.mx_axis)
++        data = _convert_bits(data, inverse=False)
+         data = self._maybe_mT(data)
+         return self._validate_storage_shape(data)
+ 
+     def unswizzle_data(self, data):
+         data = self._maybe_mT(data)
+-        data = _unpack_bits(data, self.mx_axis)
++        data = _convert_bits(data, inverse=True)
+         *batch, M, K = data.shape
+         # We have two times the elements if we already upcasted to bfloat16
+         mult = 2 if data.dtype == torch.bfloat16 else 1
+@@ -211,7 +211,7 @@ def _compress_fourth(x):
+     return ((x & 0x8) << 11) | ((x & 0x6) << 9) | ((x & 0x1) << 13)
+ 
+ 
+-def _pack_bits(x: torch.Tensor, mx_axis: int):
++def _pack_bits(x: torch.Tensor):
+     x = x.contiguous()
+     x = x.reshape(x.shape[:-1] + (x.shape[-1] // 4, 4))
+     ret = _compress_fp4(x[..., 0]) | (_compress_fp4(x[..., 0] >> 4) << 16)
+@@ -246,7 +246,7 @@ def _bf16x2_to_fp4e2m1x2(x):
+     return ret_lo | (ret_hi << 4)
+ 
+ 
+-def _unpack_bits(x, mx_axis: int):
++def _unpack_bits(x):
+     x = x.view(torch.int32)
+     m = 0b10000001110000001000000111000000
+     a = (x << 1) & 0b10000000000000001000000000000000
+@@ -259,6 +259,57 @@ def _unpack_bits(x, mx_axis: int):
+     return x
+ 
+ 
++@triton.jit
++def _compress_fp4x2_triton(x, FOURTH: tl.constexpr):
++    # Put the two nibbles in separate bf16 lanes before interleaving them.
++    x = (x & 0xF) | ((x & 0xF0) << 12)
++    if FOURTH:
++        return ((x & 0x00080008) << 11) | ((x & 0x00060006) << 9) | ((x & 0x00010001) << 13)
++    return ((x & 0x00080008) << 12) | ((x & 0x00070007) << 6)
++
++
++@triton.jit
++def _bf16x2_to_fp4e2m1x2_triton(x):
++    x = ((x >> 12) & 0x00080008) | ((x >> 6) & 0x00070007)
++    return (x & 0xF) | ((x >> 12) & 0xF0)
++
++
++@triton.jit
++def _convert_bits_kernel(X, Y, N, INVERSE: tl.constexpr, BLOCK_SIZE: tl.constexpr):
++    offsets = tl.program_id(0).to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
++    mask = offsets < N
++    # Byte loads also support contiguous views with unaligned storage offsets.
++    a = tl.load(X + 4 * offsets, mask, other=0).to(tl.uint32)
++    b = tl.load(X + 4 * offsets + 1, mask, other=0).to(tl.uint32)
++    c = tl.load(X + 4 * offsets + 2, mask, other=0).to(tl.uint32)
++    d = tl.load(X + 4 * offsets + 3, mask, other=0).to(tl.uint32)
++    if INVERSE:
++        x = a | (b << 8) | (c << 16) | (d << 24)
++        fourth = ((x << 1) & 0x80008000) | ((x >> 3) & 0x01800180) | ((x >> 7) & 0x00400040)
++        ret = (_bf16x2_to_fp4e2m1x2_triton(x) | (_bf16x2_to_fp4e2m1x2_triton(x << 3) << 8)
++               | (_bf16x2_to_fp4e2m1x2_triton(x << 6) << 16)
++               | (_bf16x2_to_fp4e2m1x2_triton(fourth) << 24))
++    else:
++        ret = (_compress_fp4x2_triton(a, False) | (_compress_fp4x2_triton(b, False) >> 3)
++               | (_compress_fp4x2_triton(c, False) >> 6) | _compress_fp4x2_triton(d, True))
++    tl.store(Y + offsets, ret, mask)
++
++
++def _convert_bits(x: torch.Tensor, inverse: bool) -> torch.Tensor:
++    """Avoid full-size integer temporaries when re-encoding CUDA values."""
++    if x.device.type != "cuda" or x.dtype != torch.uint8:
++        return _unpack_bits(x) if inverse else _pack_bits(x)
++    x = x.contiguous()
++    shape = (*x.shape[:-1], x.shape[-1] // 4)
++    x = x.reshape(*shape, 4)
++    out = torch.empty(shape, dtype=torch.int32, device=x.device)
++    block_size = 1024
++    with torch.cuda.device(x.device):
++        _convert_bits_kernel[(triton.cdiv(out.numel(), block_size), )](x, out, out.numel(), inverse,
++                                                                       BLOCK_SIZE=block_size)
++    return out.view(torch.uint8)
++
++
+ # -----------------------------------------------------------------------
+ 
+ 

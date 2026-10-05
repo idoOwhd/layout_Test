@@ -1,0 +1,1248 @@
+{
+  "records": [
+    {
+      "url": "https://github.com/NVIDIA/TensorRT-LLM/issues/14327",
+      "shared_discussion_context": [
+        "| A25 | [TensorRT-LLM #14327](https://github.com/NVIDIA/TensorRT-LLM/issues/14327) | TRT-LLM / DeepSeek-V4 | KV writer → SWA/COMPRESS attention | KV cache writer | TRT-LLM FP8 SWA/COMPRESS representation | DSV4 attention | reference FlashMLA/SGLang layout differs | cache update → attention | 明确测 TRT-LLM native vs reference-compatible direct write |",
+        "- TensorRT-LLM DeepSeek-V4 FP8 layout mismatch：[Issue #14327](https://github.com/NVIDIA/TensorRT-LLM/issues/14327)"
+      ]
+    },
+    {
+      "url": "https://github.com/NVIDIA/TensorRT-LLM/issues/16801",
+      "shared_discussion_context": [
+        "| [TensorRT-LLM issue #16801](https://github.com/NVIDIA/TensorRT-LLM/issues/16801) | layer-specific KV cache | vanilla attention | consumer 索引依赖真实 cache layout |"
+      ]
+    },
+    {
+      "url": "https://github.com/NVIDIA/TensorRT-LLM/pull/16954",
+      "shared_discussion_context": [
+        "| [TensorRT-LLM PR #16954](https://github.com/NVIDIA/TensorRT-LLM/pull/16954) | DeepEP NVFP4 transport | MoE expert compute | transport representation overhead |"
+      ]
+    },
+    {
+      "url": "https://github.com/NVIDIA/TensorRT-LLM/pull/18485",
+      "shared_discussion_context": [
+        "| A24 | [TensorRT-LLM #18485](https://github.com/NVIDIA/TensorRT-LLM/pull/18485) | TRT-LLM / sparse attention | ragged-row builder → sparse attention | ragged metadata/KV row producer | ragged sparse row contract | sparse attention | same row contract | indexer → ragged-row preparation → attention | 改 row producer 的 physical row arrangement |",
+        "| TensorRT-LLM | ragged sparse-attention row contract | [PR #18485](https://github.com/NVIDIA/TensorRT-LLM/pull/18485) |",
+        "- TensorRT-LLM sparse row contracts：[PR #18485](https://github.com/NVIDIA/TensorRT-LLM/pull/18485)",
+        "| [TensorRT-LLM PR #18485](https://github.com/NVIDIA/TensorRT-LLM/pull/18485) | ragged sparse rows | sparse attention | 显式 row representation contract |"
+      ]
+    },
+    {
+      "url": "https://github.com/NVIDIA/TensorRT-LLM/pull/18921",
+      "shared_discussion_context": [
+        "| P16 | [TensorRT-LLM #18921](https://github.com/NVIDIA/TensorRT-LLM/pull/18921) | TRT-LLM / Qwen3.8-Flash-Next | Prefill → Decode | PD exporter | prefill cache/state representation | remote decode | decode-native representation | disaggregated serving | 对照 producer-native/wire-native/consumer-native |",
+        "- Qwen3.8-Flash-Next disaggregated serving：[PR #18921](https://github.com/NVIDIA/TensorRT-LLM/pull/18921)"
+      ]
+    },
+    {
+      "url": "https://github.com/NVIDIA/TensorRT-LLM/pull/19171",
+      "shared_discussion_context": [
+        "| [TensorRT-LLM PR #19171](https://github.com/NVIDIA/TensorRT-LLM/pull/19171) | KVCM | Mooncake | cache transfer representation |"
+      ]
+    },
+    {
+      "url": "https://github.com/NVIDIA/TensorRT-LLM/pull/19297",
+      "shared_discussion_context": [
+        "| P15 | [TensorRT-LLM #19297](https://github.com/NVIDIA/TensorRT-LLM/pull/19297) | TRT-LLM KVCM V2 | GPU KV → host offload → restore | KVCM residency manager | sparse resident/offloaded layout | attention | device KV layout | host offload | placement + page format |"
+      ]
+    },
+    {
+      "url": "https://github.com/NVIDIA/TensorRT-LLM/pull/19303",
+      "shared_discussion_context": [
+        "| [TensorRT-LLM PR #19303](https://github.com/NVIDIA/TensorRT-LLM/pull/19303) | draft KV pool | target/shared pool | paired draft cache |"
+      ]
+    },
+    {
+      "url": "https://github.com/NVIDIA/TensorRT-LLM/pull/19502",
+      "shared_discussion_context": [
+        "| A26 | [TensorRT-LLM #19502](https://github.com/NVIDIA/TensorRT-LLM/pull/19502) | TRT-LLM / DeepSeek-V4 | sparse KV residency/offload → attention | sparse KV restore/import | resident/offloaded sparse representation | DSV4 attention | sparse attention cache contract | residency → restore → attention | placement+layout case |",
+        "| [TensorRT-LLM PR #19502](https://github.com/NVIDIA/TensorRT-LLM/pull/19502) | sparse KV state | offload | sparse KV representation |"
+      ]
+    },
+    {
+      "url": "https://github.com/NVIDIA/cutlass/issues/2996",
+      "shared_discussion_context": [
+        "- [issue #2996](https://github.com/NVIDIA/cutlass/issues/2996)：`NCxHWx<32>` vs NHWC Conv representations；",
+        "| CUTLASS [#2996](https://github.com/NVIDIA/cutlass/issues/2996) | Conv producer → next consumer | `NCxHWx<32>`、NHWC 等 interleaved layout 的性能并不由单 kernel 简单决定 | NCHW, NHWC, `NCxHWx<32>`，只保留 consumer 合法集合 |"
+      ]
+    },
+    {
+      "url": "https://github.com/NVIDIA/cutlass/issues/3540",
+      "shared_discussion_context": [
+        "| [CUTLASS issue #3540](https://github.com/NVIDIA/cutlass/issues/3540) | GEMM accumulator | broadcast epilogue | RowMajor/ColumnMajor 会改变 broadcast coordinate |",
+        "- [issue #3540](https://github.com/NVIDIA/cutlass/issues/3540)：ColumnMajor output transpose 与 bias consumer coordinate；"
+      ]
+    },
+    {
+      "url": "https://github.com/NVIDIA/cutlass/pull/3273",
+      "shared_discussion_context": [
+        "| U9 | [CUTLASS #3273](https://github.com/NVIDIA/cutlass/pull/3273) | CUTLASS SM120 | quantized global operand → MMA | TMA loader | MXF4/NVFP4 **native-TMA** representation | MMA | native blockscaled operand | TMA staging | compare native-TMA vs transformed input |",
+        "- [PR #3273](https://github.com/NVIDIA/cutlass/pull/3273)：MXF4/NVFP4 native-TMA representation；"
+      ]
+    },
+    {
+      "url": "https://github.com/NVIDIA/cutlass/pull/3313",
+      "shared_discussion_context": [
+        "| C12 | MMA accumulator/TMEM → Epilogue | Micro-op | [CUTLASS #3313](https://github.com/NVIDIA/cutlass/pull/3313) | TMEM/register fragment layout |",
+        "[PR #3313](https://github.com/NVIDIA/cutlass/pull/3313)",
+        "| R31 | CUTLASS TMEM→Epilogue；[#3313](https://github.com/NVIDIA/cutlass/pull/3313) | MMA accumulator in TMEM | register epilogue/store | **TMEM load atom / fragment mapping choices** | TMEM→Reg→epilogue under different mappings | ★★☆：是 micro-layout，不是 tensor-layout |",
+        "| U8 | [CUTLASS #3313](https://github.com/NVIDIA/cutlass/pull/3313) | CUTLASS Blackwell | TMEM → register epilogue | MMA accumulator TMEM | canonical TMEM fragment | epilogue | register fragment/store mapping | TMEM load atom | sweep `32dp32b1x/16x/32x/128x`；属于 micro-layout |",
+        "[CUTLASS #3313](https://github.com/NVIDIA/cutlass/pull/3313)",
+        "| CUTLASS/CuTe | MMA accumulator → epilogue | TMEM→Reg | [PR #3313](https://github.com/NVIDIA/cutlass/pull/3313) | TMEM load atom widths / register layout |"
+      ]
+    },
+    {
+      "url": "https://github.com/NVIDIA/cutlass/pull/3345",
+      "shared_discussion_context": [
+        "| [CUTLASS PR #3345](https://github.com/NVIDIA/cutlass/pull/3345) | SM120 blockscaled GEMM | epilogue store | accumulator→FP32 output layout |",
+        "- [PR #3345](https://github.com/NVIDIA/cutlass/pull/3345)：SM120 FP32 epilogue store layout；"
+      ]
+    },
+    {
+      "url": "https://github.com/NVIDIA/cutlass/pull/3650",
+      "shared_discussion_context": [
+        "| [CUTLASS PR #3650](https://github.com/NVIDIA/cutlass/pull/3650) | Stream-K accumulation | broadcast/store epilogue | fragment/output coordinate mapping |",
+        "- [PR #3650](https://github.com/NVIDIA/cutlass/pull/3650)：Stream-K accumulation → broadcast epilogue；",
+        "| CUTLASS [PR #3650](https://github.com/NVIDIA/cutlass/pull/3650)（2026，open） | MMA accumulator → epilogue/broadcast → output | RowMajor/ColumnMajor 会改变 epilogue/broadcast coordinate contract；不是纯粹名字变化 | RowMajor, ColumnMajor；TMEM/RMEM accumulator-native；epilogue-native output |"
+      ]
+    },
+    {
+      "url": "https://github.com/NVIDIA/cutlass/pull/3656",
+      "shared_discussion_context": [
+        "- [PR #3656](https://github.com/NVIDIA/cutlass/pull/3656)：CopyAtom source/destination layout-size contract。"
+      ]
+    },
+    {
+      "url": "https://github.com/NVIDIA/cutlass/pull/3660",
+      "shared_discussion_context": [
+        "- [PR #3660](https://github.com/NVIDIA/cutlass/pull/3660)：TiledMMA C-layout K slices；"
+      ]
+    },
+    {
+      "url": "https://github.com/flashinfer-ai/flashinfer/issues/3780",
+      "shared_discussion_context": [
+        "| [FlashInfer issue #3780](https://github.com/flashinfer-ai/flashinfer/issues/3780) | MegaMoE activation | MegaMoE | SM90 support/layout space |"
+      ]
+    },
+    {
+      "url": "https://github.com/flashinfer-ai/flashinfer/issues/3856",
+      "shared_discussion_context": [
+        "| [FlashInfer issue #3856](https://github.com/flashinfer-ai/flashinfer/issues/3856) | KV pool | TRTLLM sparse MLA | consumer 没有正确尊重 `stride(0)` |"
+      ]
+    },
+    {
+      "url": "https://github.com/flashinfer-ai/flashinfer/issues/4731",
+      "shared_discussion_context": [
+        "[Issue #4731](https://github.com/flashinfer-ai/flashinfer/issues/4731)",
+        "FlashInfer #4731 又显示 `q_len_per_req>1` 的 masked multi-token verify 可以出现严重性能问题，而 q_len=1 正常。urlFlashInfer issue #4731https://github.com/flashinfer-ai/flashinfer/issues/4731"
+      ]
+    },
+    {
+      "url": "https://github.com/flashinfer-ai/flashinfer/issues/5601",
+      "shared_discussion_context": [
+        "| [FlashInfer issue #5601](https://github.com/flashinfer-ai/flashinfer/issues/5601) | paged KV | cuDNN prefill | HND/NHD contract 错误可直接导致错误结果 |"
+      ]
+    },
+    {
+      "url": "https://github.com/flashinfer-ai/flashinfer/pull/4262",
+      "shared_discussion_context": [
+        "| [FlashInfer PR #4262](https://github.com/flashinfer-ai/flashinfer/pull/4262) | recurrent prefill | recurrent decode |"
+      ]
+    },
+    {
+      "url": "https://github.com/flashinfer-ai/flashinfer/pull/4581",
+      "shared_discussion_context": [
+        "| [FlashInfer PR #4581](https://github.com/flashinfer-ai/flashinfer/pull/4581) | GDN prefill | decode/MTP |"
+      ]
+    },
+    {
+      "url": "https://github.com/flashinfer-ai/flashinfer/pull/4845",
+      "shared_discussion_context": [
+        "| [FlashInfer PR #4845](https://github.com/flashinfer-ai/flashinfer/pull/4845) | KDA prefill | FP32 persistent state |"
+      ]
+    },
+    {
+      "url": "https://github.com/flashinfer-ai/flashinfer/pull/4924",
+      "shared_discussion_context": [
+        "| [FlashInfer PR #4924](https://github.com/flashinfer-ai/flashinfer/pull/4924) | local QKV | Ulysses exchange | low-precision communication representation |"
+      ]
+    },
+    {
+      "url": "https://github.com/flashinfer-ai/flashinfer/pull/5075",
+      "shared_discussion_context": [
+        "| [FlashInfer PR #5075](https://github.com/flashinfer-ai/flashinfer/pull/5075) | sparse MLA KV producer | SM120 sparse MLA | runtime KV row stride/canonical rows |"
+      ]
+    },
+    {
+      "url": "https://github.com/flashinfer-ai/flashinfer/pull/5208",
+      "shared_discussion_context": [
+        "| C4 | Expert GEMM2 → Cross-GPU Combine | Operator→Communication | [FlashInfer #5208](https://github.com/flashinfer-ai/flashinfer/pull/5208) | GEMM epilogue layout影响通信 |",
+        "[FlashInfer #5208](https://github.com/flashinfer-ai/flashinfer/pull/5208)",
+        "[PR #5208](https://github.com/flashinfer-ai/flashinfer/pull/5208)",
+        "| R17 | FlashInfer GEMM2→MoE Combine；[#5208](https://github.com/flashinfer-ai/flashinfer/pull/5208) | expert GEMM2 epilogue | cross-GPU combine/local reduction | **local token output vs `(token,k_slot)` route-slot output** | local HBM→collective vs direct peer route-slot→local reduce | ★★☆：layout+placement+comm |",
+        "| M5 | [FlashInfer #5208](https://github.com/flashinfer-ai/flashinfer/pull/5208) | FlashInfer/vLLM EP MoE | GEMM2 → Combine | GEMM2 epilogue | local output vs **`(token,k_slot)` route-slot** | reduce/combine | local/peer route-slot buffer | reduce_scatterv / peer-store / local reduce | 改 **GEMM2 destination layout+placement** |",
+        "[FlashInfer PR #5208](https://github.com/flashinfer-ai/flashinfer/pull/5208)"
+      ]
+    },
+    {
+      "url": "https://github.com/flashinfer-ai/flashinfer/pull/5309",
+      "shared_discussion_context": [
+        "| [FlashInfer PR #5309](https://github.com/flashinfer-ai/flashinfer/pull/5309) | MegaMoE FC1 | FC2 | split representation/backend |"
+      ]
+    },
+    {
+      "url": "https://github.com/flashinfer-ai/flashinfer/pull/5329",
+      "shared_discussion_context": [
+        "[FlashInfer PR #5329](https://github.com/flashinfer-ai/flashinfer/pull/5329)：同样叫 NHD 的情况下，equal/unequal K/V strides 仍会改变 consumer specialization。",
+        "| FlashInfer [PR #5329](https://github.com/flashinfer-ai/flashinfer/pull/5329)（merged） | KV producer → persistent BatchAttention | equal K/V stride 与 unequal stride 走不同 specialization，说明 consumer 不只对“layout name”敏感，还对真实 stride contract 敏感 | equal-stride NHD、unequal-stride NHD；合法 stride variants |"
+      ]
+    },
+    {
+      "url": "https://github.com/flashinfer-ai/flashinfer/pull/5402",
+      "shared_discussion_context": [
+        "| R10 | FlashInfer MSA NVFP4；[#5402](https://github.com/flashinfer-ai/flashinfer/pull/5402) | NVFP4 KV quantizer/packer | Cake/msa_ops MSA decode | **generic KV+scale packing vs canonical planar MSA page layout** | generic→repack→MSA vs producer direct canonical page layout→MSA | ★★★ |",
+        "| A20 | [FlashInfer #5402](https://github.com/flashinfer-ai/flashinfer/pull/5402) | FlashInfer / MSA | NVFP4 KV pack → MSA decode | NVFP4 KV producer | canonical planar data/scale page layout | Cake MSA decode | exact NVFP4 paged contract | quant → pack data/scales → MSA | 改 quantizer/packer direct output；canonical vs generic KV+scale |",
+        "| [FlashInfer PR #5402](https://github.com/flashinfer-ai/flashinfer/pull/5402) | NVFP4 KV producer | MSA sparse decode | 明确定义 canonical page layout contract |",
+        "| FlashInfer [PR #5402](https://github.com/flashinfer-ai/flashinfer/pull/5402)（merged） | NVFP4 paged-KV producer → MSA sparse decode | PR 专门定义 canonical planar page contract：K data/K scale/V data/V scale 的布局必须被 producer 与 reader共同遵守 | generic KV+scale representation；canonical MSA planar representation；producer-native canonical |"
+      ]
+    },
+    {
+      "url": "https://github.com/flashinfer-ai/flashinfer/pull/5452",
+      "shared_discussion_context": [
+        "| L3 | [FlashInfer #5452](https://github.com/flashinfer-ai/flashinfer/pull/5452) | FlashInfer / KDA | KDA prefill → persistent state | KDA prefill | FP32 intermediate/recurrent state/checkpoint representation | later KDA | prepared state contract | plan cache / checkpoint | 状态 precision 与 layout 分因素 |"
+      ]
+    },
+    {
+      "url": "https://github.com/flashinfer-ai/flashinfer/pull/5667",
+      "shared_discussion_context": [
+        "| C7 | MLA Projection → K/V Pack → MLA Attention | Operator/Subgraph | [FlashInfer #5667](https://github.com/flashinfer-ai/flashinfer/pull/5667) | projection output representation |",
+        "[FlashInfer #5667](https://github.com/flashinfer-ai/flashinfer/pull/5667)",
+        "| R9 | FlashInfer MLA pack→Attention；[#5667](https://github.com/flashinfer-ai/flashinfer/pull/5667) | MLA K/V packer after projection | MLA/TRTLLM attention | **separate K/V vs packed consumer-native K/V** | separate→pack→attention vs direct packed producer→attention | ★★★ |",
+        "| A21 | [FlashInfer #5667](https://github.com/flashinfer-ai/flashinfer/pull/5667) | FlashInfer / MLA | MLA projection output → attention | K/V concat+FP8 pack | separate `k_nope,v,k_pe` vs packed FP8 K/V | TRTLLM ragged/MLA attention | contiguous packed FP8 K/V | kv_b projection → concat → cast → attention | 改 pack producer；separate vs direct packed |",
+        "[FlashInfer PR #5667](https://github.com/flashinfer-ai/flashinfer/pull/5667)",
+        "| FlashInfer | MLA projection → FP8 packed K/V → TRTLLM attention | [PR #5667](https://github.com/flashinfer-ai/flashinfer/pull/5667) |"
+      ]
+    },
+    {
+      "url": "https://github.com/flashinfer-ai/flashinfer/pull/5720",
+      "shared_discussion_context": [
+        "| A22 | [FlashInfer #5720](https://github.com/flashinfer-ai/flashinfer/pull/5720) | FlashInfer / H512 decode | FP8 Q + NVFP4 KV → decode | Q/KV quant producers | FP8-Q / NVFP4-KV native representation | PrimTS decode | native H512 contract | quant → cache → attention | 更适合 representation/dtype factorial，不宜只叫 axis layout |"
+      ]
+    },
+    {
+      "url": "https://github.com/flashinfer-ai/flashinfer/pull/5742",
+      "shared_discussion_context": [
+        "| A23 | [FlashInfer #5742](https://github.com/flashinfer-ai/flashinfer/pull/5742) | FlashInfer / DeepSeek-V4 sparse MLA | sparse KV producer → sparse MLA | sparse KV/context producer | Cake sparse-MLA layouts | sparse MLA | generated SM100/103 contract | index/gather → sparse MLA | 用真实 DSV4 shape 枚举 native/gathered representation |"
+      ]
+    },
+    {
+      "url": "https://github.com/flashinfer-ai/flashinfer/pull/5751",
+      "shared_discussion_context": [
+        "| [FlashInfer PR #5751](https://github.com/flashinfer-ai/flashinfer/pull/5751) | ragged expert rows | grouped GEMM | ragged expert representation |"
+      ]
+    },
+    {
+      "url": "https://github.com/flashinfer-ai/flashinfer/pull/5846",
+      "shared_discussion_context": [
+        "| C5 | QKV Projection → KDA Prefill | Operator→Operator | [FlashInfer #5846](https://github.com/flashinfer-ai/flashinfer/pull/5846) | packed/strided QKV，不涉及 KV-cache scan |",
+        "[FlashInfer #5846](https://github.com/flashinfer-ai/flashinfer/pull/5846)",
+        "| R7 | FlashInfer packed QKV→KDA；[#5846](https://github.com/flashinfer-ai/flashinfer/pull/5846) | QKV projection | Cake KDA prefill | **packed-row/strided QKV vs direct dense-separated QKV** | `packed→zero-copy-strided→KDA` vs `packed→densify→KDA` vs patched direct-dense projection→KDA | ★★★ |",
+        "| L1 | [FlashInfer #5846](https://github.com/flashinfer-ai/flashinfer/pull/5846) | FlashInfer / Kimi-K3、Kimi-Linear | QKV Projection → KDA Prefill | packed QKV projection | **packed row + strided Q/K/V views** vs dense separate Q/K/V | Cake KDA prefill | both dense and accepted strided pitch | `split(dim=-1)` / old densify copies | 最小：改变 materialization；strict：patch projection direct dense output |",
+        "[FlashInfer PR #5846](https://github.com/flashinfer-ai/flashinfer/pull/5846)",
+        "[PR #5846](https://github.com/flashinfer-ai/flashinfer/pull/5846)"
+      ]
+    },
+    {
+      "url": "https://github.com/iree-org/iree/issues/21858",
+      "shared_discussion_context": [
+        "- [#21858](https://github.com/iree-org/iree/issues/21858)：有时宁可 duplicate operations，而不是引入 layout conflict；"
+      ]
+    },
+    {
+      "url": "https://github.com/iree-org/iree/issues/22370",
+      "shared_discussion_context": [
+        "- dynamic layout decisions：[Issue #22370](https://github.com/iree-org/iree/issues/22370)",
+        "- [#22370](https://github.com/iree-org/iree/issues/22370)：dynamic layout decisions；"
+      ]
+    },
+    {
+      "url": "https://github.com/iree-org/iree/issues/22489",
+      "shared_discussion_context": [
+        "| D5 | [IREE #22489](https://github.com/iree-org/iree/issues/22489) | IREE | producer op → preferred-layout consumer | contraction/elementwise | incoming encoding | downstream contraction | preferred encoding | local relayout | 用真实 matmul→elementwise→matmul graph |",
+        "- incoming layout mismatch preferred layout：[Issue #22489](https://github.com/iree-org/iree/issues/22489)",
+        "[IREE issue #22489](https://github.com/iree-org/iree/issues/22489)："
+      ]
+    },
+    {
+      "url": "https://github.com/iree-org/iree/issues/22700",
+      "shared_discussion_context": [
+        "- [#22700](https://github.com/iree-org/iree/issues/22700)：target transpose-load instructions；"
+      ]
+    },
+    {
+      "url": "https://github.com/iree-org/iree/issues/23782",
+      "shared_discussion_context": [
+        "- [Issue #23782](https://github.com/iree-org/iree/issues/23782)",
+        "| R30 | IREE HBM→LDS Attention；[#23782](https://github.com/iree-org/iree/issues/23782), [#22356](https://github.com/iree-org/iree/pull/22356) | global-memory tile loader | Attention/MMA | **GMEM-coalesced representation vs LDS/MMA-native tile layout** | HBM→Reg→LDS→MMA vs direct GMEM→LDS→MMA | ★★★ micro memory-hierarchy |",
+        "| U7 | [IREE #23782](https://github.com/iree-org/iree/issues/23782), [#22356](https://github.com/iree-org/iree/pull/22356) | IREE / Attention | HBM → LDS → Attention | coalesced DMA/gather | global coalesced representation | MMA/attention | LDS tile/swizzle | Reg staging or direct gather-to-LDS | `HBM→Reg→LDS` vs `HBM→LDS` |",
+        "| IREE | HBM producer → Attention LDS tile | HBM→LDS | [Issue #23782](https://github.com/iree-org/iree/issues/23782), [PR #22356](https://github.com/iree-org/iree/pull/22356) | HBM→Reg→LDS vs direct HBM→LDS |",
+        "- attention direct-to-LDS：[Issue #23782](https://github.com/iree-org/iree/issues/23782)",
+        "- [#23782](https://github.com/iree-org/iree/issues/23782)：attention direct-to-LDS；"
+      ]
+    },
+    {
+      "url": "https://github.com/iree-org/iree/pull/20410",
+      "shared_discussion_context": [
+        "- [PR #20410](https://github.com/iree-org/iree/pull/20410)：single-dispatch reshape propagation；"
+      ]
+    },
+    {
+      "url": "https://github.com/iree-org/iree/pull/20484",
+      "shared_discussion_context": [
+        "- [PR #20484](https://github.com/iree-org/iree/pull/20484)：`matmul_k` encoding；"
+      ]
+    },
+    {
+      "url": "https://github.com/iree-org/iree/pull/21554",
+      "shared_discussion_context": [
+        "- [PR #21554](https://github.com/iree-org/iree/pull/21554)：CPU data-layout propagation；"
+      ]
+    },
+    {
+      "url": "https://github.com/iree-org/iree/pull/22356",
+      "shared_discussion_context": [
+        "- [PR #22356](https://github.com/iree-org/iree/pull/22356)",
+        "| R30 | IREE HBM→LDS Attention；[#23782](https://github.com/iree-org/iree/issues/23782), [#22356](https://github.com/iree-org/iree/pull/22356) | global-memory tile loader | Attention/MMA | **GMEM-coalesced representation vs LDS/MMA-native tile layout** | HBM→Reg→LDS→MMA vs direct GMEM→LDS→MMA | ★★★ micro memory-hierarchy |",
+        "| U7 | [IREE #23782](https://github.com/iree-org/iree/issues/23782), [#22356](https://github.com/iree-org/iree/pull/22356) | IREE / Attention | HBM → LDS → Attention | coalesced DMA/gather | global coalesced representation | MMA/attention | LDS tile/swizzle | Reg staging or direct gather-to-LDS | `HBM→Reg→LDS` vs `HBM→LDS` |",
+        "- [IREE PR #22356](https://github.com/iree-org/iree/pull/22356)",
+        "| IREE | HBM producer → Attention LDS tile | HBM→LDS | [Issue #23782](https://github.com/iree-org/iree/issues/23782), [PR #22356](https://github.com/iree-org/iree/pull/22356) | HBM→Reg→LDS vs direct HBM→LDS |"
+      ]
+    },
+    {
+      "url": "https://github.com/iree-org/iree/pull/24400",
+      "shared_discussion_context": [
+        "- [PR #24400](https://github.com/iree-org/iree/pull/24400)：multi-reduction source layout propagation。"
+      ]
+    },
+    {
+      "url": "https://github.com/iree-org/iree/pull/24528",
+      "shared_discussion_context": [
+        "- [PR #24528](https://github.com/iree-org/iree/pull/24528)：attention VectorDistribute layout constraints；"
+      ]
+    },
+    {
+      "url": "https://github.com/iree-org/iree/pull/24969",
+      "shared_discussion_context": [
+        "| D6 | [IREE #24969](https://github.com/iree-org/iree/pull/24969) | IREE | graph producer → graph consumer | encoded tensor producer | globally materialized layout | downstream graph op | target-aware preferred layout | layout propagation/materialization | 原生 heuristic vs forced producer layout vs graph oracle |",
+        "- target-aware layout materialization：[PR #24969](https://github.com/iree-org/iree/pull/24969)",
+        "- [PR #24969](https://github.com/iree-org/iree/pull/24969)：target-aware layout materialization，把 layout 决策提前到 global graph，向周围 tensor graph 传播；"
+      ]
+    },
+    {
+      "url": "https://github.com/pytorch/pytorch/issues/182328",
+      "shared_discussion_context": [
+        "- [issue #182328](https://github.com/pytorch/pytorch/issues/182328)：vLLM MoE custom op stride contract mismatch。"
+      ]
+    },
+    {
+      "url": "https://github.com/pytorch/pytorch/issues/184014",
+      "shared_discussion_context": [
+        "- [issue #184014](https://github.com/pytorch/pytorch/issues/184014)：Conv→AvgPool→Flatten 下 layout optimization 导致 stride mismatch。"
+      ]
+    },
+    {
+      "url": "https://github.com/pytorch/pytorch/issues/188635",
+      "shared_discussion_context": [
+        "| [PyTorch issue #188635](https://github.com/pytorch/pytorch/issues/188635) | producer tensor | view→transpose→contiguous→attention | compiler错失 producer→consumer fusion |",
+        "- [issue #188635](https://github.com/pytorch/pytorch/issues/188635)：producer→view/transpose/contiguous→attention fusion missed。"
+      ]
+    },
+    {
+      "url": "https://github.com/pytorch/pytorch/issues/190154",
+      "shared_discussion_context": [
+        "- [issue #190154](https://github.com/pytorch/pytorch/issues/190154)：non-contiguous SDPA 输入性能显著下降。"
+      ]
+    },
+    {
+      "url": "https://github.com/pytorch/pytorch/issues/195320",
+      "shared_discussion_context": [
+        "| R26 | PyTorch permuted K→SDPA；[#195320](https://github.com/pytorch/pytorch/issues/195320) | K producer/permute | SDPA | **permuted stride representation vs expected transpose/contiguous** | stride-preserving→SDPA vs materialize→SDPA | ★★☆，首先是 correctness/legality |",
+        "| D3 | [PyTorch #195320](https://github.com/pytorch/pytorch/issues/195320) | PyTorch/Inductor / SDPA | permuted K → SDPA | K producer/permute | arbitrary permuted stride | SDPA fusion | expected logical transpose contract | permute/view → SDPA | 更适合作 correctness+legality control；枚举 stride-equivalent vs materialized |",
+        "[Issue #195320](https://github.com/pytorch/pytorch/issues/195320)",
+        "| [PyTorch issue #195320](https://github.com/pytorch/pytorch/issues/195320) | permuted K | SDPA | semantic transpose vs physical permute contract |",
+        "- [issue #195320](https://github.com/pytorch/pytorch/issues/195320)：permuted K 在 SDPA fusion 中 layout semantics 出问题。"
+      ]
+    },
+    {
+      "url": "https://github.com/pytorch/pytorch/issues/197083",
+      "shared_discussion_context": [
+        "- [issue #197083](https://github.com/pytorch/pytorch/issues/197083) / [PR #197100](https://github.com/pytorch/pytorch/pull/197100)：non-contiguous view → matmul，本来可以 zero-copy，却由于 decomposition 做 layout copy。"
+      ]
+    },
+    {
+      "url": "https://github.com/pytorch/pytorch/issues/197870",
+      "shared_discussion_context": [
+        "- [issues #197869/#197870](https://github.com/pytorch/pytorch/issues/197870)：padding/layout decision 会受 consumer FX node context 影响。"
+      ]
+    },
+    {
+      "url": "https://github.com/pytorch/pytorch/pull/184051",
+      "shared_discussion_context": [
+        "- [PR #184051](https://github.com/pytorch/pytorch/pull/184051)：custom-op layout constraints。"
+      ]
+    },
+    {
+      "url": "https://github.com/pytorch/pytorch/pull/195063",
+      "shared_discussion_context": [
+        "- [PR #195063](https://github.com/pytorch/pytorch/pull/195063)：non-row-major fused inputs 的 reduction logical index。"
+      ]
+    },
+    {
+      "url": "https://github.com/pytorch/pytorch/pull/197100",
+      "shared_discussion_context": [
+        "| C9 | non-contiguous View → Matmul | Framework Operator | [PyTorch #197100](https://github.com/pytorch/pytorch/pull/197100) | stride/view vs contiguous materialization |",
+        "| R25 | PyTorch non-contiguous→Matmul；[#197100](https://github.com/pytorch/pytorch/pull/197100) | upstream tensor/view producer | matmul | **non-contiguous zero-copy stride vs contiguous materialization** | view→matmul vs view→copy→matmul | ★★★ framework-level stride RQ1 |",
+        "| D2 | [PyTorch #197100](https://github.com/pytorch/pytorch/pull/197100) | PyTorch/Inductor | view → matmul | upstream tensor/view | non-contiguous zero-copy stride vs contiguous | matmul | accepts compatible strided operand | decomposition/materialization | 改 graph decomposition：preserve view vs materialize |",
+        "[PR #197100](https://github.com/pytorch/pytorch/pull/197100)",
+        "| [PyTorch PR #197100](https://github.com/pytorch/pytorch/pull/197100) | non-contiguous tensor/view | matmul | zero-copy stride vs materialized contiguous |",
+        "- [issue #197083](https://github.com/pytorch/pytorch/issues/197083) / [PR #197100](https://github.com/pytorch/pytorch/pull/197100)：non-contiguous view → matmul，本来可以 zero-copy，却由于 decomposition 做 layout copy。"
+      ]
+    },
+    {
+      "url": "https://github.com/pytorch/pytorch/pull/198543",
+      "shared_discussion_context": [
+        "- [PR #198543](https://github.com/pytorch/pytorch/pull/198543)：FlexAttention GQA view 前冻结 query layout。"
+      ]
+    },
+    {
+      "url": "https://github.com/sgl-project/sglang/issues/32143",
+      "shared_discussion_context": [
+        "| [SGLang issue #32143](https://github.com/sgl-project/sglang/issues/32143) | Prefill | Decode | transfer vs token replay |"
+      ]
+    },
+    {
+      "url": "https://github.com/sgl-project/sglang/issues/32712",
+      "shared_discussion_context": [
+        "| M6 | [SGLang #32712](https://github.com/sgl-project/sglang/issues/32712) | SGLang / SharedEP | Dispatch → expert execution | EP dispatch | copied/communicated vs shared zero-copy representation | expert GEMM | shared accessible representation | EP communication | 比较 materialized expert buffer vs zero-copy shared buffer |"
+      ]
+    },
+    {
+      "url": "https://github.com/sgl-project/sglang/issues/37838",
+      "shared_discussion_context": [
+        "| [SGLang issue #37838](https://github.com/sgl-project/sglang/issues/37838) | prefill KV | TRTLLM decode | uniform-FP8 KV handshake |"
+      ]
+    },
+    {
+      "url": "https://github.com/sgl-project/sglang/pull/29525",
+      "shared_discussion_context": [
+        "| [SGLang PR #29525](https://github.com/sgl-project/sglang/pull/29525) | DeepEP v2 dispatch | downstream MoE runner |"
+      ]
+    },
+    {
+      "url": "https://github.com/sgl-project/sglang/pull/29971",
+      "shared_discussion_context": [
+        "| M9 | [SGLang #29971](https://github.com/sgl-project/sglang/pull/29971) | SGLang Paged Experts | Host/paged expert → MoE | expert page loader | paged/offloaded representation | MoE expert kernel | device-native expert layout | page-in/cache | 改 page-in destination format |"
+      ]
+    },
+    {
+      "url": "https://github.com/sgl-project/sglang/pull/31652",
+      "shared_discussion_context": [
+        "| SGLang [PR #31652](https://github.com/sgl-project/sglang/pull/31652)（open） | quantization producer → KV-store consumer → attention | FP8 quant + store 原来 5 launches，融合后只对 NHD fast path 最自然，HND/page-major 等保留 fallback | `NHD`, `HND`, page-major/vectorized 5D；quant-then-store vs fused quant+store |"
+      ]
+    },
+    {
+      "url": "https://github.com/sgl-project/sglang/pull/32272",
+      "shared_discussion_context": [
+        "[SGLang PR #32272](https://github.com/sgl-project/sglang/pull/32272)：consumer 改为直接接受 non-interleaved paged KV，以删除 interleaving copy。",
+        "| SGLang [PR #32272](https://github.com/sgl-project/sglang/pull/32272)（open） | KV pool → TRTLLM fmha_v2 prefill | 以前为了 consumer API 要做 interleaved KV copy；新 indexing 可以直接读 non-interleaved paged KV | separate/non-interleaved paged K/V；interleaved KV；native producer→consumer direct |"
+      ]
+    },
+    {
+      "url": "https://github.com/sgl-project/sglang/pull/33166",
+      "shared_discussion_context": [
+        "| [SGLang PR #33166](https://github.com/sgl-project/sglang/pull/33166) | quantized activation producer | downstream Linear/GEMM | row-major scale vs bpreshuffle consumer scale |"
+      ]
+    },
+    {
+      "url": "https://github.com/sgl-project/sglang/pull/34299",
+      "shared_discussion_context": [
+        "| C6 | KDA Prefill → KDA Decode State | Subgraph/Stage | [SGLang #34299](https://github.com/sgl-project/sglang/pull/34299) | recurrent state layout，不是 Attention KV |",
+        "[SGLang #34299](https://github.com/sgl-project/sglang/pull/34299)",
+        "| R8 | SGLang KDA Prefill→Decode；[#34299](https://github.com/sgl-project/sglang/pull/34299) | KDA prefill state/checkpoint writer | KDA decode | **prefill-native checkpoint vs decode-packed state** | native state→pack→decode vs prefill direct decode-packed→decode | ★★☆ |",
+        "| L2 | [SGLang #34299](https://github.com/sgl-project/sglang/pull/34299) | SGLang / Kimi-K3、Kimi-Linear | KDA Prefill → Decode | KDA prefill checkpoint writer | **native zero-copy checkpoint** | KDA decode | **packed decode state** / backend state pool | optional pack/convert once | patch prefill state writer：native checkpoint vs direct decode-packed |",
+        "[SGLang PR #34299](https://github.com/sgl-project/sglang/pull/34299)",
+        "[PR #34299](https://github.com/sgl-project/sglang/pull/34299)"
+      ]
+    },
+    {
+      "url": "https://github.com/sgl-project/sglang/pull/34394",
+      "shared_discussion_context": [
+        "| [SGLang PR #34394](https://github.com/sgl-project/sglang/pull/34394) | DSA indexer Q/K preparation | DSA indexer | 多个 prep op 融成 consumer-native representation |"
+      ]
+    },
+    {
+      "url": "https://github.com/sgl-project/sglang/pull/34498",
+      "shared_discussion_context": [
+        "| C1 | Attention Value BMM → O-Proj GEMM | Operator→Operator | [SGLang #34498](https://github.com/sgl-project/sglang/pull/34498) | 两端都是计算算子，不是 cache read/write |",
+        "[SGLang #34498](https://github.com/sgl-project/sglang/pull/34498)",
+        "| R4 | SGLang Attention→OProj；[#34498](https://github.com/sgl-project/sglang/pull/34498) | attention value BMM | O-Proj GEMM | **BMM output `[H,T,D]` vs `[T,H,D]`** | `[H,T,D]→transpose→OProj` vs BMM direct `[T,H,D]→OProj` | ★★★ |",
+        "| D1 | [SGLang #34498](https://github.com/sgl-project/sglang/pull/34498) | SGLang / Kimi-K2.7-Code-MXFP4 | Attention BMM → O-Proj | absorbed value BMM | **`[H,T,Dv]` 或 `[T,H,Dv]`** | O-Proj GEMM | `[T,H,Dv]→[T,H·Dv]` | transpose-copy / flatten | **最干净 strict RQ1**：只改 BMM epilogue output mapping |",
+        "[SGLang PR #34498](https://github.com/sgl-project/sglang/pull/34498)",
+        "从而 downstream `flatten` 变成免费 view。这个 PR 报告整个 serving throughput 最多约 +3.3%。urlSGLang PR #34498https://github.com/sgl-project/sglang/pull/34498"
+      ]
+    },
+    {
+      "url": "https://github.com/sgl-project/sglang/pull/34525",
+      "shared_discussion_context": [
+        "| R3 | SGLang MiniMax-M3；[#34525](https://github.com/sgl-project/sglang/pull/34525) | sparse KV gather/prepare | `fmha_sm100` MSA prefill | **gather：Compact-NHD vs Compact-HND direct output** | `gather(NHD)→transpose→MSA` vs `gather(HND)→MSA` | ★★★ |",
+        "| A16 | [SGLang #34525](https://github.com/sgl-project/sglang/pull/34525) | SGLang / MiniMax-M3 | KV gather → MSA sparse prefill | `gather_kv_hnd` | native pool NHD；候选 Compact-NHD / Compact-HND | `fmha_sm100` MSA | `[page,Hkv,page_size,D]` HND | full NHD pool → gather/transpose → MSA | **核心 case**：实现 `gather_NHD` 与 `gather_HND` direct-emission，再测 edge |",
+        "[SGLang #34525](https://github.com/sgl-project/sglang/pull/34525)",
+        "[SGLang PR #34525](https://github.com/sgl-project/sglang/pull/34525)",
+        "[PR #34525](https://github.com/sgl-project/sglang/pull/34525)",
+        "即 HND-like representation；当 \\(H_{kv}>1\\) 时，原来的 permute 并非 contiguous，需要 materialization。urlSGLang PR #34525https://github.com/sgl-project/sglang/pull/34525"
+      ]
+    },
+    {
+      "url": "https://github.com/sgl-project/sglang/pull/35142",
+      "shared_discussion_context": [
+        "| SGLang | FA3 query quantization + RoPE | [PR #35142](https://github.com/sgl-project/sglang/pull/35142) |",
+        "| [SGLang PR #35142](https://github.com/sgl-project/sglang/pull/35142) | RoPE + Q quant | FA3 | consumer 对 quantized Q representation 的要求 |"
+      ]
+    },
+    {
+      "url": "https://github.com/sgl-project/sglang/pull/35322",
+      "shared_discussion_context": [
+        "| A17 | [SGLang #35322](https://github.com/sgl-project/sglang/pull/35322) | SGLang / MLA | FP8 MLA cache → FlashInfer MLA | cache producer | native FP8 MLA | FlashInfer MLA | native FP8 contract | cache → 原 full-pool BF16 cast → MLA | 比较 FP8-native consumer vs FP8→BF16 materialization；layout/dtype要拆开 |",
+        "| SGLang | FP8 MLA，避免 full-pool BF16 cast | [PR #35322](https://github.com/sgl-project/sglang/pull/35322) |"
+      ]
+    },
+    {
+      "url": "https://github.com/sgl-project/sglang/pull/35357",
+      "shared_discussion_context": [
+        "| A15 | [SGLang #35357](https://github.com/sgl-project/sglang/pull/35357) | SGLang / MiniMax-M3 | sparse QKNorm+RoPE+cache write → MSA | fused sparse prepare | sparse Q/K + cache representation | MSA | MSA cache contract | QKNorm → RoPE → cache write → MSA | 改 fused cache output mapping |",
+        "- SGLang MiniMax-M3：[PR #35357](https://github.com/sgl-project/sglang/pull/35357)",
+        "| SGLang | MiniMax-M3 sparse QK norm + RoPE + cache write | [PR #35357](https://github.com/sgl-project/sglang/pull/35357) |"
+      ]
+    },
+    {
+      "url": "https://github.com/sgl-project/sglang/pull/37261",
+      "shared_discussion_context": [
+        "| C2 | DeepEP Dispatch → Grouped Expert GEMM | Operator→Operator | [SGLang #37261](https://github.com/sgl-project/sglang/pull/37261) | MoE activation representation |",
+        "[SGLang #37261](https://github.com/sgl-project/sglang/pull/37261)",
+        "| R5 | SGLang DeepEP→DeepGEMM；[#37261](https://github.com/sgl-project/sglang/pull/37261) | DeepEP dispatch | grouped expert GEMM | **dispatch output non-expanded vs expanded expert-major** | `dispatch(normal)→ep_scatter→GEMM` vs `dispatch(expanded)→GEMM` | ★★★ |",
+        "| M1 | [SGLang #37261](https://github.com/sgl-project/sglang/pull/37261) | SGLang / Qwen3-30B-A3B、MiMoV2 | DeepEP Dispatch → DeepGEMM | DeepEP v2 dispatch | **non-expanded vs expanded expert-major** | DeepGEMM grouped GEMM | expert-grouped contiguous rows | `ep_scatter`、routing-weight handling | **直接改 dispatch destination row layout** |",
+        "- [SGLang PR #37261](https://github.com/sgl-project/sglang/pull/37261)",
+        "| SGLang | DeepEP dispatch 直接产生 expanded expert-major representation | [PR #37261](https://github.com/sgl-project/sglang/pull/37261) |"
+      ]
+    },
+    {
+      "url": "https://github.com/sgl-project/sglang/pull/38583",
+      "shared_discussion_context": [
+        "| [SGLang PR #38583](https://github.com/sgl-project/sglang/pull/38583) | fused DSA indexer decode preparation | sparse decode | 四 kernel producer 子图→decode |"
+      ]
+    },
+    {
+      "url": "https://github.com/sgl-project/sglang/pull/38592",
+      "shared_discussion_context": [
+        "| A18 | [SGLang #38592](https://github.com/sgl-project/sglang/pull/38592) | SGLang unified memory | KV/state producer → multiple consumers | unified pool writer | **token-major dense views** vs旧 pool organization | attention / transfer / HiCache | per-consumer views | unified allocation → views → attention/PD/HiCache | 改 unified-pool physical order；这是 multi-consumer extension |",
+        "- SGLang unified token-major memory：[PR #38592](https://github.com/sgl-project/sglang/pull/38592)",
+        "[SGLang PR #38592](https://github.com/sgl-project/sglang/pull/38592)：统一内存从 layer-block style 转为 token-major dense representation，以支持异构 K/V row width。"
+      ]
+    },
+    {
+      "url": "https://github.com/sgl-project/sglang/pull/38884",
+      "shared_discussion_context": [
+        "| M4 | [SGLang #38884](https://github.com/sgl-project/sglang/pull/38884) | SGLang / SM90 MoE | routed activations → CUTLASS grouped GEMM | MoE dispatcher | grouped expert rows | CUTLASS MXFP4×BF16 grouped GEMM | backend-specific expert-major rows | quant/dispatch | 改 dispatcher output rows，固定 CUTLASS backend |",
+        "| SGLang | MXFP4×BF16 grouped GEMM | [PR #38884](https://github.com/sgl-project/sglang/pull/38884) |",
+        "| [SGLang PR #38884](https://github.com/sgl-project/sglang/pull/38884) | MoE routed activations | CUTLASS grouped GEMM | MXFP4×BF16 grouped representation |"
+      ]
+    },
+    {
+      "url": "https://github.com/sgl-project/sglang/pull/39039",
+      "shared_discussion_context": [
+        "- [SGLang PR #39039](https://github.com/sgl-project/sglang/pull/39039)",
+        "| SGLang | MoonEP 直接采用 DeepGEMM psum layout | [PR #39039](https://github.com/sgl-project/sglang/pull/39039) |",
+        "urlSGLang PR #39039https://github.com/sgl-project/sglang/pull/39039",
+        "| [SGLang PR #39039](https://github.com/sgl-project/sglang/pull/39039) | MoonEP dispatch → DeepGEMM | DeepGEMM psum layout + zero-copy shard/combine |"
+      ]
+    },
+    {
+      "url": "https://github.com/sgl-project/sglang/pull/39313",
+      "shared_discussion_context": [
+        "| M3 | [SGLang #39313](https://github.com/sgl-project/sglang/pull/39313) | SGLang / modern mixed-precision MoE | shared+routed experts → MegaMoE | shared/routed expert paths | FP8 shared vs MXFP4 routed representations | DeepGEMM/MegaMoE | fused expert representation | shared expert fusion | 这是 dtype+representation 联合 case，layout-only 需控制 dtype |",
+        "| SGLang | shared/routed experts representation fusion | [PR #39313](https://github.com/sgl-project/sglang/pull/39313) |",
+        "| [SGLang PR #39313](https://github.com/sgl-project/sglang/pull/39313) | shared expert + routed experts | FP8 shared representation vs MXFP4 routed representation |"
+      ]
+    },
+    {
+      "url": "https://github.com/sgl-project/sglang/pull/39606",
+      "shared_discussion_context": [
+        "| P8 | [SGLang #39606](https://github.com/sgl-project/sglang/pull/39606) | SGLang HiCache unified KV | GPU page → L2 | staged write-back producer | page-unified KV layout | host cache | L2 page representation | staging/write-back | page-first vs staging-contiguous |"
+      ]
+    },
+    {
+      "url": "https://github.com/sgl-project/sglang/pull/39784",
+      "shared_discussion_context": [
+        "| P10 | [SGLang #39784](https://github.com/sgl-project/sglang/pull/39784) | SGLang / DeepSeek-V4 L3 | L2 KV → L3 MemCache | L3 writer | host/cache representation | MemCache L3 | storage-tier representation | serialization/storage | Host-native vs L3-native pack |"
+      ]
+    },
+    {
+      "url": "https://github.com/sgl-project/sglang/pull/39880",
+      "shared_discussion_context": [
+        "[PR #39880](https://github.com/sgl-project/sglang/pull/39880)"
+      ]
+    },
+    {
+      "url": "https://github.com/sgl-project/sglang/pull/40326",
+      "shared_discussion_context": [
+        "- SGLang stride-based KV addressing：[PR #40326](https://github.com/sgl-project/sglang/pull/40326)",
+        "[SGLang PR #40326](https://github.com/sgl-project/sglang/pull/40326)、[#40327](https://github.com/sgl-project/sglang/pull/40327)、[#40330](https://github.com/sgl-project/sglang/pull/40330)：分别处理 stride addressing、paged view construction、layout translation。"
+      ]
+    },
+    {
+      "url": "https://github.com/sgl-project/sglang/pull/40327",
+      "shared_discussion_context": [
+        "- SGLang paged KV view construction：[PR #40327](https://github.com/sgl-project/sglang/pull/40327)",
+        "[SGLang PR #40326](https://github.com/sgl-project/sglang/pull/40326)、[#40327](https://github.com/sgl-project/sglang/pull/40327)、[#40330](https://github.com/sgl-project/sglang/pull/40330)：分别处理 stride addressing、paged view construction、layout translation。"
+      ]
+    },
+    {
+      "url": "https://github.com/sgl-project/sglang/pull/40330",
+      "shared_discussion_context": [
+        "[SGLang PR #40326](https://github.com/sgl-project/sglang/pull/40326)、[#40327](https://github.com/sgl-project/sglang/pull/40327)、[#40330](https://github.com/sgl-project/sglang/pull/40330)：分别处理 stride addressing、paged view construction、layout translation。"
+      ]
+    },
+    {
+      "url": "https://github.com/sgl-project/sglang/pull/40710",
+      "shared_discussion_context": [
+        "| [SGLang PR #40710](https://github.com/sgl-project/sglang/pull/40710) | FP8 indexer writer | DSA/indexer consumer | writer representation |"
+      ]
+    },
+    {
+      "url": "https://github.com/sgl-project/sglang/pull/40909",
+      "shared_discussion_context": [
+        "- hybrid SWA KV transfer：[PR #40909](https://github.com/sgl-project/sglang/pull/40909)",
+        "| [SGLang PR #40909](https://github.com/sgl-project/sglang/pull/40909) | hybrid SWA prefill | decode | heterogeneous TP KV transfer |"
+      ]
+    },
+    {
+      "url": "https://github.com/sgl-project/sglang/pull/40960",
+      "shared_discussion_context": [
+        "| P9 | [SGLang #40960](https://github.com/sgl-project/sglang/pull/40960) | SGLang HiCache | KV backup → host | batch backup producer | per-page vs batched buffer-only | host storage | host batch layout | flush batching | transfer granularity RQ1 extension |"
+      ]
+    },
+    {
+      "url": "https://github.com/sgl-project/sglang/pull/41182",
+      "shared_discussion_context": [
+        "[PR #41182](https://github.com/sgl-project/sglang/pull/41182)",
+        "| R20 | SGLang NIXL Host staging；[#41182](https://github.com/sgl-project/sglang/pull/41182) | GPU→host gather | decode-side host→GPU scatter | **GPU-row-native vs host-packed wire representation** | GPU rows→host pack→network→scatter vs alternate direct/canonical packing | ★★☆ placement/transport RQ1 |",
+        "| P3 | [SGLang #41182](https://github.com/sgl-project/sglang/pull/41182) | SGLang / GLM-5.3、Kimi-K3 | GPU→Host→Network→Host→GPU | prefill gather | GPU KV/state rows → pinned-host packed slots | decode scatter | destination GPU rows | Triton gather/scatter + NIXL H2H | 改 host staging packing/layout 与 destination-row ordering |",
+        "- [#41182 NIXL HOST staging](https://github.com/sgl-project/sglang/pull/41182)",
+        "- [PR #41182](https://github.com/sgl-project/sglang/pull/41182)"
+      ]
+    },
+    {
+      "url": "https://github.com/sgl-project/sglang/pull/41365",
+      "shared_discussion_context": [
+        "| P7 | [SGLang #41365](https://github.com/sgl-project/sglang/pull/41365) | SGLang HiCache | GPU KV → host L2 pool | backup producer | normal precision vs **INT8 host representation** | restore/decode path | GPU attention representation | quantize/dequantize HBM↔host | layout/precision 分开；placement+compression case |"
+      ]
+    },
+    {
+      "url": "https://github.com/sgl-project/sglang/pull/41400",
+      "shared_discussion_context": [
+        "| [SGLang PR #41400](https://github.com/sgl-project/sglang/pull/41400) | KDA prefill checkpoint | later KDA execution |"
+      ]
+    },
+    {
+      "url": "https://github.com/sgl-project/sglang/pull/41533",
+      "shared_discussion_context": [
+        "| [SGLang PR #41533](https://github.com/sgl-project/sglang/pull/41533) | MLA absorb+RoPE+KV write | MLA decode | fused representation只在 decode-sized mode 使用 |"
+      ]
+    },
+    {
+      "url": "https://github.com/sgl-project/sglang/pull/41607",
+      "shared_discussion_context": [
+        "| [SGLang PR #41607](https://github.com/sgl-project/sglang/pull/41607) | recurrent state | Mooncake receiver | stride compatibility |"
+      ]
+    },
+    {
+      "url": "https://github.com/sgl-project/sglang/pull/41615",
+      "shared_discussion_context": [
+        "- SGLang GLM-5.3 sparse attention：[PR #41615](https://github.com/sgl-project/sglang/pull/41615)"
+      ]
+    },
+    {
+      "url": "https://github.com/sgl-project/sglang/pull/41698",
+      "shared_discussion_context": [
+        "| R16 | vLLM/SGLang RoPE→Attention fusion；[#46979](https://github.com/vllm-project/vllm/issues/46979), [SGLang #41698](https://github.com/sgl-project/sglang/pull/41698) | QKNorm/RoPE/KV preparation | real Attention | **producer output KV representation** | direct consumer-native cache vs producer-native+repair | ★★☆；PR before/after不能直接当RQ1 |",
+        "| A14 | [SGLang #41698](https://github.com/sgl-project/sglang/pull/41698) | SGLang / DSA decode | RoPE+KV prep → DSA Attention | fused AITER DSA prepare | DSA KV-prep representation | AITER DSA attention | native DSA contract | RoPE → cache prep → DSA | direct consumer-native cache write vs old preparation |",
+        "| [SGLang PR #41698](https://github.com/sgl-project/sglang/pull/41698) | DSA RoPE + KV preparation | AITER DSA attention | separate vs fused preparation |"
+      ]
+    },
+    {
+      "url": "https://github.com/sgl-project/sglang/pull/41875",
+      "shared_discussion_context": [
+        "| A19 | [SGLang #41875](https://github.com/sgl-project/sglang/pull/41875) | SGLang NPU / DSA | KV writer → DSA | cache writer | startup-resolved KV layout | DSA backend | capability-advertised layout | startup capability → pool creation → DSA | 强制每种合法 startup layout，与 `auto` 比 |"
+      ]
+    },
+    {
+      "url": "https://github.com/sgl-project/sglang/pull/41953",
+      "shared_discussion_context": [
+        "| R19 | SGLang PD matching DCP；[#41953](https://github.com/sgl-project/sglang/pull/41953), [#41958](https://github.com/sgl-project/sglang/pull/41958) | prefill-side KV/state exporter | decode-side importer/first consumer | **prefill-native page vs canonical-wire vs decode-native page** | pack→transfer→unpack vs direct whole-page consumer-native transfer | ★★☆ system-level |",
+        "| P1 | [SGLang #41953](https://github.com/sgl-project/sglang/pull/41953) | SGLang unified PD | Prefill export → transport/import | KV/state exporter | whole-page/whole-slot，含 byte offset/block stride/TP axis | decode importer | destination tensor rows | Mooncake transfer | 枚举 `PrefillNative` / packed canonical / `DecodeNative` wire layout |",
+        "- [#41953 Expose unified memory transfer layouts](https://github.com/sgl-project/sglang/pull/41953)",
+        "- [SGLang PR #41953](https://github.com/sgl-project/sglang/pull/41953)",
+        "- transfer layout metadata：[PR #41953](https://github.com/sgl-project/sglang/pull/41953)",
+        "| [SGLang PR #41953](https://github.com/sgl-project/sglang/pull/41953) | unified-memory P-side | PD transfer | exposes exact byte-offset/stride layout |"
+      ]
+    },
+    {
+      "url": "https://github.com/sgl-project/sglang/pull/41956",
+      "shared_discussion_context": [
+        "- [PR #41956](https://github.com/sgl-project/sglang/pull/41956)",
+        "- unequal TP：[PR #41956](https://github.com/sgl-project/sglang/pull/41956)",
+        "| [SGLang PR #41956](https://github.com/sgl-project/sglang/pull/41956) | Prefill TP layout | Decode TP layout | unequal TP representation |"
+      ]
+    },
+    {
+      "url": "https://github.com/sgl-project/sglang/pull/41958",
+      "shared_discussion_context": [
+        "| R19 | SGLang PD matching DCP；[#41953](https://github.com/sgl-project/sglang/pull/41953), [#41958](https://github.com/sgl-project/sglang/pull/41958) | prefill-side KV/state exporter | decode-side importer/first consumer | **prefill-native page vs canonical-wire vs decode-native page** | pack→transfer→unpack vs direct whole-page consumer-native transfer | ★★☆ system-level |",
+        "| P2 | [SGLang #41958](https://github.com/sgl-project/sglang/pull/41958) | SGLang TP4/DCP2 | Prefill pages → Decode pages | prefill exporter | local DCP page layout | decode local pages | matching DCP layout | whole-page copy，no redistribution | direct page-to-page vs canonical pack/unpack |",
+        "- [#41958 matching DCP peers](https://github.com/sgl-project/sglang/pull/41958)",
+        "- [PR #41958](https://github.com/sgl-project/sglang/pull/41958)",
+        "- matching DCP direct transfer：[PR #41958](https://github.com/sgl-project/sglang/pull/41958)",
+        "路径上支持 matching DCP peers，匹配时可以直接 whole-page copy，无需 redistribution/packing。urlSGLang PR #41958https://github.com/sgl-project/sglang/pull/41958"
+      ]
+    },
+    {
+      "url": "https://github.com/sgl-project/sglang/pull/41968",
+      "shared_discussion_context": [
+        "| [SGLang PR #41968](https://github.com/sgl-project/sglang/pull/41968) | speculative Mamba state | replay consumer |"
+      ]
+    },
+    {
+      "url": "https://github.com/tile-ai/tilelang/issues/2311",
+      "shared_discussion_context": [
+        "- [issue #2311](https://github.com/tile-ai/tilelang/issues/2311)：GEMM accumulator → sibling fragment consumer；"
+      ]
+    },
+    {
+      "url": "https://github.com/tile-ai/tilelang/issues/2398",
+      "shared_discussion_context": [
+        "- [issue #2398](https://github.com/tile-ai/tilelang/issues/2398)：layout inference 无合法 layout；"
+      ]
+    },
+    {
+      "url": "https://github.com/tile-ai/tilelang/issues/2609",
+      "shared_discussion_context": [
+        "- [issue #2609](https://github.com/tile-ai/tilelang/issues/2609)：swizzled shared buffer → cross-dtype view；"
+      ]
+    },
+    {
+      "url": "https://github.com/tile-ai/tilelang/issues/2642",
+      "shared_discussion_context": [
+        "| U11 | [TileLang #2642](https://github.com/tile-ai/tilelang/issues/2642) | TileLang | Shared operand → GEMM | shared-buffer producer | annotated shared layout | `T.gemm` | MMA-compatible layout | relayout | legality/control case |",
+        "| TileLang | Shared operand → MMA | SMEM→MMA | [Issue #2642](https://github.com/tile-ai/tilelang/issues/2642) | annotated layout legality/conflict |",
+        "- [issue #2642](https://github.com/tile-ai/tilelang/issues/2642)：`T.gemm` shared operand 使用 incompatible annotated layout；"
+      ]
+    },
+    {
+      "url": "https://github.com/tile-ai/tilelang/issues/2954",
+      "shared_discussion_context": [
+        "| U12 | [TileLang #2954](https://github.com/tile-ai/tilelang/issues/2954) | TileLang | GEMM operand fragment → Shared | register fragment | GEMM fragment layout | shared copy consumer | shared physical slots | `T.copy` | fragment→shared representation |",
+        "| TileLang | GEMM fragment → shared consumer | Reg fragment→SMEM | [Issue #2954](https://github.com/tile-ai/tilelang/issues/2954) | fragment-native vs shared-native |",
+        "- [issue #2954](https://github.com/tile-ai/tilelang/issues/2954)：GEMM operand fragment → shared copy；"
+      ]
+    },
+    {
+      "url": "https://github.com/tile-ai/tilelang/issues/3256",
+      "shared_discussion_context": [
+        "| U10 | [TileLang #3256](https://github.com/tile-ai/tilelang/issues/3256) | TileLang / register-resident attention | attention fragment → blockscaled GEMM | register attention output | register-resident fragment | GEMM | blockscaled MMA fragment | scale fragments | direct register consumer vs shared materialization |",
+        "| TileLang | register-resident attention → block-scaled GEMM | Reg→MMA | [Issue #3256](https://github.com/tile-ai/tilelang/issues/3256) | resident fragments vs rematerialization |",
+        "- [issue #3256](https://github.com/tile-ai/tilelang/issues/3256)：register-resident attention 的 block-scaled GEMM；"
+      ]
+    },
+    {
+      "url": "https://github.com/tile-ai/tilelang/issues/3283",
+      "shared_discussion_context": [
+        "| U13 | [TileLang #3283](https://github.com/tile-ai/tilelang/issues/3283), [#3284](https://github.com/tile-ai/tilelang/pull/3284) | TileLang SM120 | Scale producer(s) → blockscaled GEMM | SFA/SFB fragments | potentially conflicting fragment layouts | blockscaled GEMM | separate scale contracts | shared fragment reuse | multi-consumer/alias conflict |",
+        "- [issue #3283](https://github.com/tile-ai/tilelang/issues/3283)：两个 scale producers 共用 fragment 时 layout conflict；"
+      ]
+    },
+    {
+      "url": "https://github.com/tile-ai/tilelang/pull/3176",
+      "shared_discussion_context": [
+        "| U14 | [TileLang #3176](https://github.com/tile-ai/tilelang/pull/3176) | TileLang | producer → Reduction | vectorized producer | vector width/layout | reduction | reduction-aware layout | vectorization | micro control：vector width × reduction consumer |",
+        "- [PR #3176](https://github.com/tile-ai/tilelang/pull/3176)：default vector size 根据 reduction consumer 调整；"
+      ]
+    },
+    {
+      "url": "https://github.com/tile-ai/tilelang/pull/3257",
+      "shared_discussion_context": [
+        "- [PR #3257](https://github.com/tile-ai/tilelang/pull/3257)：SM120 block-scaled GEMM fragment layouts。"
+      ]
+    },
+    {
+      "url": "https://github.com/tile-ai/tilelang/pull/3284",
+      "shared_discussion_context": [
+        "| U13 | [TileLang #3283](https://github.com/tile-ai/tilelang/issues/3283), [#3284](https://github.com/tile-ai/tilelang/pull/3284) | TileLang SM120 | Scale producer(s) → blockscaled GEMM | SFA/SFB fragments | potentially conflicting fragment layouts | blockscaled GEMM | separate scale contracts | shared fragment reuse | multi-consumer/alias conflict |",
+        "- [PR #3284](https://github.com/tile-ai/tilelang/pull/3284)：显式 reject conflicting scale fragment layouts；"
+      ]
+    },
+    {
+      "url": "https://github.com/triton-lang/triton/issues/10342",
+      "shared_discussion_context": [
+        "| C10 | Dot1 → FFMA/Bias → Dot2 | Compiler Operator | [Triton #10342](https://github.com/triton-lang/triton/issues/10342) | register/MMA encoding conflict |",
+        "| R27 | Triton Dot1→Dot2；[#10342](https://github.com/triton-lang/triton/issues/10342) | first `tl.dot` | second `tl.dot` | **Dot1 accumulator layout vs Dot2 operand-compatible layout** | Dot1 native→convert→Dot2 vs alternate intermediate direct-compatible→Dot2 | ★★★ micro/operator mechanism |",
+        "| D4 | [Triton #10342](https://github.com/triton-lang/triton/issues/10342) | Triton | Dot1 → bias/FFMA → Dot2 | first `tl.dot` | MMA accumulator encoding | second `tl.dot` | DotOperand encoding | FFMA/bias + `convert_layout` | 改 Dot1 output/中间 mapping，比较 direct-compatible vs convert |",
+        "| U3 | [Triton #10342](https://github.com/triton-lang/triton/issues/10342) | Triton | Dot1 → FFMA → Dot2 | Dot1 | accumulator layout | Dot2 | DotOperand | bias/FFMA + convert | 中间 register representation |",
+        "| Triton | Dot1 → FFMA → Dot2 | Reg layout → Reg layout | [Issue #10342](https://github.com/triton-lang/triton/issues/10342) | preserve Dot1 output vs convert for Dot2 |",
+        "| [Triton issue #10342](https://github.com/triton-lang/triton/issues/10342) | `tl.dot #1` | FFMA/bias → `tl.dot #2` | 两 dot 中间插入 `convert_layout` |"
+      ]
+    },
+    {
+      "url": "https://github.com/triton-lang/triton/issues/6569",
+      "shared_discussion_context": [
+        "| [Triton issue #6569](https://github.com/triton-lang/triton/issues/6569) | transposed operand producer | `tl.dot` | 会通过 shared memory rearrange |"
+      ]
+    },
+    {
+      "url": "https://github.com/triton-lang/triton/issues/8706",
+      "shared_discussion_context": [
+        "| [#8706](https://github.com/triton-lang/triton/issues/8706) | memory coalescing ↔ layout propagation |"
+      ]
+    },
+    {
+      "url": "https://github.com/triton-lang/triton/issues/8775",
+      "shared_discussion_context": [
+        "| U6 | [Triton #8775](https://github.com/triton-lang/triton/issues/8775) | Triton | Reduce → consumer | Reduce | reduction/scratch layout | downstream op | downstream preferred layout | redundant convert | reduction output mapping |",
+        "| Triton | Reduce → downstream op | Reg/SMEM | [Issue #8775](https://github.com/triton-lang/triton/issues/8775) | reduction scratch-native vs consumer-native |",
+        "| [#8775](https://github.com/triton-lang/triton/issues/8775) | Reduce → consumer，scratch layout 导致 redundant conversion |"
+      ]
+    },
+    {
+      "url": "https://github.com/triton-lang/triton/pull/10158",
+      "shared_discussion_context": [
+        "| [#10158](https://github.com/triton-lang/triton/pull/10158) | layout through control-flow producer/consumer |"
+      ]
+    },
+    {
+      "url": "https://github.com/triton-lang/triton/pull/10360",
+      "shared_discussion_context": [
+        "| Triton | tensor permute/reshape → consumer | Reg→LDS→Reg | [PR #10360](https://github.com/triton-lang/triton/pull/10360) | SMEM relayout vs warp/register shuffle |",
+        "| [Triton PR #10360](https://github.com/triton-lang/triton/pull/10360) | small tensor op | next op | register permutation vs SMEM relayout |",
+        "| [#10360](https://github.com/triton-lang/triton/pull/10360) | register tensor op → permute/reshape → consumer |"
+      ]
+    },
+    {
+      "url": "https://github.com/triton-lang/triton/pull/10563",
+      "shared_discussion_context": [
+        "| R29 | Triton WMMA/FMA→Store；[#10563](https://github.com/triton-lang/triton/pull/10563), [#11704](https://github.com/triton-lang/triton/pull/11704) | MMA/FMA accumulator | global store | **accumulator-native vs coalesced-store layout** | compute-native→relayout→store vs alternate producer output→store | ★★★ micro mechanism |",
+        "| U4 | [Triton #10563](https://github.com/triton-lang/triton/pull/10563) | Triton AMD | WMMA → Store | WMMA accumulator | WMMA-native | global store | coalesced store mapping | convert/reorder | accumulator→store layout |",
+        "| Triton | WMMA/FMA result → Store | Reg→HBM | [PR #10563](https://github.com/triton-lang/triton/pull/10563), [PR #11704](https://github.com/triton-lang/triton/pull/11704) | accumulator-native vs store-coalesced |",
+        "| [Triton PR #10563](https://github.com/triton-lang/triton/pull/10563) | WMMA | global store | WMMA result layout 应依据 consumer store order 选择 |",
+        "| [#10563](https://github.com/triton-lang/triton/pull/10563) | WMMA → Store |"
+      ]
+    },
+    {
+      "url": "https://github.com/triton-lang/triton/pull/11360",
+      "shared_discussion_context": [
+        "| [#11360](https://github.com/triton-lang/triton/pull/11360) | FP4 conversion allocation reduction |"
+      ]
+    },
+    {
+      "url": "https://github.com/triton-lang/triton/pull/11387",
+      "shared_discussion_context": [
+        "| [#11387](https://github.com/triton-lang/triton/pull/11387) | FP4 producer → strided consumer layout |"
+      ]
+    },
+    {
+      "url": "https://github.com/triton-lang/triton/pull/11538",
+      "shared_discussion_context": [
+        "| [#11538](https://github.com/triton-lang/triton/pull/11538) | reuse relayout/rematerialization |"
+      ]
+    },
+    {
+      "url": "https://github.com/triton-lang/triton/pull/11685",
+      "shared_discussion_context": [
+        "| [#11685](https://github.com/triton-lang/triton/pull/11685) | automatic layout propagation |"
+      ]
+    },
+    {
+      "url": "https://github.com/triton-lang/triton/pull/11704",
+      "shared_discussion_context": [
+        "| R29 | Triton WMMA/FMA→Store；[#10563](https://github.com/triton-lang/triton/pull/10563), [#11704](https://github.com/triton-lang/triton/pull/11704) | MMA/FMA accumulator | global store | **accumulator-native vs coalesced-store layout** | compute-native→relayout→store vs alternate producer output→store | ★★★ micro mechanism |",
+        "| U5 | [Triton #11704](https://github.com/triton-lang/triton/pull/11704) | Triton | FMA/MMA → Store | compute result | accumulator-native | `tt.store` | coalesced Blocked | shared/register relayout | producer output encoding |",
+        "| Triton | WMMA/FMA result → Store | Reg→HBM | [PR #10563](https://github.com/triton-lang/triton/pull/10563), [PR #11704](https://github.com/triton-lang/triton/pull/11704) | accumulator-native vs store-coalesced |",
+        "| [Triton PR #11704](https://github.com/triton-lang/triton/pull/11704) | FMA/MMA result | store | accumulator-native vs coalesced store layout |",
+        "| [#11704](https://github.com/triton-lang/triton/pull/11704) | FMA → Store |",
+        "| Triton [PR #11704](https://github.com/triton-lang/triton/pull/11704)（2026，open） | FMA/MMA accumulator → `tt.store` | accumulator 原生 layout 与 coalesced store layout 冲突；当前实现用 heuristic 判断是否值得绕过 relayout | accumulator-native；coalesced `BlockedEncoding`; shared/LDS relayout |"
+      ]
+    },
+    {
+      "url": "https://github.com/triton-lang/triton/pull/11885",
+      "shared_discussion_context": [
+        "| [#11885](https://github.com/triton-lang/triton/pull/11885) | reuse dot-operand rematerialization |"
+      ]
+    },
+    {
+      "url": "https://github.com/triton-lang/triton/pull/11967",
+      "shared_discussion_context": [
+        "| [#11967](https://github.com/triton-lang/triton/pull/11967) | masks influence coalesced-layout choice |"
+      ]
+    },
+    {
+      "url": "https://github.com/triton-lang/triton/pull/6045",
+      "shared_discussion_context": [
+        "| [#6045](https://github.com/triton-lang/triton/pull/6045) | MMA operand → TMA encoding |"
+      ]
+    },
+    {
+      "url": "https://github.com/triton-lang/triton/pull/7625",
+      "shared_discussion_context": [
+        "| [#7625](https://github.com/triton-lang/triton/pull/7625) | transposed MFMA → DotOp |"
+      ]
+    },
+    {
+      "url": "https://github.com/triton-lang/triton/pull/7968",
+      "shared_discussion_context": [
+        "| C11 | GMEM Load → MFMA/Dot | Micro-op | [Triton #8450](https://github.com/triton-lang/triton/pull/8450), [#7968](https://github.com/triton-lang/triton/pull/7968) | HBM/LDS/register hierarchy |",
+        "- [Triton #7968](https://github.com/triton-lang/triton/pull/7968)",
+        "| R28 | Triton GMEM→MFMA；[#8450](https://github.com/triton-lang/triton/pull/8450), [#7968](https://github.com/triton-lang/triton/pull/7968) | global operand load | Dot/MFMA | **coalesced Blocked vs Dot-compatible/preshuffled** | GMEM→Blocked→LDS→Dot vs GMEM preshuffled→Reg→Dot | ★★★ micro mechanism |",
+        "| U2 | [Triton #7968](https://github.com/triton-lang/triton/pull/7968) | Triton AMD | GMEM → MFMA | global operand producer | plain vs **preshuffled coalesced** | MFMA | dot-native | transpose/reshape, bypass LDS | 改 **HBM operand layout**，不是只改 IR tag |",
+        "- [Triton PR #7968](https://github.com/triton-lang/triton/pull/7968)",
+        "| Triton | Global operand → Dot | HBM→LDS/Reg | [PR #7968](https://github.com/triton-lang/triton/pull/7968) | ordinary vs preshuffled global representation |"
+      ]
+    },
+    {
+      "url": "https://github.com/triton-lang/triton/pull/8450",
+      "shared_discussion_context": [
+        "| C11 | GMEM Load → MFMA/Dot | Micro-op | [Triton #8450](https://github.com/triton-lang/triton/pull/8450), [#7968](https://github.com/triton-lang/triton/pull/7968) | HBM/LDS/register hierarchy |",
+        "- [Triton #8450](https://github.com/triton-lang/triton/pull/8450)",
+        "| R28 | Triton GMEM→MFMA；[#8450](https://github.com/triton-lang/triton/pull/8450), [#7968](https://github.com/triton-lang/triton/pull/7968) | global operand load | Dot/MFMA | **coalesced Blocked vs Dot-compatible/preshuffled** | GMEM→Blocked→LDS→Dot vs GMEM preshuffled→Reg→Dot | ★★★ micro mechanism |",
+        "| U1 | [Triton #8450](https://github.com/triton-lang/triton/pull/8450) | Triton / Paged Attention RFC | GMEM Load → Dot | `LoadOp` | coalesced `Blocked` | `DotOp/MFMA` | `DotOperandEncoding` | `convert_layout` / LDS | HBM operand physical order + load encoding；比较 LDS repair vs direct |",
+        "- [Triton PR #8450](https://github.com/triton-lang/triton/pull/8450)",
+        "| Triton | Global load → Dot/MFMA | HBM→Reg/LDS→Reg | [PR #8450](https://github.com/triton-lang/triton/pull/8450) | Blocked→LDS→DotOperand vs direct HBM→DotOperand |"
+      ]
+    },
+    {
+      "url": "https://github.com/triton-lang/triton/pull/8500",
+      "shared_discussion_context": [
+        "| [#8500](https://github.com/triton-lang/triton/pull/8500) | Reduce wave layout |"
+      ]
+    },
+    {
+      "url": "https://github.com/vllm-project/vllm/issues/38256",
+      "shared_discussion_context": [
+        "| M8 | [vLLM #38256](https://github.com/vllm-project/vllm/issues/38256) | vLLM MoE offload | Host/GPU expert cache → expert GEMM | offload/cache manager | host-native vs GPU-consumer-native | expert kernel | backend-native weight layout | async prefetch/eviction | 适合扩展 M7 到多个 backend |"
+      ]
+    },
+    {
+      "url": "https://github.com/vllm-project/vllm/issues/38260",
+      "shared_discussion_context": [
+        "| P14 | [vLLM #38260](https://github.com/vllm-project/vllm/issues/38260) | vLLM multi-tier KV | GPU KV → CPU/NVMe tier → GPU | offload connector | GPU-native / canonical tier representation | restored attention | backend-native KV | pack/serialize/restore | system-level multi-tier extension |",
+        "[Issue #38260](https://github.com/vllm-project/vllm/issues/38260)"
+      ]
+    },
+    {
+      "url": "https://github.com/vllm-project/vllm/issues/45997",
+      "shared_discussion_context": [
+        "| [vLLM issue #45997](https://github.com/vllm-project/vllm/issues/45997) | attention cache | KV connector | kernel-specific vs layer-major constant-stride |"
+      ]
+    },
+    {
+      "url": "https://github.com/vllm-project/vllm/issues/46204",
+      "shared_discussion_context": [
+        "| R12 | vLLM MiniMax-M3 P/D mismatch；[#46204](https://github.com/vllm-project/vllm/issues/46204) | P/D KV importer | MSA | **HND landing vs NHD-native landing** | HND wire/import→NHD repair→MSA vs direct NHD destination→MSA | ★★★ |",
+        "| A11 | [vLLM #46204](https://github.com/vllm-project/vllm/issues/46204) | vLLM / MiniMax-M3 + P/D | KV connector → MSA | connector receive | HND forced by connector | MSA | NHD-native（issue 所述冲突） | prefill → transfer → cache mapping → MSA | 最值得测 `HND wire→NHD repair` vs `NHD direct landing` |"
+      ]
+    },
+    {
+      "url": "https://github.com/vllm-project/vllm/issues/46979",
+      "shared_discussion_context": [
+        "| R16 | vLLM/SGLang RoPE→Attention fusion；[#46979](https://github.com/vllm-project/vllm/issues/46979), [SGLang #41698](https://github.com/sgl-project/sglang/pull/41698) | QKNorm/RoPE/KV preparation | real Attention | **producer output KV representation** | direct consumer-native cache vs producer-native+repair | ★★☆；PR before/after不能直接当RQ1 |",
+        "| A2 | [vLLM #46979](https://github.com/vllm-project/vllm/issues/46979) | vLLM / GQA、MLA、SparseMLA | RoPE/KVPrep → Attention | RoPE + cache update family | GQA KV / MLA latent / SparseMLA KV | 对应 attention backend | backend-specific KV layout | projection → norm/RoPE → cache → attention | 把它做成 umbrella：分别对 GQA/MLA/SparseMLA 枚举 producer direct-emission layout |",
+        "- vLLM GQA/MLA/SparseMLA audit：[Issue #46979](https://github.com/vllm-project/vllm/issues/46979)",
+        "| vLLM | GQA/MLA/SparseMLA 的 RoPE + KV-cache fusion coverage | [Issue #46979](https://github.com/vllm-project/vllm/issues/46979) |",
+        "| [vLLM issue #46979](https://github.com/vllm-project/vllm/issues/46979) | RoPE/KV producer families | GQA/MLA/SparseMLA | 明确要求审计 fusion coverage |"
+      ]
+    },
+    {
+      "url": "https://github.com/vllm-project/vllm/issues/47095",
+      "shared_discussion_context": [
+        "| [vLLM issue #47095](https://github.com/vllm-project/vllm/issues/47095) | EP/quant producer → backend | physical representation 不一定只是轴 permutation |"
+      ]
+    },
+    {
+      "url": "https://github.com/vllm-project/vllm/issues/55312",
+      "shared_discussion_context": [
+        "[Issue #55312](https://github.com/vllm-project/vllm/issues/55312)",
+        "[vLLM Issue #55312](https://github.com/vllm-project/vllm/issues/55312) 是真实 spec-decoding layout conflict，但不一定所有 draft/target 路径都有一个严格意义上的“同一个 tensor 从 draft handed off 给 target”。",
+        "- vLLM draft/target layout conflict：[Issue #55312](https://github.com/vllm-project/vllm/issues/55312)",
+        "urlvLLM issue #55312https://github.com/vllm-project/vllm/issues/55312",
+        "| [vLLM issue #55312](https://github.com/vllm-project/vllm/issues/55312) | shared KV pool | draft + target attention | backend layout sets can be disjoint |",
+        "[vLLM issue #55312](https://github.com/vllm-project/vllm/issues/55312)：draft/target backend 的 KV layout support 可不相交。"
+      ]
+    },
+    {
+      "url": "https://github.com/vllm-project/vllm/issues/55394",
+      "shared_discussion_context": [
+        "| R14 | vLLM QSA sparse gather；[#55394](https://github.com/vllm-project/vllm/issues/55394), [#55430](https://github.com/vllm-project/vllm/pull/55430) | QSA K/V gather | sparse QSA prefill | **per-query gathered layout vs tile-union gathered layout** | per-row gather→QSA vs shared tile-union gather→QSA | ★★★ |",
+        "| A12 | [vLLM #55394](https://github.com/vllm-project/vllm/issues/55394), [#55430](https://github.com/vllm-project/vllm/pull/55430) | vLLM / Qwen3.8 QSA | KV gather → QSA sparse prefill | sparse gather | per-query gather / tile-union gathered K/V | sparse QSA | sparse tile consumer | index selection → gather → sparse attention | 改 **gather output organization**；per-row vs tile-union/consumer-native |"
+      ]
+    },
+    {
+      "url": "https://github.com/vllm-project/vllm/issues/55904",
+      "shared_discussion_context": [
+        "[vLLM issue #55904](https://github.com/vllm-project/vllm/issues/55904)：offload persistent bytes 如果不区分 LBNHC/LBHNC，会静默解释错误。"
+      ]
+    },
+    {
+      "url": "https://github.com/vllm-project/vllm/issues/56081",
+      "shared_discussion_context": [
+        "| R13 | vLLM KV data+scale alignment；[#56081](https://github.com/vllm-project/vllm/issues/56081) | quantized KV cache writer | gather-based attention | **inline scale vs side/aligned scale representation** | writer-local cost vs aligned data+metadata→gather attention edge | ★★★，但属 data+metadata layout |",
+        "| A13 | [vLLM #56081](https://github.com/vllm-project/vllm/issues/56081) | vLLM / gather attention | KV quant/write → gather consumer | cache writer with inline scales | inline data+scale causing alignment shift | gather-based attention | 128B-friendly aligned rows | KV data + scale metadata → gather | 改 producer 的 **data/scale physical packing**：inline vs side-array/aligned |"
+      ]
+    },
+    {
+      "url": "https://github.com/vllm-project/vllm/issues/56123",
+      "shared_discussion_context": [
+        "- P/D parallel-layout transfer contract：[Issue #56123](https://github.com/vllm-project/vllm/issues/56123)"
+      ]
+    },
+    {
+      "url": "https://github.com/vllm-project/vllm/issues/57794",
+      "shared_discussion_context": [
+        "| M10 | [vLLM #57794](https://github.com/vllm-project/vllm/issues/57794) | vLLM / expert-granular residency | host experts → GPU cache | residency producer | per-expert compact/cache representation | MoE GEMM | kernel-native | EPLB statistics → prefetch | placement RQ1，结合真实 routing frequency |"
+      ]
+    },
+    {
+      "url": "https://github.com/vllm-project/vllm/issues/58034",
+      "shared_discussion_context": [
+        "| L5 | [vLLM #58034](https://github.com/vllm-project/vllm/issues/58034) | vLLM / hybrid GDN/Mamba CPU | conv-state producer → consumer | Mamba/GDN state producer | DS vs SD conv layout（issue 中冲突） | CPU platform kernel | forced alternate layout | P/D state handling | 很适合 legality/cross-platform layout case |"
+      ]
+    },
+    {
+      "url": "https://github.com/vllm-project/vllm/issues/59110",
+      "shared_discussion_context": [
+        "| A10 | [vLLM #59110](https://github.com/vllm-project/vllm/issues/59110) | vLLM / heterogeneous TP | remote KV → ROCm attention | NIXL importer | split K/V slot representation | AITER/ROCm/B12X | backend-shuffled representation | P/D transport → slot map → layout translation → attention | 改 importer destination mapping；是 transfer-layout RQ1 |",
+        "| [vLLM issue #59110](https://github.com/vllm-project/vllm/issues/59110) | P-side KV | decode backend | heterogeneous TP + split K/V slot layout |"
+      ]
+    },
+    {
+      "url": "https://github.com/vllm-project/vllm/issues/59111",
+      "shared_discussion_context": [
+        "| R11 | vLLM standard KV→AITER shuffle；[#59111](https://github.com/vllm-project/vllm/issues/59111) | NIXL decode-side importer | AITER attention | **standard KV page vs AITER-shuffled page as importer output** | standard landing→shuffle→AITER vs direct shuffled landing→AITER | ★★★ |",
+        "| A9 | [vLLM #59111](https://github.com/vllm-project/vllm/issues/59111) | vLLM / ROCm AITER | standard KV pages → AITER decode | NIXL receive/import | standard KV pages | AITER attention | **shuffled pages** | transfer → decode-side conversion → attention | 改 decode-side importer：standard→shuffle 后消费 vs **直接 landing 成 shuffled layout** |",
+        "在 decode side 转换。urlvLLM issue #59111https://github.com/vllm-project/vllm/issues/59111",
+        "| [vLLM issue #59111](https://github.com/vllm-project/vllm/issues/59111) | standard KV / NIXL | ROCm AITER decode | standard pages → shuffled pages |",
+        "| vLLM [#59111](https://github.com/vllm-project/vllm/issues/59111) | standard KV producer / NIXL transfer → ROCm AITER decode | transfer/canonical representation 与 decode-side shuffled representation不同 | standard LBNHC/LBHNC；AITER shuffled; transfer-canonical→decode conversion |"
+      ]
+    },
+    {
+      "url": "https://github.com/vllm-project/vllm/issues/59176",
+      "shared_discussion_context": [
+        "[vLLM issue #59176](https://github.com/vllm-project/vllm/issues/59176)：GLM-5.3-Flash 出现 LBHNC vs BLHNC compatibility problem。"
+      ]
+    },
+    {
+      "url": "https://github.com/vllm-project/vllm/pull/46326",
+      "shared_discussion_context": [
+        "[PR #46326](https://github.com/vllm-project/vllm/pull/46326)",
+        "| R21 | vLLM HiSparse；[#46326](https://github.com/vllm-project/vllm/pull/46326) | host→GPU top-k KV swap-in | sparse MLA decode | **copy-friendly hot buffer vs consumer-native compact hot buffer** | host gather→GPU layout→sparse decode | ★★☆；consumer-native alternate需patch |",
+        "| P5 | [vLLM #46326](https://github.com/vllm-project/vllm/pull/46326) | vLLM / GLM-5.2 HiSparse | Host KV → GPU hot buffer → sparse decode | `hisparse_swap_in` | pinned-host full KV → compact GPU hot set | Sparse MLA decode | top-k GPU working-set layout | indexer top-k、LRU、gather | 改 hot-buffer destination：token-major vs consumer-native |",
+        "[vLLM #46326](https://github.com/vllm-project/vllm/pull/46326)",
+        "- [vLLM PR #46326](https://github.com/vllm-project/vllm/pull/46326)"
+      ]
+    },
+    {
+      "url": "https://github.com/vllm-project/vllm/pull/47757",
+      "shared_discussion_context": [
+        "| [vLLM PR #47757](https://github.com/vllm-project/vllm/pull/47757) | sparse MLA QK-RoPE + Q/KV concat + cache write | Sparse MLA | fused output representation |"
+      ]
+    },
+    {
+      "url": "https://github.com/vllm-project/vllm/pull/52363",
+      "shared_discussion_context": [
+        "| [vLLM PR #52363](https://github.com/vllm-project/vllm/pull/52363) | RoPE + K/V cache emission | FlashAttention decode | producer 直接生成 consumer cache layout vs 普通 RoPE→cache |",
+        "| vLLM [PR #52363](https://github.com/vllm-project/vllm/pull/52363)（open） | RoPE + K/V producer → paged KV → FlashAttention | 新实现直接把 rotary K/V 写进 cache；producer 不再只是 memcpy/write，而是带实际计算的 fused producer | 当前 vLLM 合法 `KVCacheLayout` 集合；普通 RoPE→cache、fused direct-emission、materialize |"
+      ]
+    },
+    {
+      "url": "https://github.com/vllm-project/vllm/pull/52901",
+      "shared_discussion_context": [
+        "| A3 | [vLLM #52901](https://github.com/vllm-project/vllm/pull/52901) | vLLM / gated attention | gated QKV+RoPE+KV write → Attention | fused QKV split/QK norm/RoPE/cache write | NHD/HND 类 KV representation | attention | consumer-supported cache layout | QKV split → RMSNorm → RoPE → gate → KV update | 改 fused producer 的 KV store mapping；固定 fusion 与 dtype |",
+        "| [vLLM PR #52901](https://github.com/vllm-project/vllm/pull/52901) | gated QKV split + Q/K RMSNorm + RoPE + gate + KV update | Attention | fused producer 支持 NHD/HND |"
+      ]
+    },
+    {
+      "url": "https://github.com/vllm-project/vllm/pull/52928",
+      "shared_discussion_context": [
+        "| [vLLM PR #52928](https://github.com/vllm-project/vllm/pull/52928) | Mamba state | FlashInfer ReplaySSM |"
+      ]
+    },
+    {
+      "url": "https://github.com/vllm-project/vllm/pull/53078",
+      "shared_discussion_context": [
+        "| L4 | [vLLM #53078](https://github.com/vllm-project/vllm/pull/53078) | vLLM / hybrid GDN/Mamba P/D | Prefill recurrent state → Decode | state exporter | producer TP/state shard layout | remote decode GDN/Mamba | destination TP/state layout | Mooncake/NIXL redistribution | 改 state export packing/partition |"
+      ]
+    },
+    {
+      "url": "https://github.com/vllm-project/vllm/pull/53899",
+      "shared_discussion_context": [
+        "| P12 | [vLLM #53899](https://github.com/vllm-project/vllm/pull/53899) | vLLM Qwen3.8 PLE | CPU PLE → GPU | offload worker | resident host table | PLE GPU consumer | gathered GPU rows | H2D offload | 与 #54129 比 resident-host vs mmap |"
+      ]
+    },
+    {
+      "url": "https://github.com/vllm-project/vllm/pull/54103",
+      "shared_discussion_context": [
+        "| [vLLM PR #54103](https://github.com/vllm-project/vllm/pull/54103) | KDA state producer | ATOM KDA/ReplaySSM |"
+      ]
+    },
+    {
+      "url": "https://github.com/vllm-project/vllm/pull/54109",
+      "shared_discussion_context": [
+        "| C3 | MoE Prepare → FusedMoE Expert | Operator→Operator | [vLLM #54109](https://github.com/vllm-project/vllm/pull/54109) | Standard/Padded/Batched expert activation |",
+        "[vLLM #54109](https://github.com/vllm-project/vllm/pull/54109)",
+        "| R6 | vLLM DeepEPV2；[#54109](https://github.com/vllm-project/vllm/pull/54109) | MoE Prepare/Dispatch | FusedMoE expert kernel | **Standard vs PaddedStandard activation contract** | Prepare(Standard/Padded)→同一 expert kernel；只比较 consumer 都合法的 formats | ★★★ |",
+        "| M2 | [vLLM #54109](https://github.com/vllm-project/vllm/pull/54109) | vLLM / DeepEPV2 | Prepare/Finalize → experts | DeepEPV2 prepare | `Standard`, **`PaddedStandard`**, `BatchedExperts` | FusedMoE expert kernel | declared activation-format contract | padding markers `topk_ids=-1` | 强制同一 expert kernel 消费 Standard/PaddedStandard；只测合法交集 |",
+        "- [vLLM PR #54109](https://github.com/vllm-project/vllm/pull/54109)",
+        "| vLLM | DeepEP V2 activation format | [PR #54109](https://github.com/vllm-project/vllm/pull/54109) |"
+      ]
+    },
+    {
+      "url": "https://github.com/vllm-project/vllm/pull/54129",
+      "shared_discussion_context": [
+        "[PR #54129](https://github.com/vllm-project/vllm/pull/54129)",
+        "| R24 | vLLM PLE mmap；[#54129](https://github.com/vllm-project/vllm/pull/54129) | disk/host row gather | GPU PLE consumer | **file/gather-friendly row organization vs GPU-consumer row buffer** | mmap gather→H2D→PLE | ★☆☆：更像 placement/I/O，不是纯 layout RQ1 |",
+        "| P11 | [vLLM #54129](https://github.com/vllm-project/vllm/pull/54129) | vLLM / Qwen3.8-Flash-Next PLE | mmap table → GPU PLE buffer | mmap row gather | disk-backed row-major checkpoint / optional pinned staging | PLE consumer | stable GPU gathered rows | mmap → page cache → gather → H2D | 改 host gather layout/chunking；placement不是普通 tensor layout |"
+      ]
+    },
+    {
+      "url": "https://github.com/vllm-project/vllm/pull/54327",
+      "shared_discussion_context": [
+        "[PR #54327](https://github.com/vllm-project/vllm/pull/54327)"
+      ]
+    },
+    {
+      "url": "https://github.com/vllm-project/vllm/pull/54483",
+      "shared_discussion_context": [
+        "[PR #54483](https://github.com/vllm-project/vllm/pull/54483)"
+      ]
+    },
+    {
+      "url": "https://github.com/vllm-project/vllm/pull/54846",
+      "shared_discussion_context": [
+        "| A7 | [vLLM #54846](https://github.com/vllm-project/vllm/pull/54846) | vLLM / Qwen3.8/Qwen4Exp QSA | QSA KV producer → QSA | KV update | BF16 / FP8-e4m3 / NVFP4 QSA cache | QSA | QSA page contract | quantize → cache → sparse attention | 固定 dtype 后比较 cache physical layout；再独立做 dtype×layout |"
+      ]
+    },
+    {
+      "url": "https://github.com/vllm-project/vllm/pull/55230",
+      "shared_discussion_context": [
+        "| [vLLM PR #55230](https://github.com/vllm-project/vllm/pull/55230) | decode RoPE + MLA KV write + FP8 Q assembly | MLA attention | Q/KV representation共同决定 |"
+      ]
+    },
+    {
+      "url": "https://github.com/vllm-project/vllm/pull/55398",
+      "shared_discussion_context": [
+        "[PR #55398](https://github.com/vllm-project/vllm/pull/55398)",
+        "| R22 | vLLM HiSparse direct landing；[#55398](https://github.com/vllm-project/vllm/pull/55398) | remote P/D receiver | decode cache/attention | **host landing vs final GPU-page landing** | remote→host→GPU→C vs remote→GPU-final-page→C | ★★☆，主要是 placement |",
+        "| P6 | [vLLM #55398](https://github.com/vllm-project/vllm/pull/55398) | vLLM HiSparse P/D | remote KV → host/GPU landing | NIXL destination mapper | host landing vs **direct GPU final-page landing** | decode | final page/hot-buffer contract | admission + transfer | memory placement 本身作为候选 |",
+        "[vLLM #55398](https://github.com/vllm-project/vllm/pull/55398)",
+        "- [vLLM PR #55398](https://github.com/vllm-project/vllm/pull/55398)"
+      ]
+    },
+    {
+      "url": "https://github.com/vllm-project/vllm/pull/55430",
+      "shared_discussion_context": [
+        "| R14 | vLLM QSA sparse gather；[#55394](https://github.com/vllm-project/vllm/issues/55394), [#55430](https://github.com/vllm-project/vllm/pull/55430) | QSA K/V gather | sparse QSA prefill | **per-query gathered layout vs tile-union gathered layout** | per-row gather→QSA vs shared tile-union gather→QSA | ★★★ |",
+        "| A12 | [vLLM #55394](https://github.com/vllm-project/vllm/issues/55394), [#55430](https://github.com/vllm-project/vllm/pull/55430) | vLLM / Qwen3.8 QSA | KV gather → QSA sparse prefill | sparse gather | per-query gather / tile-union gathered K/V | sparse QSA | sparse tile consumer | index selection → gather → sparse attention | 改 **gather output organization**；per-row vs tile-union/consumer-native |"
+      ]
+    },
+    {
+      "url": "https://github.com/vllm-project/vllm/pull/56177",
+      "shared_discussion_context": [
+        "| C8 | Host Expert Cache Fill → Marlin MoE GEMM | Memory producer→Operator | [vLLM #56177](https://github.com/vllm-project/vllm/pull/56177) | weight representation，而不是 activation/KV |",
+        "[PR #56177](https://github.com/vllm-project/vllm/pull/56177)",
+        "| R18 | vLLM Host Expert→Marlin；[#56177](https://github.com/vllm-project/vllm/pull/56177) | expert-cache H2D refill | Marlin MoE GEMM | **compact/checkpoint representation vs Marlin-converted physical rows** | compact H2D→convert→GEMM vs host consumer-native→H2D→GEMM | ★★★ |",
+        "| M7 | [vLLM #56177](https://github.com/vllm-project/vllm/pull/56177) | vLLM / Qwen3.8-Flash-Next NVFP4 | Host expert refill → Marlin GEMM | expert-cache H2D fill | checkpoint/compact vs **Marlin-converted physical rows** | Marlin MoE | Marlin physical-row representation | load-time conversion, LRU, H2D copy | 改 host-side stored weight representation |",
+        "[vLLM #56177](https://github.com/vllm-project/vllm/pull/56177)",
+        "[vLLM PR #56177](https://github.com/vllm-project/vllm/pull/56177)"
+      ]
+    },
+    {
+      "url": "https://github.com/vllm-project/vllm/pull/57097",
+      "shared_discussion_context": [
+        "| R15 | vLLM QKNorm/RoPE/QSA prepare；[#57097](https://github.com/vllm-project/vllm/pull/57097) | QKNorm+RoPE+KVPrep subgraph | QSA/indexer/attention | **不同 direct cache output representation** | fixed fused producer under alternate cache mappings→same consumer | ★★☆：需额外 layout-only patch |",
+        "| A1 | [vLLM #57097](https://github.com/vllm-project/vllm/pull/57097) | vLLM / Qwen3.8-Flash-Next QSA | QK-Norm+RoPE+KVPrep → QSA | `qsa_prepare` / 原三 kernel prepare stage | main Q/K/gate + paged K/V；BF16/FP8 cache | QSA sparse attention/indexer | paged QSA/KV cache contract | QKV projection → QK norm → RoPE → gate split → QSA metadata → KV cache → QSA | 固定 QSA consumer，改变 **prepare 最终 K/V cache 写布局**；不要直接用 fused-vs-unfused 当 layout-only 结论 |",
+        "- vLLM Qwen3.8 QSA：[PR #57097](https://github.com/vllm-project/vllm/pull/57097)",
+        "| vLLM | Qwen3.8-Flash-Next：QK norm+RoPE+gate+QSA prep+KV write → QSA | [PR #57097](https://github.com/vllm-project/vllm/pull/57097) |",
+        "[PR #57097](https://github.com/vllm-project/vllm/pull/57097)",
+        "其中 vLLM #57097 很有代表性：baseline 是三个真实 kernels——QK norm/RoPE、QSA pre-indexer、`reshape_and_cache_flash`；PR 将其变成一个 `qsa_prepare`，直接把 K/V 写进 paged cache，明确消除了 K intermediate round-trip。urlvLLM PR #57097https://github.com/vllm-project/vllm/pull/57097"
+      ]
+    },
+    {
+      "url": "https://github.com/vllm-project/vllm/pull/57640",
+      "shared_discussion_context": [
+        "| A4 | [vLLM #57640](https://github.com/vllm-project/vllm/pull/57640) | vLLM / Kimi-K3 MLA decode | MLA KV write + Q prep → MLA decode | fused KV-write/Q-prep | MLA latent / packed cache representation | MLA decode | AITER MLA native contract | projection → Q prep → KV write → MLA | 改 fused producer 的 cache representation；consumer 固定 AITER |"
+      ]
+    },
+    {
+      "url": "https://github.com/vllm-project/vllm/pull/58380",
+      "shared_discussion_context": [
+        "| [vLLM PR #58380](https://github.com/vllm-project/vllm/pull/58380) | allocator/cache writer | attention layers | layer-outermost vs block-outermost |",
+        "[vLLM PR #58380](https://github.com/vllm-project/vllm/pull/58380)：mixed page size 时，block-outermost layout 能显著改变 cache packing/padding。",
+        "| vLLM [PR #58380](https://github.com/vllm-project/vllm/pull/58380)（2026-09，当前 open） | KV allocator/writer → attention kernels | layer-outermost 与 block-outermost layout 对 packing/padding 和 kernel consumption 的利弊不同 | `LBNHC/LBHNC` vs `BLNHC/BLHNC` |"
+      ]
+    },
+    {
+      "url": "https://github.com/vllm-project/vllm/pull/58815",
+      "shared_discussion_context": [
+        "| P13 | [vLLM #58815](https://github.com/vllm-project/vllm/pull/58815) | vLLM Qwen3.8 PLE | checkpoint file → host/GPU | file gather | host-file gathered rows | PLE | GPU row buffer | safetensors/file gather | file range/coalescing vs consumer row order |"
+      ]
+    },
+    {
+      "url": "https://github.com/vllm-project/vllm/pull/59035",
+      "shared_discussion_context": [
+        "| A6 | [vLLM #59035](https://github.com/vllm-project/vllm/pull/59035) | vLLM ROCm | QKNorm+RoPE+KVCache → FP8-Q Attention | fused norm/RoPE/cache/Q quant | Q BF16/FP8 + KV representation | attention | FP8-Q + cache contract | Norm → RoPE → Q quant → KV write → attention | layout 与 Q dtype 做 factorial；不能把 FP8 收益全归因于 layout |",
+        "| [vLLM PR #59035](https://github.com/vllm-project/vllm/pull/59035) | QKNorm+RoPE+KV cache + Q quant | attention | quantized Q 与 cache layout 联合 |"
+      ]
+    },
+    {
+      "url": "https://github.com/vllm-project/vllm/pull/59070",
+      "shared_discussion_context": [
+        "| P4 | [vLLM #59070](https://github.com/vllm-project/vllm/pull/59070) | vLLM ROCm MLA+DCP | FP8 context → AllGather → projection | DCP prefill context producer | FP8 | downstream MLA projection/pack | consumer-ready context | AllGather、dequant、reorg | FP8 wire vs BF16 wire；dtype/layout联合，单独做 layout control |",
+        "真实影响整条 edge。urlvLLM PR #59070https://github.com/vllm-project/vllm/pull/59070",
+        "| [vLLM PR #59070](https://github.com/vllm-project/vllm/pull/59070) | cached FP8 context | AllGather → MLA projection | FP8 wire vs BF16 wire |"
+      ]
+    },
+    {
+      "url": "https://github.com/vllm-project/vllm/pull/59246",
+      "shared_discussion_context": [
+        "| vLLM | MLA FP8/NVFP4 cache variants | [PR #59246](https://github.com/vllm-project/vllm/pull/59246), [PR #59342](https://github.com/vllm-project/vllm/pull/59342) |"
+      ]
+    },
+    {
+      "url": "https://github.com/vllm-project/vllm/pull/59289",
+      "shared_discussion_context": [
+        "| A5 | [vLLM #59289](https://github.com/vllm-project/vllm/pull/59289) | vLLM / MLA | MLA KV-cache writer → MLA | vectorized KV writer | producer-native vectorized MLA cache | MLA attention | native MLA cache | projection → vectorized store → MLA | 比较 writer 直接生成不同合法 MLA cache layout，不仅比较 vector width |"
+      ]
+    },
+    {
+      "url": "https://github.com/vllm-project/vllm/pull/59300",
+      "shared_discussion_context": [
+        "| A8 | [vLLM #59300](https://github.com/vllm-project/vllm/pull/59300) | vLLM / MiniMax-M3 | NVFP4 KV producer → MSA | KV quant/cache writer | NVFP4 paged KV | MSA sparse attention | native MSA NVFP4 contract | quantization → cache → MSA | direct-write MSA-native vs canonical KV+repair |",
+        "| vLLM | MiniMax-M3 MSA + NVFP4 KV | [PR #59300](https://github.com/vllm-project/vllm/pull/59300) |",
+        "- vLLM MiniMax-M3 MSA NVFP4：[PR #59300](https://github.com/vllm-project/vllm/pull/59300)"
+      ]
+    },
+    {
+      "url": "https://github.com/vllm-project/vllm/pull/59342",
+      "shared_discussion_context": [
+        "| vLLM | MLA FP8/NVFP4 cache variants | [PR #59246](https://github.com/vllm-project/vllm/pull/59246), [PR #59342](https://github.com/vllm-project/vllm/pull/59342) |"
+      ]
+    }
+  ]
+}

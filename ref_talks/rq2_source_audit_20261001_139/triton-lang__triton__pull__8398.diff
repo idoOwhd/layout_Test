@@ -1,0 +1,344 @@
+diff --git a/include/triton/Dialect/TritonGPU/Transforms/Utility.h b/include/triton/Dialect/TritonGPU/Transforms/Utility.h
+index 12b1fa6efd20..59a1008800b0 100644
+--- a/include/triton/Dialect/TritonGPU/Transforms/Utility.h
++++ b/include/triton/Dialect/TritonGPU/Transforms/Utility.h
+@@ -172,6 +172,11 @@ void appendToForOpYield(scf::ForOp forOp, ArrayRef<Value> newOperands);
+ Operation *cloneWithInferType(mlir::OpBuilder &rewriter, Operation *op,
+                               IRMapping &mapping);
+ 
++// Get backward slice of tensor values starting from the root node along with
++// encoding propagation. Backwards propagation can be controlled via
++// propagationAction to stop the current chain or aborting signalling an error
++enum class TraversalAction { Continue, Stop, AbortWithError };
++
+ /// For a given \p root value with desired layout \p rootEncoding, get the
+ /// backward slice of values that would have to be recreated to produce the
+ /// value of \p root with that layout (without an intervening layout
+@@ -179,13 +184,13 @@ Operation *cloneWithInferType(mlir::OpBuilder &rewriter, Operation *op,
+ /// the following:
+ ///   1. has the desired layout
+ ///   2. \p getExistingConversion returns an existing converted value
+-///   3. \p stopPropagation returns true for an op.
++///   3. \p propagateAction does not return Continue.
+ /// The slice is returned in \p slice, and the desired layout of each value in
+ /// the slice is stored in \p layouts.
+ LogicalResult getConvertBackwardSlice(
+     OpOperand &root, SetVector<Value> &slice, Attribute rootEncoding,
+     DenseMap<Value, Attribute> &layout,
+-    std::function<bool(Operation *)> stopPropagation = nullptr,
++    std::function<TraversalAction(Operation *)> propagationAction = nullptr,
+     std::function<Value(OpOperand &, Attribute)> getExistingConversion =
+         nullptr);
+ 
+diff --git a/lib/Dialect/TritonGPU/Transforms/RemoveLayoutConversions.cpp b/lib/Dialect/TritonGPU/Transforms/RemoveLayoutConversions.cpp
+index 448f17b14428..3edced11dfd7 100644
+--- a/lib/Dialect/TritonGPU/Transforms/RemoveLayoutConversions.cpp
++++ b/lib/Dialect/TritonGPU/Transforms/RemoveLayoutConversions.cpp
+@@ -141,16 +141,15 @@ class LayoutRematerialization {
+   void rewriteSlice(SetVector<Value> &slice, DenseMap<Value, Attribute> &layout,
+                     ConvertLayoutOp convertOp);
+ 
+-  LogicalResult
+-  getConvertBackwardSlice(OpOperand &root, Attribute rootEncoding,
+-                          SetVector<Value> &slice,
+-                          DenseMap<Value, Attribute> &layout,
+-                          std::function<bool(Operation *)> stopPropagation);
++  LogicalResult getConvertBackwardSlice(
++      OpOperand &root, Attribute rootEncoding, SetVector<Value> &slice,
++      DenseMap<Value, Attribute> &layout,
++      std::function<TraversalAction(Operation *)> stopPropagation);
+ 
+   LogicalResult getRematerializableSlice(
+       OpOperand &root, Attribute rootEncoding, SetVector<Value> &slice,
+       DenseMap<Value, Attribute> &layout,
+-      std::function<bool(Operation *)> stopPropagation = nullptr);
++      std::function<TraversalAction(Operation *)> stopPropagation = nullptr);
+ 
+ private:
+   void updateRematMapping(SmallVector<std::tuple<Value, Value>> &values);
+@@ -968,7 +967,7 @@ void LayoutRematerialization::rewriteSlice(SetVector<Value> &slice,
+ LogicalResult LayoutRematerialization::getConvertBackwardSlice(
+     OpOperand &root, Attribute rootEncoding, SetVector<Value> &slice,
+     DenseMap<Value, Attribute> &layout,
+-    std::function<bool(Operation *)> stopPropagation) {
++    std::function<TraversalAction(Operation *)> stopPropagation) {
+   // Allow re-using existing conversions for a value. Check dominance of any
+   // reusable materializations against the root value. This is sufficient
+   // because the conversions are processed in post-order.
+@@ -1003,13 +1002,13 @@ LogicalResult LayoutRematerialization::getConvertBackwardSlice(
+ LogicalResult LayoutRematerialization::getRematerializableSlice(
+     OpOperand &root, Attribute rootEncoding, SetVector<Value> &sliceArg,
+     DenseMap<Value, Attribute> &layoutArg,
+-    std::function<bool(Operation *)> stopPropagation) {
++    std::function<TraversalAction(Operation *)> propagationAction) {
+   // Operate on copies of the input, we do not want to modify them unless we
+   // have succeeded.
+   auto slice = sliceArg;
+   auto layout = layoutArg;
+   LogicalResult result = getConvertBackwardSlice(root, rootEncoding, slice,
+-                                                 layout, stopPropagation);
++                                                 layout, propagationAction);
+   if (result.failed() || slice.empty())
+     return failure();
+ 
+@@ -1111,6 +1110,17 @@ static int64_t getByteCount(Value result, int64_t minElementCount = 0,
+   return (elementCount * dtypeBitWidth) >> 3;
+ }
+ 
++static auto
++abortOnForOpOrStopOn(llvm::function_ref<bool(Operation *)> shouldStop = {}) {
++  return [shouldStop](Operation *op) {
++    if (isa<scf::ForOp>(op))
++      return TraversalAction::AbortWithError;
++    if (shouldStop && shouldStop(op))
++      return TraversalAction::Stop;
++    return TraversalAction::Continue;
++  };
++}
++
+ void LayoutRematerialization::backwardRematerialization(
+     ConvertLayoutOp convertOp) {
+   // DotOperand is hoisted by hoistDotOperand
+@@ -1244,6 +1254,25 @@ void LayoutRematerialization::backwardRematerialization(
+     }
+   }
+ 
++  // Heuristic: rematerialize through forOps for pointer types with 0 remat
++  // cost. This aims to rematerialize cvt layouts for pipelined loads in the
++  // epilogue to avoid redundant computations inside the loop.
++  bool sliceContainsForOp = llvm::any_of(slice, [](Value v) {
++    return llvm::isa_and_nonnull<scf::ForOp>(v.getDefiningOp());
++  });
++  if (sliceContainsForOp) {
++    if (!isa<PointerType>(targetType.getElementType())) {
++      LDBG("  skipped rematerialization of non pointer type becuase the slice "
++           "contains a forOp");
++      return;
++    }
++    if (rematerialisationCost > 0) {
++      LDBG("  skipped rematerialization through a forOp because of non zero "
++           "rematerialisation cost");
++      return;
++    }
++  }
++
+   LLVM_DEBUG({
+     DBGS() << "  convert layout cost: " << convertLayoutCost << "\n";
+     DBGS() << "  rematerialisation cost: " << rematerialisationCost << "\n";
+@@ -1335,7 +1364,8 @@ void LayoutRematerialization::hoistConvertDotOperand(
+   DenseMap<Value, Attribute> layout;
+   // Set-up the conversion "cache"
+   LogicalResult result = getConvertBackwardSlice(
+-      convertOp.getSrcMutable(), targetType.getEncoding(), slice, layout, stop);
++      convertOp.getSrcMutable(), targetType.getEncoding(), slice, layout,
++      abortOnForOpOrStopOn(stop));
+   if (result.failed())
+     return;
+ 
+@@ -1414,7 +1444,7 @@ void LayoutRematerialization::hoistConvertOnTopOfExtOrBroadcast(
+   DenseMap<Value, Attribute> layout;
+   LogicalResult result = getRematerializableSlice(
+       convertOp.getSrcMutable(), targetType.getEncoding(), slice, layout,
+-      isExtOrBroadcastOp);
++      abortOnForOpOrStopOn(isExtOrBroadcastOp));
+   if (result.failed())
+     return;
+ 
+@@ -1430,10 +1460,11 @@ void LayoutRematerialization::hoistConvertOnTopOfExtOrBroadcast(
+     if (!srcEncoding)
+       return;
+ 
+-    // If we can rematerialize the rest of the ext slice we can ignore this ext
+-    // as it won't need a convert.
++    // If we can rematerialize the rest of the ext slice we can ignore this
++    // ext as it won't need a convert.
+     if (succeeded(getRematerializableSlice(op->getOpOperand(0), srcEncoding,
+-                                           slice, layout)))
++                                           slice, layout,
++                                           abortOnForOpOrStopOn())))
+       continue;
+ 
+     // Only apply it if there is a single ext op otherwise we would have to
+@@ -1473,26 +1504,27 @@ void LayoutRematerialization::hoistConvertOnTopOfExtOrBroadcast(
+ void LayoutRematerialization::hoistConvertIntoConditionals(
+     ConvertLayoutOp convertOp) {
+   // Take the backward slice of tensor dependencies rooted at the conversion,
+-  // stopping at conditionals. This subslice is used to initialize the analysis.
++  // stopping at conditionals. This subslice is used to initialize the
++  // analysis.
+   SetVector<Value> slice;
+   DenseMap<Value, Attribute> layout;
+   auto isIfOp = [](Operation *op) { return isa<scf::IfOp>(op); };
+   if (failed(getRematerializableSlice(convertOp.getSrcMutable(),
+                                       convertOp.getType().getEncoding(), slice,
+-                                      layout, isIfOp)))
++                                      layout, abortOnForOpOrStopOn(isIfOp))))
+     return;
+ 
+-  // These are the conditional edges above which conversions should be hoisted.
+-  // The value represents the `scf.if` op result and the operand represents the
+-  // edge into one of the branches.
++  // These are the conditional edges above which conversions should be
++  // hoisted. The value represents the `scf.if` op result and the operand
++  // represents the edge into one of the branches.
+   SmallVector<std::pair<Value, OpOperand *>> hoistAbove;
+ 
+-  // The list of `scf.if` op results in the slice that are not rematerializable.
+-  // Hoisting is terminated at these values.
++  // The list of `scf.if` op results in the slice that are not
++  // rematerializable. Hoisting is terminated at these values.
+   SmallVector<OpResult> terminals;
+ 
+-  // This loop recurses through the subslices of the backwards dependencies, so
+-  // re-query the size of `slice`.
++  // This loop recurses through the subslices of the backwards dependencies,
++  // so re-query the size of `slice`.
+   for (unsigned i = 0; i != slice.size(); ++i) {
+     Value v = slice[i];
+     auto ifOp = v.getDefiningOp<scf::IfOp>();
+@@ -1515,9 +1547,9 @@ void LayoutRematerialization::hoistConvertIntoConditionals(
+     auto newLayout = layout;
+ 
+     LogicalResult thenResult = getRematerializableSlice(
+-        thenRes, rootLayout, newSlice, newLayout, isIfOp);
++        thenRes, rootLayout, newSlice, newLayout, abortOnForOpOrStopOn(isIfOp));
+     LogicalResult elseResult = getRematerializableSlice(
+-        elseRes, rootLayout, newSlice, newLayout, isIfOp);
++        elseRes, rootLayout, newSlice, newLayout, abortOnForOpOrStopOn(isIfOp));
+ 
+     // If propagation across both edges of this conditional succeeded, then we
+     // don't need to hoist across it. Merge into the current slice.
+diff --git a/lib/Dialect/TritonGPU/Transforms/Utility.cpp b/lib/Dialect/TritonGPU/Transforms/Utility.cpp
+index 3f03fe7c724f..cf2b97435c71 100644
+--- a/lib/Dialect/TritonGPU/Transforms/Utility.cpp
++++ b/lib/Dialect/TritonGPU/Transforms/Utility.cpp
+@@ -857,7 +857,7 @@ static bool isFreeConvert(Operation *op) {
+ LogicalResult getConvertBackwardSlice(
+     OpOperand &root, SetVector<Value> &slice, Attribute rootEncoding,
+     DenseMap<Value, Attribute> &layout,
+-    std::function<bool(Operation *)> stopPropagation,
++    std::function<TraversalAction(Operation *)> propagationAction,
+     std::function<Value(OpOperand &, Attribute)> getExistingConversion) {
+   DenseSet<std::pair<OpOperand *, Attribute>> seen;
+   SmallVector<std::pair<OpOperand *, Attribute>> queue;
+@@ -890,7 +890,7 @@ LogicalResult getConvertBackwardSlice(
+     // Skip propagating through for op/while op/ws op results for now.
+     // TODO: enable this based on needs.
+     auto defOp = currentValue.getDefiningOp();
+-    if (isa_and_nonnull<scf::ForOp, scf::WhileOp, ttg::WarpSpecializeOp>(defOp))
++    if (isa_and_nonnull<scf::WhileOp, ttg::WarpSpecializeOp>(defOp))
+       return failure();
+     if (failed(updateLayout(currentValue, encoding)))
+       return failure();
+@@ -904,9 +904,29 @@ LogicalResult getConvertBackwardSlice(
+       continue;
+     }
+ 
++    if (auto forOp = currentValue.getDefiningOp<scf::ForOp>()) {
++      if (propagationAction) {
++        auto action = propagationAction(forOp);
++        if (action == TraversalAction::AbortWithError)
++          return failure();
++        else if (action == TraversalAction::Stop)
++          continue;
++      }
++
++      unsigned argIdx = cast<OpResult>(currentValue).getResultNumber();
++      enqueue(forOp.getBody()->getTerminator()->getOpOperand(argIdx), encoding);
++
++      continue;
++    }
++
+     if (auto ifOp = currentValue.getDefiningOp<scf::IfOp>()) {
+-      if (stopPropagation && stopPropagation(ifOp))
+-        continue;
++      if (propagationAction) {
++        auto action = propagationAction(ifOp);
++        if (action == TraversalAction::AbortWithError)
++          return failure();
++        else if (action == TraversalAction::Stop)
++          continue;
++      }
+       unsigned argIdx = mlir::cast<OpResult>(currentValue).getResultNumber();
+ 
+       OpOperand &thenValue = ifOp.thenYield()->getOpOperand(argIdx);
+@@ -931,8 +951,13 @@ LogicalResult getConvertBackwardSlice(
+       }
+       if (canFoldIntoConversion(definingOp, encoding))
+         continue;
+-      if (stopPropagation && stopPropagation(definingOp))
+-        continue;
++      if (propagationAction) {
++        auto action = propagationAction(definingOp);
++        if (action == TraversalAction::AbortWithError)
++          return failure();
++        else if (action == TraversalAction::Stop)
++          continue;
++      }
+       if (isa<triton::CatOp>(definingOp))
+         return failure();
+       if (auto gather = dyn_cast<GatherOp>(definingOp)) {
+diff --git a/lib/Dialect/TritonNvidiaGPU/Transforms/OptimizeTMemLayouts.cpp b/lib/Dialect/TritonNvidiaGPU/Transforms/OptimizeTMemLayouts.cpp
+index 082d3d4f7a1e..01053bccec0f 100644
+--- a/lib/Dialect/TritonNvidiaGPU/Transforms/OptimizeTMemLayouts.cpp
++++ b/lib/Dialect/TritonNvidiaGPU/Transforms/OptimizeTMemLayouts.cpp
+@@ -294,8 +294,13 @@ class TMemFromSharedMemPattern : public OpRewritePattern<TMEMStoreOp> {
+     SetVector<Value> slice;
+     DenseMap<Value, Attribute> layoutMap;
+     // Check how it may propagate up the SSA chain.
+-    LogicalResult result = getConvertBackwardSlice(
+-        tmemStoreOp.getSrcMutable(), slice, newEncoding, layoutMap);
++    auto stopOnForOp = [](Operation *op) {
++      return isa<scf::ForOp>(op) ? TraversalAction::AbortWithError
++                                 : TraversalAction::Continue;
++    };
++    LogicalResult result =
++        getConvertBackwardSlice(tmemStoreOp.getSrcMutable(), slice, newEncoding,
++                                layoutMap, stopOnForOp);
+     if (result.failed())
+       return failure();
+     bool foundImprovedLoad = false;
+diff --git a/test/TritonGPU/combine.mlir b/test/TritonGPU/combine.mlir
+index 21753a89b315..c729b982a744 100644
+--- a/test/TritonGPU/combine.mlir
++++ b/test/TritonGPU/combine.mlir
+@@ -2270,6 +2270,39 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
+ 
+ // -----
+ 
++#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 8], order = [1, 0]}>
++#blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [32, 1], warpsPerCTA = [8, 1], order = [1, 0]}>
++// CHECK-DAG: [[$target_layout:#.*]] = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 8], order = [1, 0]}>
++// CHECK-DAG: [[$source_layout:#.*]] = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [32, 1], warpsPerCTA = [8, 1], order = [1, 0]}>
++module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
++  // CHECK-LABEL: rematerialize_ptr_type_through_loop
++  tt.func public @rematerialize_ptr_type_through_loop(%arg0: !tt.ptr<f16>) {
++    %c1_i32 = arith.constant 1 : i32
++    %c0_i32 = arith.constant 0 : i32
++    %c128_i32 = arith.constant 128 : i32
++    %cst_0 = arith.constant dense<0.000000e+00> : tensor<128x64xf16, #blocked1>
++    %cst_1 = arith.constant dense<64> : tensor<128x64xi32, #blocked1>
++    %0 = tt.splat %arg0 : !tt.ptr<f16> -> tensor<128x64x!tt.ptr<f16>, #blocked1>
++    // CHECK: scf.for {{.*}} tensor<128x64x!tt.ptr<f16>, [[$target_layout]]
++    %1:2 = scf.for %arg1 = %c0_i32 to %c128_i32 step %c1_i32 iter_args(%arg2 = %0, %arg3 = %cst_0) -> (tensor<128x64x!tt.ptr<f16>, #blocked1>, tensor<128x64xf16, #blocked1>)  : i32 {
++      %4 = tt.addptr %arg2, %cst_1 : tensor<128x64x!tt.ptr<f16>, #blocked1>, tensor<128x64xi32, #blocked1>
++      %7 = arith.addf %arg3, %cst_0 : tensor<128x64xf16, #blocked1>
++      scf.yield %4, %7 : tensor<128x64x!tt.ptr<f16>, #blocked1>, tensor<128x64xf16, #blocked1>
++    }
++    // Check that we only have the ConvertLayout for the accumulator left in the epilogue
++    // CHECK: scf.yield
++    // CHECK-NOT: ttg.convert_layout
++    // CHECK: ttg.convert_layout {{.*}} : tensor<128x64xf16, [[$source_layout]]> -> tensor<128x64xf16, [[$target_layout]]>
++    // CHECK-NOT: ttg.convert_layout
++    %2 = ttg.convert_layout %1#0 : tensor<128x64x!tt.ptr<f16>, #blocked1> -> tensor<128x64x!tt.ptr<f16>, #blocked>
++    %3 = ttg.convert_layout %1#1 : tensor<128x64xf16, #blocked1> -> tensor<128x64xf16, #blocked>
++    tt.store %2, %3 : tensor<128x64x!tt.ptr<f16>, #blocked>
++    tt.return
++  }
++}
++
++// -----
++
+ #blocked = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+ #blocked1 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+ 

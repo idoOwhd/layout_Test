@@ -1,0 +1,957 @@
+diff --git a/docs/tirx/native_basics/cuda/buffers.rst b/docs/tirx/native_basics/cuda/buffers.rst
+index 9977725eadbf..3bed60671c57 100644
+--- a/docs/tirx/native_basics/cuda/buffers.rst
++++ b/docs/tirx/native_basics/cuda/buffers.rst
+@@ -424,7 +424,8 @@ or hand you a pointer — they emit no runtime op of their own. The common ones:
+    * - ``B.view(*shape, layout=…)``
+      - reinterpret the same storage under a new shape/layout (no copy)
+    * - ``B.local(*shape, layout=…)``
+-     - the calling thread's private register slice of a ``local`` buffer
++     - the calling thread's private register slice of a ``local`` buffer,
++       in physical storage order by default
+    * - ``B.permute(*dims)``
+      - a view with axes permuted (a transposed layout)
+    * - ``B.access_ptr(mask, …)``
+@@ -473,13 +474,23 @@ sees the 256-element buffer as ``64×4``; ``A.permute(1, 0)`` transposes the axe
+     At_ptr[(j * 4) + i]                       // permute: swapped strides
+ 
+ **Registers — ``local``.** Decomposes a thread-axis ``local`` layout into the
+-calling thread's flat register bundle (used pervasively by the tile primitives):
++calling thread's register bundle (used pervasively by the tile primitives).
++Both forms expose the raw physical storage span by default, including layout
++gaps and offsets: ``R.local()`` infers a flat 1-D span, while
++``R.local(d0, d1, ...)`` is a row-major reshape whose product must equal that
++span.  Pass an explicit ``layout=`` only when storage-iterator coordinates are
++required.  This mediated form is an escape hatch: the supplied layout
++interprets the requested shape, so that shape is not constrained to the raw
++span.  Without ``layout=``, omitting the shape always infers a one-dimensional
++physical storage span.  Only the explicit-``layout=`` compatibility form with
++no shape infers a one-dimensional shape from the logical storage size:
+ 
+ .. code-block:: python
+ 
+     R  = T.alloc_buffer((32, 8), "float32", scope="local", layout=TileLayout(S[(32, 8) : (1 @ laneid, 1)]))
+-    Rl = R.local(8)          # this lane's 8 registers
++    R_flat = R.local()       # this lane's 8 registers, physical order
++    R_2d = R.local(2, 4)     # the same registers, row-major 2x4 reshape
+ 
+ .. code-block:: c++
+ 
+-    alignas(64) float Rl_ptr[8];             // the lane's private registers
++    alignas(64) float R_flat_ptr[8];          // the lane's private registers
+diff --git a/docs/tirx/tile_primitives/copy/reg.rst b/docs/tirx/tile_primitives/copy/reg.rst
+index 5db0edf86fcf..779f954b5366 100644
+--- a/docs/tirx/tile_primitives/copy/reg.rst
++++ b/docs/tirx/tile_primitives/copy/reg.rst
+@@ -121,7 +121,7 @@ loop (not ``T.unroll`` — same flooding rationale as :doc:`gmem_smem`):
+ 
+ .. code-block:: python
+ 
+-    r_local = r_buf.local(*per_thread_r_shape)   # flat per-thread registers
++    r_local = r_buf.local()                      # raw per-thread physical span
+     for f in range(total_outer):
+         ds, dr = _outer_const_offsets(outer, f)               # shared / reg deltas
+         s_ptr = _ptr_off(s_buf.ptr_to(s_zero_indices), _s_iter_off(f, ds, s_off))
+@@ -131,6 +131,11 @@ loop (not ``T.unroll`` — same flooding rationale as :doc:`gmem_smem`):
+         else:
+             copy_op(r_ptr, s_ptr)     # shared/global -> register
+ 
++``dr`` and ``r_off_base`` are physical storage offsets, so the register alias
++must use the raw-span ``local()`` view.  This remains correct when storage
++iterators are permuted or leave gaps; every physical slot through
++``layout.storage().span()`` is directly addressable.
++
+ Generated TIRx IR
+ -----------------
+ 
+diff --git a/docs/tirx/tile_primitives/gemm.rst b/docs/tirx/tile_primitives/gemm.rst
+index 97d7e7ed6b16..b4b1a5b0dc0a 100644
+--- a/docs/tirx/tile_primitives/gemm.rst
++++ b/docs/tirx/tile_primitives/gemm.rst
+@@ -88,7 +88,7 @@ accumulate) — one ``m16n8k16`` atom (from ``test_gemm_mma_m16n8k_.py``):
+         D_f = T.alloc_buffer((16, 8),  "float32", scope="local", layout=D_FRAG)
+         A_reg = A_f.local(8)                              # stage A into the lane's 8 regs
+         for s in T.unroll(8):
+-            kp, kHi, rM = s % 2, (s // 2) % 2, s // 4
++            kp, rM, kHi = s % 2, (s // 2) % 2, s // 4
+             A_reg[s] = A_g[lane // 4 + 8 * rM, 2 * (lane % 4) + kp + 8 * kHi]
+         B_reg = B_f.local(4)                              # stage B into the lane's 4 regs
+         for s in T.unroll(4):
+@@ -109,9 +109,13 @@ group the operand sub-layouts (``D_M, D_N, A_M, A_K, B_K, B_N, C_*``) into the f
+ m16n8k frame, anchoring A/C on D's M, B/C on D's N, and B on A's K. The first
+ instruction that fits, with matching warp-tiling, wins.
+ 
+-**2. Derive register layouts.** Each operand gets a per-lane register view: D/C as
+-``[Mo, No, rM, rN]`` (4 f32), A as ``[Mo, Ko, rM, kHi, k_pack]``, B as
+-``[Ko, No, kHi, k_pack]`` — the exact register order ``mma.sync`` expects.
++**2. Derive register layouts.** Each operand gets a mediated per-lane view:
++D/C as ``[Mo, No, rM, rN]`` (4 f32), A as
++``[Mo, Ko, rM, kHi, k_pack]``, and B as
++``[Ko, No, kHi, k_pack]``.  The corresponding raw physical register order
++exposed by the default ``local`` view is D/C ``[Mo, No, rM, rN]``, A
++``[Mo, Ko, kHi, rM, k_pack]``, and B ``[Ko, No, kHi, k_pack]`` — the PTX
++operand enumeration that ``mma.sync`` expects.
+ 
+ **3. Emit the unrolled nest** — initialize D (from C if ``beta==1``, else 0), then
+ accumulate over K in place, one ``mma`` per (m, n) tile:
+diff --git a/python/tvm/backend/cuda/tile_primitive/copy/vec_auto_reg.py b/python/tvm/backend/cuda/tile_primitive/copy/vec_auto_reg.py
+index 9e5677fd3dfe..44c291f19d18 100644
+--- a/python/tvm/backend/cuda/tile_primitive/copy/vec_auto_reg.py
++++ b/python/tvm/backend/cuda/tile_primitive/copy/vec_auto_reg.py
+@@ -476,10 +476,6 @@ def _emit_reg(op_call: TilePrimitiveCall, sctx: DispatchContext) -> PrimFunc:
+     vec_len = _choose_vec_len(elem_bits, atoms, r_p, s_p)
+     vec_bits = vec_len * elem_bits
+     outer = _split_atoms_for_vec(atoms, vec_len)
+-    per_thread_r_total = 1
+-    for it in r_iters:
+-        per_thread_r_total *= int(it.extent)
+-    per_thread_r_shape = [per_thread_r_total or 1]
+ 
+     # Build the per-thread S offset outside the impl with placeholder Vars;
+     # inside the impl, real scope_ids are declared and substituted in.
+@@ -547,7 +543,9 @@ def _s_iter_off(f, ds, s_off):
+     def impl():
+         s_off = _substitute_axes(s_off_template, placeholders, sctx)
+         _setup_swizzle(s_off)
+-        r_local = r_buf.local(*per_thread_r_shape)
++        # ``dr`` and ``r_off_base`` below are physical storage offsets, so use
++        # the raw-span local view rather than storage-iterator coordinates.
++        r_local = r_buf.local()
+         # Keep a serial TIR loop and let ptxas unroll; explicit ``T.unroll``
+         # replicates per-iter scratch arrays and pressures registers.
+         for f in range(total_outer):
+diff --git a/python/tvm/backend/cuda/tile_primitive/reduction/local.py b/python/tvm/backend/cuda/tile_primitive/reduction/local.py
+index 446b027ff90c..9738ceb20f59 100644
+--- a/python/tvm/backend/cuda/tile_primitive/reduction/local.py
++++ b/python/tvm/backend/cuda/tile_primitive/reduction/local.py
+@@ -137,8 +137,8 @@ def _gen_warp_shuffle_reduce(src, dst, reduce_width, local_elems, accum, op_type
+     # fmt: off
+     @T.prim_func(check_well_formed=False)
+     def impl():
+-        src_local = src.local(local_elems)
+-        dst_local = dst.local(local_elems)
++        src_local = src.local(local_elems, layout=src.layout.storage())
++        dst_local = dst.local(local_elems, layout=dst.layout.storage())
+         for k in T.serial(local_elems):
+             if not is_same_buffer:
+                 dst_local[k] = src_local[k]
+@@ -357,8 +357,10 @@ def inner_shuffle(v, shuffle_mask):
+     if need_save_accum:
+         @T.prim_func(check_well_formed=False)
+         def impl():
+-            src_local = src.local(*src_local_shape)
+-            dst_local = dst.local(*dst_local_shape)
++            # These dimensions are storage-iterator coordinates, so request
++            # the mediated layout explicitly.  Bare local() is physical-order.
++            src_local = src.local(*src_local_shape, layout=src.layout.storage())
++            dst_local = dst.local(*dst_local_shape, layout=dst.layout.storage())
+             old_val = T.alloc_buffer([1], dtype, scope="local")
+ 
+             for spa in T.serial(dst_local_total):
+@@ -376,8 +378,10 @@ def impl():
+     else:
+         @T.prim_func(check_well_formed=False)
+         def impl():
+-            src_local = src.local(*src_local_shape)
+-            dst_local = dst.local(*dst_local_shape)
++            # These dimensions are storage-iterator coordinates, so request
++            # the mediated layout explicitly.  Bare local() is physical-order.
++            src_local = src.local(*src_local_shape, layout=src.layout.storage())
++            dst_local = dst.local(*dst_local_shape, layout=dst.layout.storage())
+ 
+             for spa in T.serial(dst_local_total):
+                 dst_idx = T.meta_var(get_indices(spa, dst_local_st, dst_local_ext))
+diff --git a/python/tvm/tirx/_buffer_view.py b/python/tvm/tirx/_buffer_view.py
+index 4448a8a72d71..90c4a13a6126 100644
+--- a/python/tvm/tirx/_buffer_view.py
++++ b/python/tvm/tirx/_buffer_view.py
+@@ -126,10 +126,28 @@ def _infer_shape(shape):
+ def local(buf: Buffer, *shape, layout=None) -> Buffer:
+     """Implement :meth:`Buffer.local`."""
+     if not shape:
+-        local_layout = buf.layout.storage()
+-        total = functools.reduce(lambda x, y: x * y, [it.extent for it in local_layout.shard], 1)
+-        shape = (total,)
+-    return _redecl(buf, shape, buf.layout.storage() if layout is None else layout)
++        if buf.layout is None:
++            raise ValueError(
++                "Buffer.local cannot infer a shape because the parent buffer has layout=None; "
++                "pass an explicit shape together with layout=..."
++            )
++        storage_layout = buf.layout.storage()
++        local_extent = storage_layout.span() if layout is None else storage_layout.size()
++        shape = (local_extent,)
++    elif layout is None:
++        if buf.layout is None:
++            raise ValueError(
++                "Buffer.local without layout= cannot validate the physical storage span "
++                "because the parent buffer has layout=None; pass an explicit layout=..."
++            )
++        local_extent = buf.layout.storage().span()
++        shape_total = functools.reduce(lambda x, y: x * y, shape, 1)
++        if not tvm.arith.Analyzer().can_prove_equal(shape_total, local_extent):
++            raise ValueError(
++                f"Local view shape {shape} has {shape_total} elements, "
++                f"but the buffer has physical storage span {local_extent} per thread"
++            )
++    return _redecl(buf, shape, "default" if layout is None else layout)
+ 
+ 
+ def permute(buf: Buffer, *dims) -> Buffer:
+diff --git a/python/tvm/tirx/buffer.py b/python/tvm/tirx/buffer.py
+index 6246e5540b36..be4fc25dca22 100644
+--- a/python/tvm/tirx/buffer.py
++++ b/python/tvm/tirx/buffer.py
+@@ -332,18 +332,31 @@ def view(self, *args, **kwargs) -> "Buffer":
+     def local(self, *shape, layout=None) -> "Buffer":
+         """Create a thread-local view of this buffer.
+ 
++        By default, both the inferred and explicit-shape forms address the
++        raw physical storage span.  ``local()[k]`` is the k-th physical
++        storage element, including any gaps or layout offset, while
++        ``local(d0, d1, ...)`` is a row-major reshape of that same span.
++        Pass ``layout=`` to request a mediated view explicitly.  This is an
++        escape hatch whose shape is interpreted by the supplied layout.  When
++        that shape is explicit, the parent buffer does not need a layout.
++
+         When called with no shape arguments, auto-infers a 1D shape from
+-        the layout's non-thread component (i.e. ``layout.storage().shard``).
++        the span of the parent layout's non-thread component (i.e.
++        ``self.layout.storage().span()``).  The explicit-``layout=`` form
++        instead infers the parent layout's ``storage().size()`` for
++        compatibility.  Either inference requires the parent buffer to have a
++        layout.
+ 
+         Parameters
+         ----------
+         shape : tuple of Expr
+-            The shape of the local view for indexing. If omitted, a 1D
+-            shape is computed automatically.
++            The shape of the local view for indexing.  Without ``layout=``,
++            its product must equal the per-thread physical storage span.
++            With an explicit layout, the shape is not constrained by the raw
++            span.  If omitted, a matching 1D shape is computed automatically.
+ 
+         layout : optional
+-            Override layout. If None, uses the storage layout
+-            (parent layout with thread axes removed).
++            Override layout. If None, the default (identity) layout is used.
+ 
+         Returns
+         -------
+diff --git a/src/tirx/script/printer/stmt.cc b/src/tirx/script/printer/stmt.cc
+index 93ef1724e0b2..4f25f2bd7734 100644
+--- a/src/tirx/script/printer/stmt.cc
++++ b/src/tirx/script/printer/stmt.cc
+@@ -16,6 +16,8 @@
+  * specific language governing permissions and limitations
+  * under the License.
+  */
++#include <algorithm>
++
+ #include "../../../tirx/transform/ir_utils.h"  // For `GetPtrStorageScope`
+ #include "./utils.h"
+ 
+@@ -318,6 +320,15 @@ ffi::Optional<ExprDoc> TryDeclBufferSugarWithParent(const tirx::BufferVar& child
+       }
+     }
+   }
++  bool same_strides = (child->strides.size() == parent->strides.size());
++  if (same_strides) {
++    for (size_t i = 0; i < child->strides.size(); ++i) {
++      if (!expr_equal(child->strides[i], parent->strides[i])) {
++        same_strides = false;
++        break;
++      }
++    }
++  }
+ 
+   bool child_is_default = IsDefaultLayout(child->layout, child->shape);
+   bool parent_is_default = IsDefaultLayout(parent->layout, parent->shape);
+@@ -328,12 +339,26 @@ ffi::Optional<ExprDoc> TryDeclBufferSugarWithParent(const tirx::BufferVar& child
+   // alias (stores, views) breaks. Such aliases now print as plain
+   // T.decl_buffer, which reparses exactly.
+ 
+-  // --- (b) Local: parent has thread axes, child has storage layout (non-thread part) ---
+-  if (same_elem_offset && same_dtype && !parent_is_default && parent->layout.has_value()) {
++  // Differences in these Buffer fields cannot be expressed by the alias sugar
++  // below, so conservatively fall back to T.decl_buffer.
++  // Shape, strides, elem_offset, dtype, and layout are checked by each helper
++  // because those are the fields that individual transformations may change.
++  //
++  // The explicit data projection was checked by FindParentBuffers.  name/span
++  // do not participate in structural equality, and BufferTypeNode has no
++  // axis-separators field (unlike tir::Buffer).
++  bool same_common_metadata = child.scope() == parent.scope() &&
++                              child->data_alignment == parent->data_alignment &&
++                              child->offset_factor == parent->offset_factor &&
++                              StructuralEqual()(child->allocated_addr, parent->allocated_addr);
++  if (!same_common_metadata) return std::nullopt;
++
++  // --- (b) Local: parent has thread axes and child spans its physical storage ---
++  if (same_elem_offset && same_dtype && same_strides && !parent_is_default &&
++      parent->layout.has_value() && child->layout.has_value()) {
+     if (auto* parent_tile = parent->layout.value().as<tirx::TileLayoutNode>()) {
+       if (parent_tile->HasThreadAxis()) {
+-        // Check if child's layout matches the storage layout (parent layout with thread axes
+-        // removed). Compute expected storage layout by filtering non-thread shard iters.
++        // Compute the raw physical storage span after filtering thread axes.
+         std::vector<tirx::Iter> storage_shard;
+         std::vector<tirx::Iter> storage_replica;
+         ffi::Map<tirx::Axis, PrimExpr> storage_offset;
+@@ -356,38 +381,39 @@ ffi::Optional<ExprDoc> TryDeclBufferSugarWithParent(const tirx::BufferVar& child
+             ffi::Array<tirx::Iter>(storage_shard.begin(), storage_shard.end()),
+             ffi::Array<tirx::Iter>(storage_replica.begin(), storage_replica.end()), storage_offset);
+ 
+-        bool child_matches_storage = false;
+-        if (child->layout.has_value()) {
+-          child_matches_storage =
+-              StructuralEqual()(child->layout.value(), tirx::Layout(expected_storage));
++        PrimExpr storage_span = expected_storage->GetSpan(ffi::Optional<ffi::String>());
++        PrimExpr storage_size = expected_storage->GetSize(ffi::Optional<ffi::String>());
++        PrimExpr child_total = IntImm::Int32(1);
++        for (const PrimExpr& dim : child->shape) {
++          child_total = child_total * dim;
+         }
+-        if (child_matches_storage) {
+-          // Compute storage total for auto-infer check
+-          int64_t total = 1;
+-          bool all_const = true;
+-          for (const auto& iter : storage_shard) {
+-            if (auto* imm = iter->extent.as<IntImmNode>()) {
+-              total *= imm->value;
+-            } else {
+-              all_const = false;
+-              break;
+-            }
+-          }
+-          // Check if shape can be auto-inferred (single dim matching storage total)
+-          if (all_const && child->shape.size() == 1) {
+-            if (auto* child_dim = child->shape[0].as<IntImmNode>()) {
+-              if (child_dim->value == total) {
+-                return pdoc->Attr("local")->Call({});
+-              }
++        arith::Analyzer analyzer;
++        bool default_physical =
++            child_is_default && analyzer->CanProveEqual(child_total, storage_span);
++        bool child_has_thread_axis = false;
++        if (const auto* child_tile = child->layout.value().as<tirx::TileLayoutNode>()) {
++          child_has_thread_axis = child_tile->HasThreadAxis();
++        }
++        bool explicit_override = !default_physical && !child_has_thread_axis;
++        if (default_physical || explicit_override) {
++          PrimExpr expected_extent = default_physical ? storage_span : storage_size;
++          bool auto_shape =
++              child->shape.size() == 1 && analyzer->CanProveEqual(child->shape[0], expected_extent);
++          ffi::Array<ExprDoc> args;
++          if (!auto_shape) {
++            for (size_t i = 0; i < child->shape.size(); ++i) {
++              args.push_back(d->AsDoc<ExprDoc>(child->shape[i],
++                                               p->Attr("buffer")->Attr("shape")->ArrayItem(i)));
+             }
+           }
+-          // Print as parent.local(*shape)
+-          ffi::Array<ExprDoc> args;
+-          for (size_t i = 0; i < child->shape.size(); ++i) {
+-            args.push_back(
+-                d->AsDoc<ExprDoc>(child->shape[i], p->Attr("buffer")->Attr("shape")->ArrayItem(i)));
++          ffi::Array<ffi::String> kwargs_keys;
++          ffi::Array<ExprDoc> kwargs_values;
++          if (explicit_override) {
++            kwargs_keys.push_back("layout");
++            kwargs_values.push_back(
++                d->AsDoc<ExprDoc>(child->layout.value(), p->Attr("buffer")->Attr("layout")));
+           }
+-          return pdoc->Attr("local")->Call(args);
++          return pdoc->Attr("local")->Call(args, kwargs_keys, kwargs_values);
+         }
+       }
+     }
+@@ -575,15 +601,6 @@ ffi::Optional<ExprDoc> TryDeclBufferSugarWithParent(const tirx::BufferVar& child
+     // doesn't (or vice versa), the sugar can't faithfully round-trip
+     // through view — fall back to T.decl_buffer where strides is an
+     // explicit kwarg.
+-    bool same_strides = (child->strides.size() == parent->strides.size());
+-    if (same_strides) {
+-      for (size_t i = 0; i < child->strides.size(); ++i) {
+-        if (!expr_equal(child->strides[i], parent->strides[i])) {
+-          same_strides = false;
+-          break;
+-        }
+-      }
+-    }
+     if (!same_strides) return std::nullopt;
+ 
+     ffi::Array<ExprDoc> args;
+@@ -603,7 +620,12 @@ ffi::Optional<ExprDoc> TryDeclBufferSugarWithParent(const tirx::BufferVar& child
+     // First pass prefers a parent whose layout matches structurally, so the
+     // sugar prints as a bare reshape instead of restating the layout.
+     if (require_same_layout && !same_layout) return std::nullopt;
+-    if (!same_layout && child->layout.has_value() && !child_is_default) {
++    // Default layouts are shape-specific objects, but a default-to-default
++    // reshape is still represented by view(*shape) without an explicit layout.
++    if (!same_layout && !(child_is_default && parent_is_default)) {
++      // Buffer.view(..., layout=None) means "inherit the parent layout", so it
++      // cannot reconstruct a layout-less child from a laid-out parent.
++      if (!child->layout.has_value()) return std::nullopt;
+       kwargs_keys.push_back("layout");
+       kwargs_values.push_back(
+           d->AsDoc<ExprDoc>(child->layout.value(), p->Attr("buffer")->Attr("layout")));
+diff --git a/tests/python/tirx/operator/tile_primitive/cuda/copy/test_reg.py b/tests/python/tirx/operator/tile_primitive/cuda/copy/test_reg.py
+index 8cd88f52203a..c57d57518212 100644
+--- a/tests/python/tirx/operator/tile_primitive/cuda/copy/test_reg.py
++++ b/tests/python/tirx/operator/tile_primitive/cuda/copy/test_reg.py
+@@ -272,6 +272,55 @@ def run_and_check():
+     tvm.testing.run_with_gpu_lock(run_and_check)
+ 
+ 
++@pytest.mark.gpu
++@pytest.mark.skipif(not env.has_cuda_compute(9), reason="need cuda compute >= 9.0")
++def test_reg_roundtrip_gapped_permuted_storage():
++    """Forced reg dispatch addresses sparse register layouts by physical offset."""
++    shape = (32, 2, 2)
++    r_layout = TileLayout(S[shape : (1 @ laneid, 2, 4)])
++    storage = r_layout.storage()
++    assert int(storage.size()) == 4
++    assert int(storage.span()) == 7
++    assert [int(storage.apply(i, shape=[4])["m"]) for i in range(4)] == [0, 4, 2, 6]
++
++    # fmt: off
++    @T.prim_func
++    def kernel(A_ptr: T.handle, B_ptr: T.handle) -> None:
++        A = T.match_buffer(A_ptr, shape, "float32")
++        B = T.match_buffer(B_ptr, shape, "float32")
++
++        T.device_entry()
++        T.cta_id([1])
++        T.lane_id([32])
++        T.thread_id([32])
++        reg = T.alloc_buffer(shape, "float32", scope="local", layout=r_layout)
++        Tx.warp.copy(reg, A, dispatch="vec_auto")
++        Tx.warp.copy(B, reg, dispatch="vec_auto")
++        # fmt: on
++
++    target = tvm.target.Target("cuda")
++    with target:
++        compiled = tvm.compile(
++            tvm.IRModule({"main": kernel}), target=target, tir_pipeline="tirx"
++        )
++    source = compiled.mod.imports[0].inspect_source()
++    assert "tvm_builtin_ptx_ld" in source
++    assert "tvm_builtin_ptx_st" in source
++
++    rng = np.random.default_rng(0)
++    A_np = rng.random(shape, dtype=np.float32)
++    B_np = np.zeros(shape, dtype=np.float32)
++
++    def run_and_check():
++        dev = tvm.cuda(0)
++        A = tvm.runtime.tensor(A_np, dev)
++        B = tvm.runtime.tensor(B_np, dev)
++        compiled(A, B)
++        np.testing.assert_array_equal(B.numpy(), A_np)
++
++    tvm.testing.run_with_gpu_lock(run_and_check)
++
++
+ # ----------------------------------------------------------------------------
+ # Migrated from test_copy_sync.py: sync G↔L copy via Tx.copy() (L = local =
+ # per-thread register, so it dispatches to the vec_auto register path).
+diff --git a/tests/python/tirx/operator/tile_primitive/cuda/gemm/test_gemm_mma_m16n8k_.py b/tests/python/tirx/operator/tile_primitive/cuda/gemm/test_gemm_mma_m16n8k_.py
+index 5f632011960a..4ad4e22440ea 100644
+--- a/tests/python/tirx/operator/tile_primitive/cuda/gemm/test_gemm_mma_m16n8k_.py
++++ b/tests/python/tirx/operator/tile_primitive/cuda/gemm/test_gemm_mma_m16n8k_.py
+@@ -241,11 +241,12 @@ def _build_tiled_numeric(Mt, Nt, Kt, kinst, beta, dtype):
+     """End-to-end ``T.gemm`` over an Mt x Nt x Kt tiling, with the A/B inputs
+     loaded and the D output stored register-by-register.
+ 
+-    Fragments are indexed through their per-register multi-dim ``.local()`` views
+-    (the shard's non-lane dims, in shard order): A = [Mt, rM(2), Kt, kHi, kp],
+-    B = [Kt, kHi, kp, Nt], D/C = [Mt, rM(2), Nt, rN(2)]. The lane owns g = lane>>2
+-    and t = lane&3; within a tile M = mt*16 + rM*8 + g, N = nt*8 + t*2 + rN,
+-    K = kt*kinst + kHi*8 + t*2 + kp.
++    Fragments are indexed through per-register multi-dim ``.local()`` views.
++    Their axes follow physical register order (stride-descending):
++    A = [Mt, Kt, kHi, rM(2), kp], B = [Kt, Nt, kHi, kp], and
++    D/C = [Mt, Nt, rM(2), rN(2)]. The lane owns g = lane>>2 and
++    t = lane&3; within a tile M = mt*16 + rM*8 + g,
++    N = nt*8 + t*2 + rN, K = kt*kinst + kHi*8 + t*2 + kp.
+     """
+     Dl, Al, Bl = _frag(Mt, Nt, Kt, kinst)
+     M, N, K = 16 * Mt, 8 * Nt, kinst * Kt
+@@ -266,28 +267,28 @@ def gemm(A_ptr: T.handle, B_ptr: T.handle, C_ptr: T.handle, D_ptr: T.handle):
+         B_f = T.alloc_buffer((K, N), dtype, scope="local", layout=Bl)
+         C_f = T.alloc_buffer((M, N), "float32", scope="local", layout=Dl)
+         D_f = T.alloc_buffer((M, N), "float32", scope="local", layout=Dl)
+-        A_reg = A_f.local(Mt, 2, Kt, kHi_n, KP)
+-        for mt, rM, kt, kHi, kp in T.grid(Mt, 2, Kt, kHi_n, KP):
+-            A_reg[mt, rM, kt, kHi, kp] = A_g[
++        A_reg = A_f.local(Mt, Kt, kHi_n, 2, KP)
++        for mt, kt, kHi, rM, kp in T.grid(Mt, Kt, kHi_n, 2, KP):
++            A_reg[mt, kt, kHi, rM, kp] = A_g[
+                 mt * 16 + lane // 4 + 8 * rM,
+                 kt * kinst + kHi * 8 + 2 * (lane % 4) + kp,
+             ]
+-        B_reg = B_f.local(Kt, kHi_n, KP, Nt)
+-        for kt, kHi, kp, nt in T.grid(Kt, kHi_n, KP, Nt):
+-            B_reg[kt, kHi, kp, nt] = B_g[
++        B_reg = B_f.local(Kt, Nt, kHi_n, KP)
++        for kt, nt, kHi, kp in T.grid(Kt, Nt, kHi_n, KP):
++            B_reg[kt, nt, kHi, kp] = B_g[
+                 kt * kinst + kHi * 8 + 2 * (lane % 4) + kp,
+                 nt * 8 + lane // 4,
+             ]
+         if beta == 1.0:
+-            C_reg = C_f.local(Mt, 2, Nt, 2)
+-            for mt, rM, nt, rN in T.grid(Mt, 2, Nt, 2):
+-                C_reg[mt, rM, nt, rN] = C_g[
++            C_reg = C_f.local(Mt, Nt, 2, 2)
++            for mt, nt, rM, rN in T.grid(Mt, Nt, 2, 2):
++                C_reg[mt, nt, rM, rN] = C_g[
+                     mt * 16 + lane // 4 + 8 * rM, nt * 8 + 2 * (lane % 4) + rN
+                 ]
+         Tx.warp.gemm(D_f, A_f, B_f, C_f, transpose_A=False, transpose_B=False, alpha=1.0, beta=beta)
+-        D_reg = D_f.local(Mt, 2, Nt, 2)
+-        for mt, rM, nt, rN in T.grid(Mt, 2, Nt, 2):
+-            D_g[mt * 16 + lane // 4 + 8 * rM, nt * 8 + 2 * (lane % 4) + rN] = D_reg[mt, rM, nt, rN]
++        D_reg = D_f.local(Mt, Nt, 2, 2)
++        for mt, nt, rM, rN in T.grid(Mt, Nt, 2, 2):
++            D_g[mt * 16 + lane // 4 + 8 * rM, nt * 8 + 2 * (lane % 4) + rN] = D_reg[mt, nt, rM, rN]
+ 
+     return gemm, M, N, K
+ 
+@@ -295,11 +296,9 @@ def gemm(A_ptr: T.handle, B_ptr: T.handle, C_ptr: T.handle, D_ptr: T.handle):
+ def _build_transpose_numeric(transpose_A, transpose_B, dtype="float16"):
+     """End-to-end single-tile ``T.gemm`` for one A/B input orientation.
+ 
+-    The transposed A fragment (``A_KM_FRAG``) carries its registers in the
+-    [kHi, kp, rM] shard order (vs [rM, kHi, kp] for the K-major ``A_FRAG``); B's
+-    register order ([kHi, kp]) is the same for both orientations. The buffer
+-    index axes swap with the orientation, but each register still holds the same
+-    logical (M, K) / (K, N) element.
++    The transposed and K-major A fragments share the physical register order
++    [kHi, rM, kp]; only their logical buffer axes differ.  B's physical order
++    [kHi, kp] is likewise unchanged by orientation.
+     """
+     Al = A_KM_FRAG if transpose_A else A_FRAG
+     Bl = B_NK_FRAG if transpose_B else B_FRAG
+@@ -320,13 +319,13 @@ def gemm(A_ptr: T.handle, B_ptr: T.handle, D_ptr: T.handle):
+         D_f = T.alloc_buffer((16, 8), "float32", scope="local", layout=D_FRAG)
+         A_reg = A_f.local(2, 2, 2)
+         if transpose_A:
+-            # A_KM_FRAG register order is [kHi, kp, rM]; buffer is [K, M].
+-            for kHi, kp, rM in T.grid(2, 2, 2):
+-                A_reg[kHi, kp, rM] = A_g[2 * (lane % 4) + kp + 8 * kHi, lane // 4 + 8 * rM]
++            # A_KM_FRAG: buffer is [K, M].
++            for kHi, rM, kp in T.grid(2, 2, 2):
++                A_reg[kHi, rM, kp] = A_g[2 * (lane % 4) + kp + 8 * kHi, lane // 4 + 8 * rM]
+         else:
+-            # A_FRAG register order is [rM, kHi, kp]; buffer is [M, K].
+-            for rM, kHi, kp in T.grid(2, 2, 2):
+-                A_reg[rM, kHi, kp] = A_g[lane // 4 + 8 * rM, 2 * (lane % 4) + kp + 8 * kHi]
++            # A_FRAG: buffer is [M, K].
++            for kHi, rM, kp in T.grid(2, 2, 2):
++                A_reg[kHi, rM, kp] = A_g[lane // 4 + 8 * rM, 2 * (lane % 4) + kp + 8 * kHi]
+         B_reg = B_f.local(2, 2)
+         if transpose_B:
+             # B_NK_FRAG buffer is [N, K].
+@@ -428,7 +427,7 @@ def test_cuda_gemm_mma_numerical(dtype):
+     with ``g = lane >> 2`` and ``t = lane & 3``. The per-register *slot* order
+     matches the dispatch's fragment register layout:
+ 
+-        A reg slot = 4*rM + 2*kHi + kp  -> M = g + 8*rM, K = 2*t + kp + 8*kHi
++        A reg slot = 4*kHi + 2*rM + kp  -> M = g + 8*rM, K = 2*t + kp + 8*kHi
+         B reg slot = 2*kHi + kp         -> K = 2*t + kp + 8*kHi, N = g
+         D reg slot = 2*rM + rN          -> M = g + 8*rM, N = 2*t + rN
+     """
+@@ -452,9 +451,10 @@ def gemm(A_ptr: T.handle, B_ptr: T.handle, D_ptr: T.handle):
+         D_f = T.alloc_buffer((16, 8), "float32", scope="local", layout=D_FRAG)
+         A_reg = A_f.local(8)
+         for s in T.unroll(8):
++            # Physical register order: s = 4*kHi + 2*rM + kp.
+             kp = s % 2
+-            kHi = (s // 2) % 2
+-            rM = s // 4
++            rM = (s // 2) % 2
++            kHi = s // 4
+             A_reg[s] = A_g[lane // 4 + 8 * rM, 2 * (lane % 4) + kp + 8 * kHi]
+         B_reg = B_f.local(4)
+         for s in T.unroll(4):
+diff --git a/tests/python/tirx/operator/tile_primitive/cuda/reduction/test_reduction.py b/tests/python/tirx/operator/tile_primitive/cuda/reduction/test_reduction.py
+index c34424540c4a..c766e19384a8 100644
+--- a/tests/python/tirx/operator/tile_primitive/cuda/reduction/test_reduction.py
++++ b/tests/python/tirx/operator/tile_primitive/cuda/reduction/test_reduction.py
+@@ -916,6 +916,63 @@ def run_and_check():
+         tvm.testing.run_with_gpu_lock(run_and_check)
+ 
+ 
++@pytest.mark.gpu
++@pytest.mark.skipif(not env.has_cuda(), reason="need cuda")
++def test_reduction_op_warp_shuffle_gapped_permuted_storage():
++    """Warp shuffle follows storage coordinates even when physical slots are sparse."""
++    n_lanes = 32
++    local_shape = (2, 2)
++    src_shape = (n_lanes, *local_shape)
++
++    # Per-thread logical coordinates enumerate physical slots [0, 4, 2, 6].
++    # The storage layout therefore has four elements but spans seven slots.
++    src_layout = TileLayout(S[src_shape : (1 @ laneid, 2, 4)])
++    dst_layout = TileLayout(S[local_shape : (2, 4)] + R[n_lanes : 1 @ laneid])
++    storage = src_layout.storage()
++    assert int(storage.size()) == 4
++    assert int(storage.span()) == 7
++    assert [int(storage.apply(i, shape=[4])["m"]) for i in range(4)] == [0, 4, 2, 6]
++
++    # fmt: off
++    @T.prim_func
++    def test_func(A_ptr: T.handle, B_ptr: T.handle) -> None:
++        A = T.match_buffer(A_ptr, src_shape, "float32", layout=TileLayout(S[src_shape]))
++        B = T.match_buffer(B_ptr, local_shape, "float32", layout=TileLayout(S[local_shape]))
++
++        T.device_entry()
++        _cta_id = T.cta_id([1])
++        _warp_id = T.warp_id([1])
++        lane_id = T.lane_id([n_lanes])
++        src_local = T.alloc_buffer([7], "float32", scope="local")
++        dst_local = T.alloc_buffer([7], "float32", scope="local")
++        src_view = src_local.view(*src_shape, layout=src_layout)
++        dst_view = dst_local.view(*local_shape, layout=dst_layout)
++        for i, j in T.grid(*local_shape):
++            src_local[i * 2 + j * 4] = A[lane_id, i, j]
++        Tx.warp.sum(dst_view, src_view)
++        for i, j in T.grid(*local_shape):
++            B[i, j] = dst_local[i * 2 + j * 4]
++        # fmt: on
++
++    target = tvm.target.Target("cuda")
++    with target:
++        mod = tvm.compile(tvm.IRModule({"main": test_func}), target=target, tir_pipeline="tirx")
++
++    rng = np.random.default_rng(0)
++    A_np = rng.random(src_shape, dtype=np.float32)
++    B_np = np.zeros(local_shape, dtype=np.float32)
++    B_ref = A_np.astype("float64").sum(axis=0).astype("float32")
++
++    def run_and_check():
++        dev = tvm.cuda(0)
++        A = tvm.runtime.tensor(A_np, dev)
++        B = tvm.runtime.tensor(B_np, dev)
++        mod(A, B)
++        tvm.testing.assert_allclose(B_ref, B.numpy(), atol=1e-4)
++
++    tvm.testing.run_with_gpu_lock(run_and_check)
++
++
+ @pytest.mark.gpu
+ @pytest.mark.skipif(not env.has_cuda(), reason="need cuda")
+ def test_reduction_warp_shuffle_multi_warp_loop():
+diff --git a/tests/python/tirx/test_parser_printer.py b/tests/python/tirx/test_parser_printer.py
+index 9a8a811294c2..88f27d102c01 100644
+--- a/tests/python/tirx/test_parser_printer.py
++++ b/tests/python/tirx/test_parser_printer.py
+@@ -1353,7 +1353,7 @@ def _visit(node):
+ 
+ 
+ def test_buffer_local_ir():
+-    """Verify .local() auto-infer: shape from storage shard extents, layout, shared data."""
++    """Verify .local() infers the physical span and uses an identity layout."""
+ 
+     # fmt: off
+     @T.prim_func
+@@ -1372,19 +1372,289 @@ def func() -> None:
+ 
+     # Shared data pointer
+     assert_structural_equal(_collect_buffer_sources(func)["B_local"], b_buf.data)
+-    # Shape: single dim matching storage shard total
++    # Shape: single dim matching the raw physical storage span
+     assert len(b_local.ty.shape) == 1
+     storage = b_buf.ty.layout.storage()
+-    expected_total = 1
+-    for it in storage.shard:
+-        expected_total *= int(it.extent)
+-    assert int(b_local.ty.shape[0]) == expected_total
+-    # Layout: storage layout (parent layout with thread axes removed)
+-    assert_structural_equal(b_local.ty.layout, storage)
++    assert int(b_local.ty.shape[0]) == int(storage.span())
++    # The inferred view uses physical storage order, not storage-iterator order.
++    assert b_local.ty.layout.is_trivial()
+ 
+     # Round-trip
+     code = func.script()
++    assert "B_local = B.local()" in code
+     assert from_source(code).script() == code
++    assert_structural_equal(func, from_source(code))
++
++
++def test_buffer_local_physical_order():
++    """Both inferred and explicit shapes map a non-trivial fragment physically."""
++    from tvm.tirx.layout import tcgen05_atom_layout
++
++    # fmt: off
++    @T.prim_func
++    def func() -> None:
++        T.device_entry()
++        A = T.alloc_buffer([32], dtype="float32", scope="local")
++        B = A.view(64, 64, layout=tcgen05_atom_layout("16x256b", (64, 64), "float32"))
++        B_flat = B.local()
++        B_2d = B.local(4, 8)
++        B_flat[2] = T.float32(1)
++        B_2d[0, 2] = T.float32(2)
++        # fmt: on
++
++    bufs = _collect_buffers(func)
++    b_buf = bufs["B"]
++    b_flat = bufs["B_flat"]
++    b_2d = bufs["B_2d"]
++
++    # The parent storage view enumerates storage iters in a different order
++    # from their physical strides, so inheriting it would permute registers.
++    assert not b_buf.ty.layout.storage().is_trivial()
++
++    for local in [b_flat, b_2d]:
++        assert_structural_equal(_collect_buffer_sources(func)[local.name], b_buf.data)
++        assert local.ty.layout.is_trivial()
++    assert [int(dim) for dim in b_flat.ty.shape] == [32]
++    assert [int(dim) for dim in b_2d.ty.shape] == [4, 8]
++
++    # Index 2 in either row-major shape is the same physical register.
++    flat_offset = b_flat.ty.layout.apply(2, shape=list(b_flat.ty.shape))["m"]
++    reshaped_offset = b_2d.ty.layout.apply(0, 2, shape=list(b_2d.ty.shape))["m"]
++    assert int(flat_offset) == int(reshaped_offset) == 2
++
++    code = func.script()
++    assert "B_flat = B.local()" in code
++    assert "B_2d = B.local(4, 8)" in code
++    assert from_source(code).script() == code
++    assert_structural_equal(func, from_source(code))
++
++
++def test_buffer_local_layout_overrides_roundtrip():
++    """Storage and arbitrary mediated layouts remain explicit overrides."""
++    from tvm.tirx.layout import tcgen05_atom_layout
++
++    # fmt: off
++    @T.prim_func
++    def func() -> None:
++        T.device_entry()
++        A = T.alloc_buffer([32], dtype="float32", scope="local")
++        B = A.view(64, 64, layout=tcgen05_atom_layout("16x256b", (64, 64), "float32"))
++        B_storage = B.local(layout=B.layout.storage())
++        # An explicit layout is an escape hatch and may describe a smaller
++        # mediated view than the parent's full per-thread storage.
++        B_custom = B.local(2, 4, layout=T.TileLayout(T.S[(2, 4) : (1, 2)]))
++        B_storage[0] = T.float32(1)
++        B_custom[0, 0] = T.float32(2)
++        # fmt: on
++
++    bufs = _collect_buffers(func)
++    b_buf = bufs["B"]
++    b_storage = bufs["B_storage"]
++    b_custom = bufs["B_custom"]
++    assert_structural_equal(b_storage.ty.layout, b_buf.ty.layout.storage())
++    assert not b_storage.ty.layout.is_trivial()
++    assert not b_custom.ty.layout.is_trivial()
++
++    code = func.script()
++    storage_line = next(line for line in code.splitlines() if "B_storage =" in line)
++    custom_line = next(line for line in code.splitlines() if "B_custom =" in line)
++    assert ".local(layout=" in storage_line
++    assert ".local(2, 4, layout=" in custom_line
++    assert_structural_equal(func, from_source(code))
++    assert from_source(code).script() == code
++
++
++def test_buffer_local_explicit_layout_without_parent_layout():
++    """An explicit shape and layout do not inspect the parent's absent layout."""
++
++    # fmt: off
++    @T.prim_func
++    def func() -> None:
++        T.device_entry()
++        A = T.alloc_buffer((4,), dtype="float32", scope="local", layout=None)
++        B = A.local(4, layout=T.TileLayout(T.S[4]))
++        B[0] = T.float32(1)
++        # fmt: on
++
++    bufs = _collect_buffers(func)
++    assert bufs["A"].ty.layout is None
++    assert bufs["B"].ty.layout.is_trivial()
++    code = func.script()
++    parsed = from_source(code)
++    assert_structural_equal(func, parsed)
++    assert parsed.script() == code
++
++
++def test_buffer_local_compose_layout_printer_roundtrip():
++    """Generic view sugar keeps a physical local view's identity layout."""
++
++    # fmt: off
++    @T.prim_func
++    def func() -> None:
++        T.device_entry()
++        A = T.alloc_buffer(
++            (8, 8),
++            dtype="float32",
++            scope="local",
++            layout=T.ComposeLayout(3, 3, 3, T.TileLayout(T.S[(8, 8)])),
++        )
++        B = A.local()
++        B[0] = T.float32(1)
++        # fmt: on
++
++    bufs = _collect_buffers(func)
++    assert [int(dim) for dim in bufs["B"].ty.shape] == [64]
++    assert bufs["B"].ty.layout.is_trivial()
++    code = func.script()
++    local_line = next(line for line in code.splitlines() if "B =" in line)
++    assert ".view(64, layout=" in local_line
++    parsed = from_source(code)
++    assert_structural_equal(func, parsed)
++    assert parsed.script() == code
++
++
++def test_buffer_local_inference_without_parent_layout_has_clear_diagnostic():
++    """Shape inference requires a parent storage layout."""
++
++    with pytest.raises(tvm.error.DiagnosticError, match="parent buffer has layout=None"):
++        # fmt: off
++        @T.prim_func
++        def func() -> None:
++            T.device_entry()
++            A = T.alloc_buffer((4,), dtype="float32", scope="local", layout=None)
++            B = A.local(layout=T.TileLayout(T.S[4]))
++            B[0] = T.float32(1)
++            # fmt: on
++
++
++def test_buffer_local_physical_span_includes_gaps_and_offset():
++    """The raw local view includes every slot up to the storage span."""
++
++    # fmt: off
++    @T.prim_func
++    def func() -> None:
++        T.device_entry()
++        A = T.alloc_buffer([6], dtype="float32", scope="local")
++        B = A.view(32, 2, layout=T.TileLayout(T.S[(32, 2) : (1 @ laneid, 2)] + 3))
++        B_flat = B.local()
++        B_2d = B.local(2, 3)
++        B_storage = B.local(2, layout=B.layout.storage())
++        B_flat[5] = T.float32(1)
++        B_2d[1, 2] = T.float32(2)
++        B_storage[1] = T.float32(3)
++        # fmt: on
++
++    bufs = _collect_buffers(func)
++    b_buf = bufs["B"]
++    b_flat = bufs["B_flat"]
++    b_2d = bufs["B_2d"]
++    b_storage = bufs["B_storage"]
++    assert int(b_buf.ty.layout.storage().span()) == 6
++    assert int(b_buf.ty.layout.storage().size()) == 2
++    assert [int(dim) for dim in b_flat.ty.shape] == [6]
++    assert [int(dim) for dim in b_2d.ty.shape] == [2, 3]
++    assert [int(dim) for dim in b_storage.ty.shape] == [2]
++    for local in [b_flat, b_2d]:
++        assert local.ty.layout.is_trivial()
++    for i in range(6):
++        assert int(b_flat.ty.layout.apply(i, shape=list(b_flat.ty.shape))["m"]) == i
++    assert int(b_2d.ty.layout.apply(1, 2, shape=list(b_2d.ty.shape))["m"]) == 5
++    assert_structural_equal(b_storage.ty.layout, b_buf.ty.layout.storage())
++    assert int(b_storage.ty.layout.apply(0, shape=list(b_storage.ty.shape))["m"]) == 3
++    assert int(b_storage.ty.layout.apply(1, shape=list(b_storage.ty.shape))["m"]) == 5
++
++    code = func.script()
++    storage_line = next(line for line in code.splitlines() if "B_storage =" in line)
++    assert ".local(layout=" in storage_line
++    assert_structural_equal(func, from_source(code))
++    assert from_source(code).script() == code
++
++
++def test_buffer_local_printer_is_stable_with_multiple_aliases():
++    """Thread-layout parents win deterministically over sibling aliases."""
++    from tvm.tirx.layout import tcgen05_atom_layout
++
++    # fmt: off
++    @T.prim_func
++    def func() -> None:
++        T.device_entry()
++        A = T.alloc_buffer([32], dtype="float32", scope="local")
++        B = A.view(64, 64, layout=tcgen05_atom_layout("16x256b", (64, 64), "float32"))
++        B_flat = B.local()
++        B_2d = B.local(4, 8)
++        B_storage = B.local(layout=B.layout.storage())
++        B_flat[0] = B_2d[0, 0] + B_storage[0]
++        # fmt: on
++
++    expected = func.script()
++    assert "B_flat = B.local()" in expected
++    assert "B_2d = B.local(4, 8)" in expected
++    storage_line = next(line for line in expected.splitlines() if "B_storage =" in line)
++    assert ".local(layout=" in storage_line
++    for _ in range(20):
++        parsed = from_source(expected)
++        assert parsed.script() == expected
++        assert_structural_equal(func, parsed)
++
++
++def test_buffer_local_printer_preserves_inherited_metadata():
++    """Local sugar falls back when it would discard Buffer metadata."""
++
++    # fmt: off
++    @T.prim_func
++    def func() -> None:
++        T.device_entry()
++        A = T.alloc_buffer(
++            [32, 2],
++            dtype="float32",
++            elem_offset=8,
++            scope="local",
++            layout=T.TileLayout(T.S[(32, 2) : (1 @ laneid, 2)]),
++        )
++        B_align = T.decl_buffer(
++            (2,),
++            dtype="float32",
++            data=A.data,
++            elem_offset=8,
++            scope="local",
++            align=128,
++        )
++        B_factor = T.decl_buffer(
++            (2,),
++            dtype="float32",
++            data=A.data,
++            elem_offset=8,
++            scope="local",
++            offset_factor=8,
++        )
++        B_align[0] = B_factor[0]
++        # fmt: on
++
++    code = func.script()
++    align_line = next(line for line in code.splitlines() if "B_align =" in line)
++    factor_line = next(line for line in code.splitlines() if "B_factor =" in line)
++    assert "T.decl_buffer" in align_line and "align=128" in align_line
++    assert "T.decl_buffer" in factor_line and "offset_factor=8" in factor_line
++    assert ".local(" not in align_line
++    assert ".local(" not in factor_line
++    parsed = from_source(code)
++    assert_structural_equal(func, parsed)
++    assert parsed.script() == code
++
++
++def test_buffer_local_rejects_shape_that_does_not_match_physical_span():
++    """An explicit local shape product must preserve the physical span."""
++
++    with pytest.raises(tvm.error.DiagnosticError, match="physical storage span 6 per thread"):
++        # fmt: off
++        @T.prim_func
++        def func() -> None:
++            T.device_entry()
++            A = T.alloc_buffer([6], dtype="float32", scope="local")
++            B = A.view(32, 2, layout=T.TileLayout(T.S[(32, 2) : (1 @ laneid, 2)] + 3))
++            B_local = B.local(2)
++            B_local[0] = T.float32(0)
++            # fmt: on
+ 
+ 
+ def test_pointer_expression_assignment_uses_bind():

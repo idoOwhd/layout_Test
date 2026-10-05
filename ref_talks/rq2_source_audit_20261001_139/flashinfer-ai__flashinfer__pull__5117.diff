@@ -1,0 +1,1753 @@
+diff --git a/examples/deepseek_v41/cache.py b/examples/deepseek_v41/cache.py
+new file mode 100644
+index 00000000000..786ec21dc30
+--- /dev/null
++++ b/examples/deepseek_v41/cache.py
+@@ -0,0 +1,11 @@
++# Copyright (c) 2026 by FlashInfer team.
++# Licensed under the Apache License, Version 2.0.
++
++import torch
++from flashinfer import deepseek_v41 as ds
++
++x = torch.randn(128, 512, device="cuda", dtype=torch.bfloat16)
++main = ds.deepseek_v41_quantize_cache(x, format="main_kv_fp4")
++swa = ds.deepseek_v41_quantize_cache(x, format="swa_mxfp8")
++index = ds.deepseek_v41_quantize_index_cache(x[:, :128].contiguous())
++print("main/SWA/index page shapes:", main.shape, swa.shape, index.shape)
+diff --git a/flashinfer/deepseek_v41.py b/flashinfer/deepseek_v41.py
+new file mode 100644
+index 00000000000..8ad477bf9d3
+--- /dev/null
++++ b/flashinfer/deepseek_v41.py
+@@ -0,0 +1,139 @@
++# Copyright (c) 2026 by FlashInfer team.
++# Licensed under the Apache License, Version 2.0.
++
++"""Experimental Frost kernels for DeepSeek V4.1 on Blackwell."""
++
++from .api_logging import flashinfer_experimental_api
++
++
++@flashinfer_experimental_api
++def deepseek_v41_paged_indices(indices, block_table, *, page_size=64, out=None):
++    """Map logical int32 [B,Sq,K] token IDs into physical paged cache slots.
++
++    The int32 [B,pages] table stores physical page numbers; page_size is
++    32/64/128. Negative or out-of-capacity IDs and negative table entries
++    produce -1. Caller guarantees nonnegative physical pages refer to live
++    cache storage and page*page_size+offset fits int32. This does not apply
++    causality or initialize cache pages. Reuse out for allocation-free calls
++    and graph replay with changed IDs/table. Output may not alias inputs.
++    """
++    from .experimental.deepseek_v41.paging import paged_indices
++
++    return paged_indices(indices, block_table, page_size=page_size, out=out)
++
++
++@flashinfer_experimental_api
++def deepseek_v41_quantize_index_cache(x, *, page_size=64, out=None, slots=None):
++    """Fuse MXFP4 D128 quantization into DeepGEMM indexer cache pages.
++
++    Each page contains all 64-byte data rows followed by all 4-byte scale rows.
++    The returned opaque uint8 view has shape [pages,page_size,1,68], with page
++    stride padded to 512 bytes for sparse paged indexing. It is NOT a tensor
++    of interleaved data/scale token rows. Slots follow pack_cache's ownership
++    contract. Caller-owned output permits allocation-free graph replay.
++    """
++    from .experimental.deepseek_v41.quantization import quantize_index_cache
++
++    return quantize_index_cache(x, page_size=page_size, out=out, slots=slots)
++
++
++@flashinfer_experimental_api
++def deepseek_v41_quantize_cache(x, *, format, page_size=64, out=None, slots=None):
++    """Fuse D512 quantization and paged cache/scatter update in one GPU launch.
++
++    Formats, page layout and slot ownership match quantize/pack_cache below.
++    ``out`` enables allocation-free replay; unwritten slots remain unchanged.
++    """
++    from .experimental.deepseek_v41.quantization import quantize_cache
++
++    return quantize_cache(x, format=format, page_size=page_size, out=out, slots=slots)
++
++
++@flashinfer_experimental_api
++def deepseek_v41_quantize(x, *, format, data=None, scales=None):
++    """Quantize contiguous BF16/FP32 rows into explicit V4.1 data/scale bytes.
++
++    ``format`` is ``mxfp4`` (group32/E8M0), ``main_kv_fp4``
++    (group16/E4M3, no global scale) or ``swa_mxfp8`` (group32/E8M0).
++    Caller-provided outputs avoid allocation. This API defines no QAT derivative.
++    """
++    from .experimental.deepseek_v41.quantization import quantize
++
++    return quantize(x, format=format, data=data, scales=scales)
++
++
++@flashinfer_experimental_api
++def deepseek_v41_pack_cache(data, scales, *, page_size=64, out=None, slots=None):
++    """Pack data rows followed by scale rows within each physical cache page.
++
++    Inputs are uint8 rows for D512 SWA FP8 (512+16 bytes) or global FP4
++    (256+32 bytes). Optional CUDA int32 slots map input rows to physical slots;
++    -1 skips a row, and the caller guarantees every other slot is in range and
++    unique. Unwritten slots remain untouched and must not be attended to.
++    """
++    from .experimental.deepseek_v41.quantization import pack_cache
++
++    return pack_cache(data, scales, page_size=page_size, out=out, slots=slots)
++
++
++@flashinfer_experimental_api
++def deepseek_v41_rope_quantize_cache(
++    x, freqs, positions, *, format, out, slots, page_size=64
++):
++    """Rotate the last64 channels, round to BF16 and publish quantized cache rows.
++
++    Contiguous BF16 x[rows,D], FP32 freqs[sequence,32,2] containing real/imaginary
++    parts of precomputed complex rotations, and int32 positions/slots[rows].
++    All tensors reside on one CUDA device. Formats: index_mxfp4(D128, group32/
++    E8M0), main_kv_fp4(D512, group16/E4M3, no global scale), swa_mxfp8(D512,
++    group32/E8M0). Caller owns the paged uint8 output and unique live slots.
++    A -1 position or slot skips publication. Other positions/slots must be in
++    range; active input values and frequencies must be finite, with main-KV
++    scales representable in E4M3. Positions address the supplied frequency
++    table directly: CSA2 completed groups use their FIRST raw-token position,
++    twice the compressed ID. Input rows remain unchanged so index projection
++    can consume pre-RoPE latents. Page32/64/128, with the component APIs' cache
++    layouts and padded index-page stride. No allocation, QAT or host sync.
++    """
++    from .experimental.deepseek_v41.rope_cache import rope_quantize_cache
++
++    return rope_quantize_cache(
++        x, freqs, positions, format=format, out=out, slots=slots, page_size=page_size
++    )
++
++
++@flashinfer_experimental_api
++def deepseek_v41_quantize_gemm(x, *, data=None, scales=None):
++    """Quantize activation rows to E4M3 with packed group32/E8M0 GEMM scales.
++
++    Contiguous CUDA BF16/FP32 x[M,K], K128..32768 divisible by128, finite
++    values. Returns contiguous E4M3 data[M,K] and int32 scales[M,K/128],
++    strides(1,round_up(M,4)). Each int32 packs four adjacent E8M0 bytes with
++    the first group in the low byte. This is DeepGEMM's SM100 recipe(1,32)
++    layout, distinct from the cuDNN FE six-dimensional scale layout. Unused
++    scale-stride padding is untouched. Reuse both outputs for allocation-free
++    graph replay. No tensor-global scale or implicit QAT derivative.
++    """
++    from .experimental.deepseek_v41.gemm_quantization import quantize_gemm
++
++    return quantize_gemm(x, data=data, scales=scales)
++
++
++@flashinfer_experimental_api
++def deepseek_v41_rope(x, freqs, positions, *, inverse=False, out=None):
++    """Rotate the last64 BF16 channels of query or attention-output heads.
++
++    CUDA BF16 x[tokens,heads,D], D128/512, with dense heads and optional gaps
++    between tokens; output is contiguous. FP32 complex frequency
++    parts freqs[sequence,32,2]; device int32 positions[tokens]. Adjacent pairs
++    rotate with the published FP32 complex FMA order and round to BF16.
++    inverse=True conjugates the rotation for the attention output. Finite
++    active inputs/frequencies and positions in range are required; -1 tokens
++    preserve the output and must not be consumed. The non-RoPE channels are
++    copied unchanged. Reuse out for allocation-free graph replay; out=x is
++    supported for contiguous inputs. Other overlaps are rejected.
++    Inference-only, no quantization.
++    """
++    from .experimental.deepseek_v41.rope import rope
++
++    return rope(x, freqs, positions, inverse=inverse, out=out)
+diff --git a/flashinfer/experimental/deepseek_v41/__init__.py b/flashinfer/experimental/deepseek_v41/__init__.py
+new file mode 100644
+index 00000000000..8d6b2ce864a
+--- /dev/null
++++ b/flashinfer/experimental/deepseek_v41/__init__.py
+@@ -0,0 +1,3 @@
++# Copyright (c) 2026 by FlashInfer team.
++# Licensed under the Apache License, Version 2.0.
++"""V4.1 experimental implementations; enter through flashinfer.deepseek_v41."""
+diff --git a/flashinfer/experimental/deepseek_v41/_formats.py b/flashinfer/experimental/deepseek_v41/_formats.py
+new file mode 100644
+index 00000000000..233ef34ca10
+--- /dev/null
++++ b/flashinfer/experimental/deepseek_v41/_formats.py
+@@ -0,0 +1,36 @@
++# Copyright (c) 2026 by FlashInfer team.
++# Licensed under the Apache License, Version 2.0.
++
++import triton as tr
++import triton.language as tl
++
++
++@tr.jit
++def _fp4(data, channel):
++    nibble = (data.to(tl.int32) >> ((channel % 2) * 4)) & 15
++    magnitude = nibble & 7
++    value = tl.where(
++        magnitude < 2,
++        magnitude * 0.5,
++        tl.exp2(((magnitude >> 1) - 1).to(tl.float32)) * (1.0 + (magnitude & 1) * 0.5),
++    )
++    return tl.where((nibble & 8) != 0, -value, value)
++
++
++@tr.jit
++def _scale(byte):
++    exponent = byte.to(tl.int32)
++    bits = tl.where(
++        exponent == 0, 0x00400000, tl.where(exponent == 255, 0x7FC00000, exponent << 23)
++    )
++    return bits.to(tl.float32, bitcast=True)
++
++
++@tr.jit
++def _fp4_bits(data, channel):
++    nibble = (data.to(tl.int32) >> ((channel % 2) * 4)) & 15
++    magnitude = nibble & 7
++    bits = tl.where(magnitude < 2, magnitude * 0x3F000000, (magnitude + 252) << 22) | (
++        (nibble & 8) << 28
++    )
++    return bits.to(tl.float32, bitcast=True)
+diff --git a/flashinfer/experimental/deepseek_v41/_utils.py b/flashinfer/experimental/deepseek_v41/_utils.py
+new file mode 100644
+index 00000000000..83d7bca83d9
+--- /dev/null
++++ b/flashinfer/experimental/deepseek_v41/_utils.py
+@@ -0,0 +1,13 @@
++# Copyright (c) 2026 by FlashInfer team.
++# Licensed under the Apache License, Version 2.0.
++
++
++def _overlaps(a, b):
++    def span(x):
++        return x.data_ptr(), x.data_ptr() + (
++            1 + sum((n - 1) * s for n, s in zip(x.shape, x.stride(), strict=True))
++        ) * x.element_size()
++
++    al, ah = span(a)
++    bl, bh = span(b)
++    return al < bh and bl < ah
+diff --git a/flashinfer/experimental/deepseek_v41/gemm_quantization.py b/flashinfer/experimental/deepseek_v41/gemm_quantization.py
+new file mode 100644
+index 00000000000..5b68bf4883f
+--- /dev/null
++++ b/flashinfer/experimental/deepseek_v41/gemm_quantization.py
+@@ -0,0 +1,92 @@
++# Copyright (c) 2026 by FlashInfer team.
++# Licensed under the Apache License, Version 2.0.
++
++"""MXFP8 activation quantization directly into DeepGEMM's packed scale layout."""
++
++import torch
++import triton as tr
++import triton.language as tl
++
++from .quantization import _power2
++from ._utils import _overlaps
++
++
++@tr.jit
++def _quantize_gemm(
++    X, DATA, SF, M: tl.constexpr, K: tl.constexpr, SF_STRIDE: tl.constexpr
++):
++    rows = tl.program_id(0) * 4 + tl.arange(0, 4)
++    columns = tl.program_id(1) * 512 + tl.arange(0, 512)
++    value = tl.load(
++        X + rows[:, None].to(tl.int64) * K + columns[None, :],
++        (rows[:, None] < M) & (columns[None, :] < K),
++        0,
++    ).to(tl.float32)
++    grouped = value.reshape(4, 16, 32)
++    amax = tl.max(tl.abs(grouped), 2)
++    scale, encoded = _power2(tl.maximum(amax, 1e-4), 1.0 / 448.0)
++    normalized = (grouped / scale[:, :, None]).reshape(4, 512)
++    quantized = tl.minimum(tl.maximum(normalized, -448.0), 448.0).to(tl.float8e4nv)
++    tl.store(
++        DATA + rows[:, None].to(tl.int64) * K + columns[None, :],
++        quantized,
++        (rows[:, None] < M) & (columns[None, :] < K),
++    )
++    shifts = tl.arange(0, 4) * 8
++    packed = tl.sum(encoded.reshape(4, 4, 4).to(tl.uint32) << shifts[None, None, :], 2)
++    sf_columns = tl.program_id(1) * 4 + tl.arange(0, 4)
++    tl.store(
++        SF + rows[:, None] + sf_columns[None, :].to(tl.int64) * SF_STRIDE,
++        packed.to(tl.int32),
++        (rows[:, None] < M) & (sf_columns[None, :] < K // 128),
++    )
++
++
++def quantize_gemm(x, *, data=None, scales=None):
++    if x.device.type != "cuda" or torch.cuda.get_device_capability(x.device) not in (
++        (10, 0),
++        (10, 3),
++    ):
++        raise ValueError("V4.1 GEMM quantization currently requires SM100/SM103")
++    if (
++        x.ndim != 2
++        or not x.is_contiguous()
++        or x.dtype not in (torch.bfloat16, torch.float32)
++        or not 128 <= x.shape[1] <= 32768
++        or x.shape[1] % 128
++    ):
++        raise ValueError(
++            "contiguous BF16/FP32 [M,K], K128..32768 divisible by128 required"
++        )
++    if x.requires_grad and torch.is_grad_enabled():
++        raise ValueError("GEMM quantization has no implicit QAT derivative")
++    m, k = x.shape
++    sf_stride = tr.cdiv(m, 4) * 4
++    if data is None:
++        data = torch.empty(m, k, device=x.device, dtype=torch.float8_e4m3fn)
++    elif (
++        data.shape != (m, k)
++        or data.dtype != torch.float8_e4m3fn
++        or data.device != x.device
++        or not data.is_contiguous()
++    ):
++        raise ValueError("data must be contiguous E4M3 [M,K] on the input device")
++    if scales is None:
++        scales = torch.empty_strided(
++            (m, k // 128), (1, sf_stride), device=x.device, dtype=torch.int32
++        )
++    elif (
++        scales.shape != (m, k // 128)
++        or scales.dtype != torch.int32
++        or scales.device != x.device
++        or scales.stride() != (1, sf_stride)
++    ):
++        raise ValueError("scales require int32 [M,K/128] with strides(1,round_up(M,4))")
++    if m and any(_overlaps(a, b) for a, b in ((data, x), (scales, x), (data, scales))):
++        raise ValueError("GEMM quantization buffers may not overlap")
++    if m:
++        with torch.cuda.device(x.device):
++            _quantize_gemm[(tr.cdiv(m, 4), tr.cdiv(k, 512))](
++                x, data, scales, m, k, sf_stride, num_warps=4, enable_fp_fusion=False
++            )
++    return data, scales
+diff --git a/flashinfer/experimental/deepseek_v41/paging.py b/flashinfer/experimental/deepseek_v41/paging.py
+new file mode 100644
+index 00000000000..8f82060f55d
+--- /dev/null
++++ b/flashinfer/experimental/deepseek_v41/paging.py
+@@ -0,0 +1,78 @@
++# Copyright (c) 2026 by FlashInfer team.
++# Licensed under the Apache License, Version 2.0.
++
++"""Logical sparse token IDs to physical FlashMLA cache slots."""
++
++import torch
++import triton as tr
++import triton.language as tl
++
++from ._utils import _overlaps
++
++
++@tr.jit
++def _map(
++    IDS,
++    TABLE,
++    OUT,
++    K: tl.constexpr,
++    SQ: tl.constexpr,
++    PAGES: tl.constexpr,
++    PAGE: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    row = tl.program_id(1)
++    column = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
++    logical = tl.load(IDS + row * K + column, column < K, -1)
++    valid = (column < K) & (logical >= 0) & (logical < PAGES * PAGE)
++    page = tl.load(TABLE + (row // SQ) * PAGES + logical // PAGE, valid, -1)
++    physical = tl.where(valid & (page >= 0), page * PAGE + logical % PAGE, -1)
++    tl.store(OUT + row * K + column, physical, column < K)
++
++
++def paged_indices(indices, block_table, *, page_size=64, out=None):
++    if indices.device.type != "cuda" or torch.cuda.get_device_capability(
++        indices.device
++    ) not in ((10, 0), (10, 3)):
++        raise ValueError("V4.1 paged indices currently require SM100/SM103")
++    if (
++        indices.ndim != 3
++        or indices.dtype != torch.int32
++        or not indices.is_contiguous()
++        or min(indices.shape) <= 0
++    ):
++        raise ValueError("positive contiguous int32 [B,Sq,K] indices required")
++    if (
++        block_table.ndim != 2
++        or block_table.shape[0] != indices.shape[0]
++        or block_table.shape[1] <= 0
++        or block_table.dtype != torch.int32
++        or block_table.device != indices.device
++        or not block_table.is_contiguous()
++    ):
++        raise ValueError(
++            "contiguous int32 [B,pages] block table required on indices device"
++        )
++    if page_size not in (32, 64, 128):
++        raise ValueError("page_size must be 32, 64 or 128")
++    if block_table.shape[1] * page_size >= 2**31:
++        raise ValueError("logical capacity must fit int32")
++    if out is None:
++        out = torch.empty_like(indices)
++    elif (
++        out.shape != indices.shape
++        or out.dtype != torch.int32
++        or out.device != indices.device
++        or not out.is_contiguous()
++    ):
++        raise ValueError(
++            "output must match indices shape, device, int32 dtype and contiguous layout"
++        )
++    if _overlaps(out, indices) or _overlaps(out, block_table):
++        raise ValueError("output must not overlap indices or block table")
++    b, sq, k = indices.shape
++    with torch.cuda.device(indices.device):
++        _map[(tr.cdiv(k, 256), b * sq)](
++            indices, block_table, out, k, sq, block_table.shape[1], page_size, 256
++        )
++    return out
+diff --git a/flashinfer/experimental/deepseek_v41/quantization.py b/flashinfer/experimental/deepseek_v41/quantization.py
+new file mode 100644
+index 00000000000..964b3c9e9e4
+--- /dev/null
++++ b/flashinfer/experimental/deepseek_v41/quantization.py
+@@ -0,0 +1,400 @@
++# Copyright (c) 2026 by FlashInfer team.
++# Licensed under the Apache License, Version 2.0.
++
++"""Blackwell JIT quantization using native E2M1 conversion, no global scale."""
++
++import torch
++import triton as tr
++import triton.language as tl
++
++
++@tr.jit
++def _power2(amax, inverse_bound: tl.constexpr):
++    value = amax * inverse_bound
++    bits = value.to(tl.int32, bitcast=True)
++    exponent = (bits >> 23) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
++    scale = (exponent << 23).to(tl.float32, bitcast=True)
++    return scale, exponent.to(tl.uint8)
++
++
++@tr.jit
++def _rotate_pair(
++    a, b, FREQS, rope_positions, valid, D: tl.constexpr, INVERSE: tl.constexpr = False
++):
++    pair = tl.arange(0, D // 2)
++    rotary_pair = pair - (D - 64) // 2
++    address = rope_positions[:, None].to(tl.int64) * 64 + rotary_pair[None, :] * 2
++    mask = valid[:, None] & (rotary_pair[None, :] >= 0)
++    cosine = tl.load(FREQS + address, mask, 1.0)
++    sine = tl.load(FREQS + address + 1, mask, 0.0)
++    if INVERSE:
++        sine = -sine
++    # Match the published adjacent-pair complex rotation and BF16 boundary
++    # before either amax or low-precision conversion.
++    # Torch's CUDA complex multiplication contracts a*cos - b*sin and
++    # b*cos + a*sin in this order. Explicit FMAs preserve BF16 halfway
++    # behavior without enabling contraction in the subsequent quantizer.
++    real = tl.fma(a, cosine, -(b * sine)).to(tl.bfloat16).to(tl.float32)
++    imaginary = tl.fma(b, cosine, a * sine).to(tl.bfloat16).to(tl.float32)
++    return tl.where(rotary_pair[None, :] >= 0, real, a), tl.where(
++        rotary_pair[None, :] >= 0, imaginary, b
++    )
++
++
++@tr.jit
++def _quantize(
++    X,
++    DATA,
++    SCALES,
++    N,
++    D: tl.constexpr,
++    FORMAT: tl.constexpr,
++    GROUP: tl.constexpr,
++    ROWS: tl.constexpr,
++    PAGED: tl.constexpr = False,
++    PAGE: tl.constexpr = 64,
++    SLOTS=None,
++    HAS_SLOTS: tl.constexpr = False,
++    PAGE_STRIDE: tl.constexpr = 0,
++    ROPE: tl.constexpr = False,
++    FREQS=None,
++    ROT_POS=None,
++    FREQ_ROWS: tl.constexpr = 0,
++):
++    rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
++    WIDTH: tl.constexpr = D if FORMAT == 2 else D // 2
++    SF: tl.constexpr = D // GROUP
++    valid = rows < N
++    if ROPE:
++        rope_positions = tl.load(ROT_POS + rows, valid, -1)
++        valid = valid & (rope_positions >= 0) & (rope_positions < FREQ_ROWS)
++    if PAGED:
++        slot = tl.load(SLOTS + rows, valid, -1) if HAS_SLOTS else rows
++        valid = valid & (slot >= 0)
++        # Packed byte offsets can exceed int32 even with int32 token IDs.
++        slot = slot.to(tl.int64)
++        stride: tl.constexpr = PAGE_STRIDE if PAGE_STRIDE else PAGE * (WIDTH + SF)
++        base = (slot // PAGE) * stride
++        data_base = base + (slot % PAGE) * WIDTH
++        scale_base = base + PAGE * WIDTH + (slot % PAGE) * SF
++    else:
++        data_base, scale_base = rows * WIDTH, rows * SF
++    if FORMAT != 2:
++        col = tl.arange(0, D // 2)
++        a = tl.load(X + rows[:, None] * D + col[None, :] * 2, rows[:, None] < N, 0).to(
++            tl.float32
++        )
++        b = tl.load(
++            X + rows[:, None] * D + col[None, :] * 2 + 1, rows[:, None] < N, 0
++        ).to(tl.float32)
++        if ROPE:
++            a, b = _rotate_pair(a, b, FREQS, rope_positions, valid, D)
++        ga, gb = (
++            a.reshape(ROWS, D // GROUP, GROUP // 2),
++            b.reshape(ROWS, D // GROUP, GROUP // 2),
++        )
++        amax = tl.max(tl.maximum(tl.abs(ga), tl.abs(gb)), 2)
++        if FORMAT == 1:
++            scale8 = (tl.maximum(amax, 6 * 2.0**-9) / 6).to(tl.float8e4nv)
++            scale = scale8.to(tl.float32)
++            encoded = scale8.to(tl.uint8, bitcast=True)
++        else:
++            scale, encoded = _power2(tl.maximum(amax, 6 * 2.0**-126), 1.0 / 6.0)
++        # Approximate reciprocal multiplication perturbs exact E2M1 halfway
++        # values with E4M3 scales. Preserve round-to-nearest division first.
++        a = tl.div_rn(ga, scale[:, :, None]).reshape(ROWS, D // 2)
++        b = tl.div_rn(gb, scale[:, :, None]).reshape(ROWS, D // 2)
++        packed = tl.inline_asm_elementwise(
++            "{ .reg .b8 v; cvt.rn.satfinite.e2m1x2.f32 v, $2, $1; cvt.u32.u8 $0, v; }",
++            constraints="=r,f,f",
++            args=[a, b],
++            dtype=tl.uint32,
++            is_pure=True,
++            pack=1,
++        )
++        tl.store(
++            DATA + data_base[:, None] + col[None, :],
++            packed.to(tl.uint8),
++            valid[:, None],
++        )
++    else:
++        col = tl.arange(0, D)
++        if ROPE:
++            pair = tl.arange(0, D // 2)
++            a = tl.load(
++                X + rows[:, None] * D + pair[None, :] * 2, rows[:, None] < N, 0
++            ).to(tl.float32)
++            b = tl.load(
++                X + rows[:, None] * D + pair[None, :] * 2 + 1, rows[:, None] < N, 0
++            ).to(tl.float32)
++            a, b = _rotate_pair(a, b, FREQS, rope_positions, valid, D)
++            x = tl.interleave(a, b)
++        else:
++            x = tl.load(X + rows[:, None] * D + col[None, :], rows[:, None] < N, 0).to(
++                tl.float32
++            )
++        grouped = x.reshape(ROWS, D // GROUP, GROUP)
++        amax = tl.max(tl.abs(grouped), 2)
++        scale, encoded = _power2(tl.maximum(amax, 1e-4), 1.0 / 448.0)
++        normalized = (grouped / scale[:, :, None]).reshape(ROWS, D)
++        fp8 = tl.minimum(tl.maximum(normalized, -448.0), 448.0).to(tl.float8e4nv)
++        tl.store(
++            DATA + data_base[:, None] + col[None, :],
++            fp8.to(tl.uint8, bitcast=True),
++            valid[:, None],
++        )
++    groups = tl.arange(0, D // GROUP)
++    tl.store(SCALES + scale_base[:, None] + groups[None, :], encoded, valid[:, None])
++
++
++@tr.jit
++def _pack(
++    DATA,
++    SCALES,
++    OUT,
++    SLOTS,
++    N,
++    PAGE: tl.constexpr,
++    WIDTH: tl.constexpr,
++    SF: tl.constexpr,
++    HAS_SLOTS: tl.constexpr,
++):
++    row = tl.program_id(0)
++    slot = (tl.load(SLOTS + row) if HAS_SLOTS else row).to(tl.int64)
++    columns = tl.arange(0, tr.next_power_of_2(WIDTH))
++    sf_columns = tl.arange(0, tr.next_power_of_2(SF))
++    if slot >= 0:
++        page, local = slot // PAGE, slot % PAGE
++        base = page * PAGE * (WIDTH + SF)
++        value = tl.load(DATA + row * WIDTH + columns, columns < WIDTH, 0)
++        scale = tl.load(SCALES + row * SF + sf_columns, sf_columns < SF, 0)
++        tl.store(OUT + base + local * WIDTH + columns, value, columns < WIDTH)
++        tl.store(
++            OUT + base + PAGE * WIDTH + local * SF + sf_columns, scale, sf_columns < SF
++        )
++
++
++def _check(x):
++    if x.device.type != "cuda" or torch.cuda.get_device_capability(x.device) not in (
++        (10, 0),
++        (10, 3),
++    ):
++        raise ValueError("V4.1 quantization currently requires SM100/SM103")
++    if x.ndim != 2 or not x.is_contiguous():
++        raise ValueError("contiguous two-dimensional rows required")
++
++
++def _output(value, shape, device):
++    if value is None:
++        return torch.empty(shape, dtype=torch.uint8, device=device)
++    if (
++        tuple(value.shape) != tuple(shape)
++        or value.dtype != torch.uint8
++        or value.device != device
++        or not value.is_contiguous()
++    ):
++        raise ValueError(
++            "output must be contiguous uint8 with matching shape and device"
++        )
++    return value
++
++
++def quantize(x, *, format, data=None, scales=None):
++    _check(x)
++    if x.dtype not in (torch.bfloat16, torch.float32):
++        raise ValueError("BF16 or FP32 inputs required")
++    formats = {"mxfp4": (0, 32, 2), "main_kv_fp4": (1, 16, 2), "swa_mxfp8": (2, 32, 1)}
++    if format not in formats:
++        raise ValueError(f"unsupported V4.1 format: {format}")
++    code, group, divisor = formats[format]
++    n, d = x.shape
++    if d not in (128, 512):
++        raise ValueError("initial implementation supports D128 and D512")
++    if x.requires_grad and torch.is_grad_enabled():
++        raise ValueError("quantization has no implicit QAT derivative")
++    data = _output(data, (n, d // divisor), x.device)
++    scales = _output(scales, (n, d // group), x.device)
++    if n:
++        with torch.cuda.device(x.device):
++            _quantize[(tr.cdiv(n, 4),)](
++                x,
++                data,
++                scales,
++                n,
++                d,
++                code,
++                group,
++                4,
++                num_warps=4,
++                enable_fp_fusion=False,
++            )
++    return data, scales
++
++
++def pack_cache(data, scales, *, page_size=64, out=None, slots=None):
++    _check(data)
++    n, width = data.shape
++    if data.dtype != torch.uint8 or (width, scales.shape[-1]) not in (
++        (512, 16),
++        (256, 32),
++    ):
++        raise ValueError("D512 SWA FP8 or main-KV FP4 byte rows required")
++    sf = scales.shape[-1]
++    _output(scales, (n, sf), data.device)
++    if page_size not in (32, 64, 128):
++        raise ValueError("page_size must be 32, 64 or 128")
++    if out is None:
++        if slots is not None:
++            raise ValueError("scatter updates require caller-owned cache capacity")
++        out = _output(
++            None, (tr.cdiv(n, page_size), page_size, 1, width + sf), data.device
++        )
++    else:
++        if out.ndim != 4 or out.shape[1:] != (page_size, 1, width + sf):
++            raise ValueError("invalid paged cache shape")
++        _output(out, out.shape, data.device)
++        if slots is None and out.shape[0] * page_size < n:
++            raise ValueError("cache capacity is smaller than input")
++    if slots is not None and (
++        slots.dtype != torch.int32
++        or slots.shape != (n,)
++        or slots.device != data.device
++        or not slots.is_contiguous()
++    ):
++        raise ValueError(
++            "slots must be contiguous CUDA int32 with one entry per input row"
++        )
++    if n:
++        with torch.cuda.device(data.device):
++            _pack[(n,)](
++                data,
++                scales,
++                out,
++                slots,
++                n,
++                page_size,
++                width,
++                sf,
++                slots is not None,
++                num_warps=4,
++            )
++    return out
++
++
++def quantize_cache(x, *, format, page_size=64, out=None, slots=None):
++    _check(x)
++    if x.dtype not in (torch.bfloat16, torch.float32) or x.shape[1] != 512:
++        raise ValueError("cache quantization requires BF16/FP32 D512 rows")
++    if x.requires_grad and torch.is_grad_enabled():
++        raise ValueError("cache quantization has no implicit QAT derivative")
++    if format not in ("main_kv_fp4", "swa_mxfp8"):
++        raise ValueError("cache format must be main_kv_fp4 or swa_mxfp8")
++    if page_size not in (32, 64, 128):
++        raise ValueError("page_size must be 32, 64 or 128")
++    code, group, width = (1, 16, 288) if format == "main_kv_fp4" else (2, 32, 528)
++    n = x.shape[0]
++    if out is None:
++        if slots is not None:
++            raise ValueError("scatter updates require caller-owned cache capacity")
++        out = _output(None, (tr.cdiv(n, page_size), page_size, 1, width), x.device)
++    else:
++        if out.ndim != 4 or out.shape[1:] != (page_size, 1, width):
++            raise ValueError("invalid paged cache shape")
++        _output(out, out.shape, x.device)
++        if slots is None and out.shape[0] * page_size < n:
++            raise ValueError("cache capacity is smaller than input")
++    if slots is not None and (
++        slots.dtype != torch.int32
++        or slots.shape != (n,)
++        or slots.device != x.device
++        or not slots.is_contiguous()
++    ):
++        raise ValueError(
++            "slots must be contiguous CUDA int32 with one entry per input row"
++        )
++    if n:
++        with torch.cuda.device(x.device):
++            _quantize[(tr.cdiv(n, 4),)](
++                x,
++                out,
++                out,
++                n,
++                512,
++                code,
++                group,
++                4,
++                True,
++                page_size,
++                slots,
++                slots is not None,
++                num_warps=4,
++                enable_fp_fusion=False,
++            )
++    return out
++
++
++def quantize_index_cache(x, *, page_size=64, out=None, slots=None):
++    """DeepGEMM MXFP4 D128 pages, with data region then scale region."""
++    _check(x)
++    if x.dtype not in (torch.bfloat16, torch.float32) or x.shape[1] != 128:
++        raise ValueError("index cache requires BF16/FP32 D128 rows")
++    if x.requires_grad and torch.is_grad_enabled():
++        raise ValueError("index cache quantization has no implicit QAT derivative")
++    if page_size not in (32, 64, 128):
++        raise ValueError("page_size must be 32, 64 or 128")
++    n = x.shape[0]
++    stride = tr.cdiv(page_size * 68, 512) * 512
++    if out is None:
++        if slots is not None:
++            raise ValueError("scatter updates require caller-owned cache capacity")
++        out = torch.empty_strided(
++            (tr.cdiv(n, page_size), page_size, 1, 68),
++            (stride, 68, 68, 1),
++            dtype=torch.uint8,
++            device=x.device,
++        )
++    else:
++        if (
++            out.ndim != 4
++            or out.shape[1:] != (page_size, 1, 68)
++            or out.dtype != torch.uint8
++            or out.device != x.device
++            or out.stride(0) < page_size * 68
++            or out.stride(0) % 512
++            or out.stride()[1:] != (68, 68, 1)
++        ):
++            raise ValueError(
++                "index cache requires uint8 page layout with a 512-byte-aligned page stride"
++            )
++        stride = out.stride(0)
++        if slots is None and out.shape[0] * page_size < n:
++            raise ValueError("cache capacity is smaller than input")
++    if slots is not None and (
++        slots.dtype != torch.int32
++        or slots.shape != (n,)
++        or slots.device != x.device
++        or not slots.is_contiguous()
++    ):
++        raise ValueError(
++            "slots must be contiguous CUDA int32 with one entry per input row"
++        )
++    if n:
++        with torch.cuda.device(x.device):
++            _quantize[(tr.cdiv(n, 4),)](
++                x,
++                out,
++                out,
++                n,
++                128,
++                0,
++                32,
++                4,
++                True,
++                page_size,
++                slots,
++                slots is not None,
++                stride,
++                num_warps=4,
++                enable_fp_fusion=False,
++            )
++    return out
+diff --git a/flashinfer/experimental/deepseek_v41/rope.py b/flashinfer/experimental/deepseek_v41/rope.py
+new file mode 100644
+index 00000000000..141441abcda
+--- /dev/null
++++ b/flashinfer/experimental/deepseek_v41/rope.py
+@@ -0,0 +1,119 @@
++# Copyright (c) 2026 by FlashInfer team.
++# Licensed under the Apache License, Version 2.0.
++
++"""BF16 adjacent-pair rotary encoding for query and attention-output heads."""
++
++import torch
++import triton as tr
++import triton.language as tl
++
++from .quantization import _rotate_pair
++from ._utils import _overlaps
++
++
++@tr.jit
++def _rope(
++    X,
++    FREQ,
++    POS,
++    OUT,
++    T: tl.constexpr,
++    H: tl.constexpr,
++    D: tl.constexpr,
++    X_STRIDE: tl.constexpr,
++    SEQUENCE: tl.constexpr,
++    INVERSE: tl.constexpr,
++):
++    row = tl.program_id(0) * 4 + tl.arange(0, 4)
++    pair = tl.arange(0, D // 2)
++    position = tl.load(POS + row // H, row < T * H, -1)
++    valid = (row < T * H) & (position >= 0) & (position < SEQUENCE)
++    address = row[:, None].to(tl.int64) * D + pair[None, :] * 2
++    source = (
++        (row // H)[:, None].to(tl.int64) * X_STRIDE
++        + (row % H)[:, None] * D
++        + pair[None, :] * 2
++    )
++    a = tl.load(X + source, valid[:, None], 0).to(tl.float32)
++    b = tl.load(X + source + 1, valid[:, None], 0).to(tl.float32)
++    a, b = _rotate_pair(a, b, FREQ, position, valid, D, INVERSE)
++    tl.store(OUT + address, a, valid[:, None])
++    tl.store(OUT + address + 1, b, valid[:, None])
++
++
++def rope(x, freqs, positions, *, inverse=False, out=None):
++    if x.device.type != "cuda" or torch.cuda.get_device_capability(x.device) not in (
++        (10, 0),
++        (10, 3),
++    ):
++        raise ValueError("V4.1 RoPE currently requires SM100/SM103")
++    if (
++        x.ndim != 3
++        or x.shape[1] < 1
++        or x.shape[2] not in (128, 512)
++        or x.dtype != torch.bfloat16
++        or x.stride(2) != 1
++        or x.stride(1) != x.shape[2]
++        or x.stride(0) < x.shape[1] * x.shape[2]
++    ):
++        raise ValueError(
++            "RoPE requires BF16 [tokens,heads,128|512], dense heads and nonoverlapping tokens"
++        )
++    tokens, heads, dim = x.shape
++    if (
++        freqs.ndim != 3
++        or freqs.shape[0] < 1
++        or freqs.shape[1:] != (32, 2)
++        or freqs.dtype != torch.float32
++        or freqs.device != x.device
++        or not freqs.is_contiguous()
++    ):
++        raise ValueError(
++            "freqs must be contiguous FP32 [sequence,32,2] on the input device"
++        )
++    if (
++        positions.shape != (tokens,)
++        or positions.dtype != torch.int32
++        or positions.device != x.device
++        or not positions.is_contiguous()
++    ):
++        raise ValueError("positions must be contiguous CUDA int32 [tokens]")
++    if out is None:
++        out = torch.empty(x.shape, device=x.device, dtype=x.dtype)
++    elif (
++        out.shape != x.shape
++        or out.dtype != x.dtype
++        or out.device != x.device
++        or not out.is_contiguous()
++    ):
++        raise ValueError(
++            "output must match the input shape/dtype/device and be contiguous"
++        )
++    if any(t.requires_grad for t in (x, freqs, out)) and torch.is_grad_enabled():
++        raise ValueError("RoPE primitive is inference-only")
++    if tokens and (
++        _overlaps(out, freqs)
++        or _overlaps(out, positions)
++        or (
++            _overlaps(out, x)
++            and (out.data_ptr() != x.data_ptr() or out.stride() != x.stride())
++        )
++    ):
++        raise ValueError("output may only alias the identical input view")
++    if tokens:
++        with torch.cuda.device(x.device):
++            _rope[(tr.cdiv(tokens * heads, 4),)](
++                x,
++                freqs,
++                positions,
++                out,
++                tokens,
++                heads,
++                dim,
++                x.stride(0),
++                freqs.shape[0],
++                inverse,
++                num_warps=4,
++                enable_fp_fusion=False,
++            )
++    return out
+diff --git a/flashinfer/experimental/deepseek_v41/rope_cache.py b/flashinfer/experimental/deepseek_v41/rope_cache.py
+new file mode 100644
+index 00000000000..e85361b12bb
+--- /dev/null
++++ b/flashinfer/experimental/deepseek_v41/rope_cache.py
+@@ -0,0 +1,86 @@
++# Copyright (c) 2026 by FlashInfer team.
++# Licensed under the Apache License, Version 2.0.
++
++"""Adjacent-pair RoPE, BF16 rounding and model-specific paged quantization."""
++
++import torch
++import triton as tr
++
++from .quantization import _check, _quantize
++from ._utils import _overlaps
++
++
++def rope_quantize_cache(x, freqs, positions, *, format, out, slots, page_size=64):
++    _check(x)
++    formats = {
++        "index_mxfp4": (128, 0, 32, 68),
++        "main_kv_fp4": (512, 1, 16, 288),
++        "swa_mxfp8": (512, 2, 32, 528),
++    }
++    if format not in formats:
++        raise ValueError("format must be index_mxfp4, main_kv_fp4 or swa_mxfp8")
++    dim, code, group, width = formats[format]
++    rows = x.shape[0]
++    if x.dtype != torch.bfloat16 or x.shape[1] != dim:
++        raise ValueError("RoPE cache requires BF16 rows matching the format dimension")
++    if (
++        freqs.ndim != 3
++        or freqs.shape[0] < 1
++        or freqs.shape[1:] != (32, 2)
++        or freqs.dtype != torch.float32
++        or freqs.device != x.device
++        or not freqs.is_contiguous()
++    ):
++        raise ValueError("freqs must be contiguous CUDA FP32 [sequence,32,2]")
++    for tensor in (positions, slots):
++        if (
++            tensor.shape != (rows,)
++            or tensor.dtype != torch.int32
++            or tensor.device != x.device
++            or not tensor.is_contiguous()
++        ):
++            raise ValueError("positions/slots must be contiguous CUDA int32 [rows]")
++    if page_size not in (32, 64, 128):
++        raise ValueError("page_size must be 32, 64 or 128")
++    if (
++        out.ndim != 4
++        or out.shape[1:] != (page_size, 1, width)
++        or out.dtype != torch.uint8
++        or out.device != x.device
++        or out.stride()[1:] != (width, width, 1)
++    ):
++        raise ValueError("paged output declaration mismatch")
++    if code == 0:
++        if out.stride(0) < page_size * width or out.stride(0) % 512:
++            raise ValueError("index cache requires a 512-byte-aligned page stride")
++    elif not out.is_contiguous():
++        raise ValueError("main/window cache must be contiguous")
++    for source in (x, freqs, positions, slots):
++        if _overlaps(out, source):
++            raise ValueError("cache may not overlap an input")
++        if source.requires_grad and torch.is_grad_enabled():
++            raise ValueError("RoPE cache has no implicit QAT derivative")
++    if rows:
++        with torch.cuda.device(x.device):
++            _quantize[(tr.cdiv(rows, 4),)](
++                x,
++                out,
++                out,
++                rows,
++                dim,
++                code,
++                group,
++                4,
++                True,
++                page_size,
++                slots,
++                True,
++                out.stride(0),
++                True,
++                freqs,
++                positions,
++                freqs.shape[0],
++                num_warps=4,
++                enable_fp_fusion=False,
++            )
++    return out
+diff --git a/tests/experimental/test_deepseek_v41.py b/tests/experimental/test_deepseek_v41.py
+new file mode 100644
+index 00000000000..1daf0d78142
+--- /dev/null
++++ b/tests/experimental/test_deepseek_v41.py
+@@ -0,0 +1,192 @@
++# Copyright (c) 2026 by FlashInfer team.
++# Licensed under the Apache License, Version 2.0.
++
++import pytest
++import torch
++
++from flashinfer.deepseek_v41 import (
++    deepseek_v41_pack_cache,
++    deepseek_v41_quantize,
++    deepseek_v41_quantize_cache,
++    deepseek_v41_quantize_index_cache,
++)
++
++
++def gate():
++    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
++        (10, 0),
++        (10, 3),
++    ):
++        pytest.skip("V4.1 kernels require SM100/SM103")
++
++
++@pytest.mark.parametrize("page", [32, 64, 128])
++def test_index_cache_regions_padding_scatter_and_graph(page):
++    gate()
++    torch.manual_seed(410 + page)
++    tokens = page + 7
++    x = torch.randn(tokens, 128, dtype=torch.bfloat16, device="cuda")
++    pages, stride = 3, ((page * 68 + 511) // 512) * 512
++    storage = torch.full((pages, stride), 197, dtype=torch.uint8, device="cuda")
++    cache = storage.as_strided((pages, page, 1, 68), (stride, 68, 68, 1))
++    slots = torch.randperm(pages * page, device="cuda")[:tokens].int()
++    slots[2] = -1
++    expected = storage.clone()
++
++    def update_reference():
++        data, scales = reference(x, "mxfp4")
++        valid = slots >= 0
++        page_ids, local = slots[valid].long() // page, slots[valid].long() % page
++        expected[
++            page_ids[:, None], local[:, None] * 64 + torch.arange(64, device="cuda")
++        ] = data[valid]
++        expected[
++            page_ids[:, None],
++            page * 64 + local[:, None] * 4 + torch.arange(4, device="cuda"),
++        ] = scales[valid]
++
++    deepseek_v41_quantize_index_cache(x, page_size=page, out=cache, slots=slots)
++    update_reference()
++    torch.testing.assert_close(storage, expected, rtol=0, atol=0)
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        deepseek_v41_quantize_index_cache(x, page_size=page, out=cache, slots=slots)
++    x.mul_(0.75)
++    slots.copy_(torch.randperm(pages * page, device="cuda")[:tokens].int())
++    graph.replay()
++    update_reference()
++    torch.testing.assert_close(storage, expected, rtol=0, atol=0)
++    allocated = deepseek_v41_quantize_index_cache(x, page_size=page)
++    assert allocated.shape == (2, page, 1, 68)
++    assert allocated.stride(0) == stride
++    bad = torch.empty_strided(
++        (2, page, 1, 68), (stride + 4, 68, 68, 1), dtype=torch.uint8, device="cuda"
++    )
++    with pytest.raises(ValueError, match="512-byte-aligned"):
++        deepseek_v41_quantize_index_cache(x, page_size=page, out=bad)
++
++
++def reference(x, fmt):
++    group = 16 if fmt == "main_kv_fp4" else 32
++    g = x.float().view(x.shape[0], -1, group)
++    amax = g.abs().amax(-1)
++    if fmt == "main_kv_fp4":
++        sf = (amax.clamp_min(6 * 2**-9) / 6).to(torch.float8_e4m3fn)
++    else:
++        bound, minimum = (448, 1e-4) if fmt == "swa_mxfp8" else (6, 6 * 2**-126)
++        sf = torch.exp2(torch.ceil(torch.log2(amax.clamp_min(minimum) / bound))).to(
++            torch.float8_e8m0fnu
++        )
++    v = (g / sf.float().unsqueeze(-1)).view_as(x)
++    if fmt == "swa_mxfp8":
++        data = v.to(torch.float8_e4m3fn).view(torch.uint8)
++    else:
++        levels = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device=x.device)
++        distances = (v.abs().clamp_max(6)[..., None] - levels).abs()
++        # Resolve exact halfway cases to an even code independently of PTX.
++        minimum = distances.amin(-1, keepdim=True)
++        candidates = distances == minimum
++        codes = torch.arange(8, device=x.device)
++        priority = codes + (codes % 2) * 8
++        rank = torch.where(candidates, priority, 100).argmin(-1).to(torch.uint8)
++        rank |= torch.signbit(v).to(torch.uint8) * 8
++        data = rank[:, 0::2] | (rank[:, 1::2] << 4)
++    return data.contiguous(), sf.view(torch.uint8).contiguous()
++
++
++@pytest.mark.parametrize("fmt", ["mxfp4", "main_kv_fp4", "swa_mxfp8"])
++@pytest.mark.parametrize("shape", [(1, 128), (19, 512), (257, 512)])
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
++def test_quantization_exact_bytes_and_graph(fmt, shape, dtype):
++    gate()
++    torch.manual_seed(414)
++    x = torch.randn(*shape, dtype=dtype, device="cuda")
++    x[0, :32] = 0
++    expected = reference(x, fmt)
++    actual = deepseek_v41_quantize(x, format=fmt)
++    for a, e in zip(actual, expected, strict=True):
++        torch.testing.assert_close(a, e, rtol=0, atol=0)
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        deepseek_v41_quantize(x, format=fmt, data=actual[0], scales=actual[1])
++    graph.replay()
++    for a, e in zip(actual, expected, strict=True):
++        torch.testing.assert_close(a, e, rtol=0, atol=0)
++
++
++def test_fp4_halfway_even_and_signed_zero():
++    gate()
++    # Amax=6 fixes MX scale to 1; values hit every E2M1 halfway boundary.
++    values = [
++        0.0,
++        -0.0,
++        0.25,
++        0.75,
++        1.25,
++        1.75,
++        2.5,
++        3.5,
++        5.0,
++        6.0,
++        -0.25,
++        -0.75,
++        -1.25,
++        -1.75,
++        -2.5,
++        -3.5,
++    ]
++    x = torch.tensor(values * 8, device="cuda").view(1, 128)
++    actual = deepseek_v41_quantize(x, format="mxfp4")
++    expected = reference(x, "mxfp4")
++    assert actual[0][0, 0].item() == 128
++    for a, e in zip(actual, expected, strict=True):
++        torch.testing.assert_close(a, e, rtol=0, atol=0)
++
++
++@pytest.mark.parametrize(
++    "fmt,width,sf", [("main_kv_fp4", 256, 32), ("swa_mxfp8", 512, 16)]
++)
++@pytest.mark.parametrize("page", [32, 64, 128])
++def test_page_layout_scatter_and_untouched_slots(fmt, width, sf, page):
++    gate()
++    x = torch.randn(5, 512, device="cuda", dtype=torch.bfloat16)
++    data, scales = deepseek_v41_quantize(x, format=fmt)
++    slots = torch.tensor(
++        [page + 3, 1, -1, page - 1, page], device="cuda", dtype=torch.int32
++    )
++    output = torch.full((2, page, 1, width + sf), 173, device="cuda", dtype=torch.uint8)
++    expected = output.clone().view(2, -1)
++    for row, slot in enumerate([page + 3, 1, -1, page - 1, page]):
++        if slot < 0:
++            continue
++        block, local = divmod(slot, page)
++        expected[block, local * width : (local + 1) * width] = data[row]
++        expected[block, page * width + local * sf : page * width + (local + 1) * sf] = (
++            scales[row]
++        )
++    stream = torch.cuda.Stream()
++    stream.wait_stream(torch.cuda.current_stream())
++    with torch.cuda.stream(stream):
++        deepseek_v41_pack_cache(data, scales, page_size=page, out=output, slots=slots)
++    torch.cuda.current_stream().wait_stream(stream)
++    torch.testing.assert_close(output.flatten(), expected.flatten(), rtol=0, atol=0)
++    fused = torch.full_like(output, 173)
++    deepseek_v41_quantize_cache(x, format=fmt, page_size=page, out=fused, slots=slots)
++    torch.testing.assert_close(fused.flatten(), expected.flatten(), rtol=0, atol=0)
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        deepseek_v41_quantize_cache(
++            x, format=fmt, page_size=page, out=fused, slots=slots
++        )
++    graph.replay()
++    torch.testing.assert_close(fused.flatten(), expected.flatten(), rtol=0, atol=0)
++
++
++def test_reject_implicit_qat_and_wrong_cache_format():
++    gate()
++    x = torch.randn(2, 128, device="cuda", requires_grad=True)
++    with pytest.raises(ValueError, match="QAT"):
++        deepseek_v41_quantize(x, format="mxfp4")
++    data, scales = deepseek_v41_quantize(x.detach(), format="mxfp4")
++    with pytest.raises(ValueError, match="D512"):
++        deepseek_v41_pack_cache(data, scales)
+diff --git a/tests/experimental/test_deepseek_v41_gemm_quantization.py b/tests/experimental/test_deepseek_v41_gemm_quantization.py
+new file mode 100644
+index 00000000000..984b2198650
+--- /dev/null
++++ b/tests/experimental/test_deepseek_v41_gemm_quantization.py
+@@ -0,0 +1,117 @@
++# Copyright (c) 2026 by FlashInfer team.
++# Licensed under the Apache License, Version 2.0.
++
++import pytest
++import torch
++
++from flashinfer.deepseek_v41 import deepseek_v41_quantize_gemm
++from .test_deepseek_v41 import reference
++
++
++@pytest.mark.parametrize(
++    "m,k",
++    [
++        (0, 1280),
++        (1, 128),
++        (1, 1280),
++        (2, 5120),
++        (4, 8192),
++        (17, 2304),
++        (129, 6144),
++        (3, 32768),
++    ],
++)
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
++def test_gemm_quant_exact_bytes_scale_layout_padding_and_changed_graph(m, k, dtype):
++    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
++        (10, 0),
++        (10, 3),
++    ):
++        pytest.skip("GEMM quantization requires SM100/SM103")
++    torch.manual_seed(41723 + m + k)
++    x = torch.randn(m, k, device="cuda", dtype=dtype)
++    data = torch.empty(m, k, device="cuda", dtype=torch.float8_e4m3fn)
++    stride = (m + 3) // 4 * 4
++    storage = torch.full(
++        (k // 128, stride), 0x45454545, device="cuda", dtype=torch.int32
++    )
++    scales = storage.T[:m]
++    if not m:
++        # Empty tensor default strides do not encode the declared packed
++        # layout; explicitly request its zero MN stride for this no-op case.
++        scales = torch.empty_strided(
++            (0, k // 128), (1, 0), device="cuda", dtype=torch.int32
++        )
++
++    def run():
++        return deepseek_v41_quantize_gemm(x, data=data, scales=scales)
++
++    def verify():
++        if m:
++            expected_data, sf = reference(x, "swa_mxfp8")
++            expected_sf = (
++                sf.reshape(m, k // 128, 4)
++                .contiguous()
++                .view(torch.int32)
++                .reshape(m, k // 128)
++            )
++            torch.testing.assert_close(
++                data.view(torch.uint8), expected_data, atol=0, rtol=0
++            )
++            torch.testing.assert_close(scales, expected_sf, atol=0, rtol=0)
++        torch.testing.assert_close(
++            storage[:, m:], torch.full_like(storage[:, m:], 0x45454545), atol=0, rtol=0
++        )
++
++    run()
++    verify()
++    if not m:
++        allocated = deepseek_v41_quantize_gemm(x)
++        assert allocated[0].shape == (0, k)
++        assert allocated[1].shape == (0, k // 128)
++        assert allocated[1].stride() == (1, 0)
++        return
++    allocated = deepseek_v41_quantize_gemm(x)
++    torch.testing.assert_close(
++        allocated[0].view(torch.uint8), data.view(torch.uint8), atol=0, rtol=0
++    )
++    torch.testing.assert_close(allocated[1], scales, atol=0, rtol=0)
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        run()
++    for factor in (0.125, 16.0, 1.0):
++        x.copy_(torch.randn_like(x) * factor)
++        x[0, :32].zero_()
++        graph.replay()
++        verify()
++    torch.cuda.set_sync_debug_mode("error")
++    try:
++        run()
++    finally:
++        torch.cuda.set_sync_debug_mode("default")
++    with pytest.raises(ValueError, match="overlap"):
++        deepseek_v41_quantize_gemm(
++            x,
++            data=x.view(torch.float8_e4m3fn).flatten()[: m * k].view(m, k),
++            scales=scales,
++        )
++
++
++def test_gemm_quantizer_deepgemm_scale_interop():
++    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
++        (10, 0),
++        (10, 3),
++    ):
++        pytest.skip("DeepGEMM interop requires SM100/SM103")
++    deep_gemm = pytest.importorskip("deep_gemm")
++    torch.manual_seed(41991)
++    x = torch.randn(3, 5120, device="cuda", dtype=torch.bfloat16)
++    _, actual = deepseek_v41_quantize_gemm(x)
++    _, raw_sf = reference(x, "swa_mxfp8")
++    reference_sf = deep_gemm.transform_sf_into_required_layout(
++        raw_sf.view(torch.float8_e8m0fnu).float(), 3, 5120, (1, 32)
++    )
++    assert (
++        actual.shape == reference_sf.shape and actual.stride() == reference_sf.stride()
++    )
++    torch.testing.assert_close(actual, reference_sf, atol=0, rtol=0)
+diff --git a/tests/experimental/test_deepseek_v41_paging.py b/tests/experimental/test_deepseek_v41_paging.py
+new file mode 100644
+index 00000000000..a1c3826d917
+--- /dev/null
++++ b/tests/experimental/test_deepseek_v41_paging.py
+@@ -0,0 +1,68 @@
++# Copyright (c) 2026 by FlashInfer team.
++# Licensed under the Apache License, Version 2.0.
++
++import pytest
++import torch
++from flashinfer.deepseek_v41 import deepseek_v41_paged_indices
++
++
++@pytest.mark.parametrize("page_size", [32, 64, 128])
++@pytest.mark.parametrize("query_tokens", [1, 5])
++def test_physical_pages_boundaries_and_changed_graph(page_size, query_tokens):
++    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
++        (10, 0),
++        (10, 3),
++    ):
++        pytest.skip("requires SM100/SM103")
++    torch.manual_seed(41)
++    ids = torch.randint(
++        -10,
++        5 * page_size + 10,
++        (3, query_tokens, 513),
++        device="cuda",
++        dtype=torch.int32,
++    )
++    ids[..., :8] = torch.tensor(
++        [
++            -1,
++            0,
++            page_size - 1,
++            page_size,
++            5 * page_size - 1,
++            5 * page_size,
++            2**31 - 1,
++            -(2**31),
++        ],
++        device="cuda",
++        dtype=torch.int32,
++    )
++    table = torch.randperm(15, device="cuda").int().reshape(3, 5)
++    table[1, 2] = -1
++    out = torch.empty_like(ids)
++
++    def expected():
++        page = ids.long() // page_size
++        physical_page = (
++            table[:, None, :].expand(3, query_tokens, 5).gather(2, page.clamp(0, 4))
++        )
++        valid = (ids >= 0) & (ids < 5 * page_size) & (physical_page >= 0)
++        return torch.where(valid, physical_page * page_size + ids % page_size, -1)
++
++    assert deepseek_v41_paged_indices(ids, table, page_size=page_size, out=out) is out
++    torch.testing.assert_close(out, expected(), atol=0, rtol=0)
++    stream = torch.cuda.Stream()
++    stream.wait_stream(torch.cuda.current_stream())
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph, stream=stream):
++        deepseek_v41_paged_indices(ids, table, page_size=page_size, out=out)
++    ids[..., 0] = page_size + 1
++    table.copy_(table.flip(1))
++    graph.replay()
++    torch.testing.assert_close(out, expected(), atol=0, rtol=0)
++    with pytest.raises(ValueError, match="overlap"):
++        deepseek_v41_paged_indices(ids, table, page_size=page_size, out=ids)
++    torch.cuda.set_sync_debug_mode("error")
++    try:
++        deepseek_v41_paged_indices(ids, table, page_size=page_size, out=out)
++    finally:
++        torch.cuda.set_sync_debug_mode("default")
+diff --git a/tests/experimental/test_deepseek_v41_rope.py b/tests/experimental/test_deepseek_v41_rope.py
+new file mode 100644
+index 00000000000..4371c067d61
+--- /dev/null
++++ b/tests/experimental/test_deepseek_v41_rope.py
+@@ -0,0 +1,117 @@
++# Copyright (c) 2026 by FlashInfer team.
++# Licensed under the Apache License, Version 2.0.
++
++import pytest
++import torch
++
++from flashinfer.deepseek_v41 import deepseek_v41_rope
++
++
++@pytest.mark.parametrize("shape", [(1, 64, 512), (5, 32, 128), (17, 1, 512)])
++@pytest.mark.parametrize("inverse", [False, True])
++@pytest.mark.parametrize("token_padding", [0, 4096])
++def test_rope_exact_complex_reference_graph_inplace_and_mask(
++    shape, inverse, token_padding
++):
++    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
++        (10, 0),
++        (10, 3),
++    ):
++        pytest.skip("V4.1 RoPE requires SM100/SM103")
++    torch.manual_seed(41811)
++    storage = torch.full(
++        (shape[0], shape[1] * shape[2] + token_padding),
++        37,
++        device="cuda",
++        dtype=torch.bfloat16,
++    )
++    x = storage[:, : shape[1] * shape[2]].view(shape)
++    x.copy_(torch.randn_like(x))
++    phase = torch.randn(65537, 32, device="cuda") * 100
++    freqs = torch.view_as_real(torch.polar(torch.ones_like(phase), phase))
++    positions = torch.randint(65537, (shape[0],), device="cuda", dtype=torch.int32)
++    out = torch.full_like(x, 17)
++    expected = out.clone()
++
++    def run():
++        return deepseek_v41_rope(x, freqs, positions, inverse=inverse, out=out)
++
++    def reference(values):
++        pairs = torch.view_as_complex(
++            values[..., -64:].float().reshape(*values.shape[:-1], 32, 2)
++        )
++        rotations = torch.view_as_complex(freqs)[positions.clamp_min(0).long(), None, :]
++        if inverse:
++            rotations = rotations.conj()
++        output = values.clone()
++        output[..., -64:] = torch.view_as_real(pairs * rotations).flatten(-2).bfloat16()
++        return output
++
++    def verify():
++        active = positions >= 0
++        expected[active] = reference(x)[active]
++        torch.testing.assert_close(out, expected, atol=0, rtol=0)
++        torch.testing.assert_close(
++            storage[:, shape[1] * shape[2] :],
++            torch.full_like(storage[:, shape[1] * shape[2] :], 37),
++            atol=0,
++            rtol=0,
++        )
++
++    run()
++    verify()
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        run()
++    for step in range(3):
++        x.copy_(torch.randn_like(x))
++        positions.copy_(
++            torch.randint(65537, (shape[0],), device="cuda", dtype=torch.int32)
++        )
++        positions[step % shape[0]] = -1
++        freqs.copy_(freqs.flip(-1))
++        graph.replay()
++        verify()
++    positions.fill_(65536)
++    allocated = deepseek_v41_rope(x, freqs, positions, inverse=inverse)
++    assert allocated.is_contiguous()
++    torch.testing.assert_close(allocated, reference(x), atol=0, rtol=0)
++    inplace = x.contiguous()
++    expected_inplace = reference(inplace)
++    deepseek_v41_rope(inplace, freqs, positions, inverse=inverse, out=inplace)
++    torch.testing.assert_close(inplace, expected_inplace, atol=0, rtol=0)
++    if token_padding and shape[0] > 1:
++        # Same data pointer with a different token stride is not in-place.
++        alias = torch.as_strided(x, shape, (shape[1] * shape[2], shape[2], 1))
++        with pytest.raises(ValueError, match="alias"):
++            deepseek_v41_rope(x, freqs, positions, out=alias)
++    torch.cuda.set_sync_debug_mode("error")
++    try:
++        run()
++    finally:
++        torch.cuda.set_sync_debug_mode("default")
++    storage = torch.empty(x.numel() + 2, device="cuda", dtype=x.dtype)
++    with pytest.raises(ValueError, match="alias"):
++        deepseek_v41_rope(
++            storage[:-2].view_as(x), freqs, positions, out=storage[2:].view_as(x)
++        )
++
++
++def test_rope_token_stride_beyond_two_gibibytes():
++    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
++        (10, 0),
++        (10, 3),
++    ):
++        pytest.skip("V4.1 RoPE requires SM100/SM103")
++    stride = (1 << 30) + 512
++    if torch.cuda.mem_get_info()[0] < (stride + 512) * 2 + (64 << 20):
++        pytest.skip("large-offset regression requires a little over2GiB free")
++    storage = torch.empty(stride + 512, device="cuda", dtype=torch.bfloat16)
++    x = storage.as_strided((2, 1, 512), (stride, 512, 1))
++    x[0].fill_(1)
++    x[1].fill_(2)
++    freqs = torch.zeros(2, 32, 2, device="cuda")
++    freqs[:, :, 0] = 1
++    positions = torch.arange(2, device="cuda", dtype=torch.int32)
++    out = deepseek_v41_rope(x, freqs, positions)
++    torch.testing.assert_close(out, x.contiguous(), atol=0, rtol=0)
+diff --git a/tests/experimental/test_deepseek_v41_rope_cache.py b/tests/experimental/test_deepseek_v41_rope_cache.py
+new file mode 100644
+index 00000000000..ab0cad45786
+--- /dev/null
++++ b/tests/experimental/test_deepseek_v41_rope_cache.py
+@@ -0,0 +1,192 @@
++# Copyright (c) 2026 by FlashInfer team.
++# Licensed under the Apache License, Version 2.0.
++
++import pytest
++import torch
++
++from flashinfer.deepseek_v41 import deepseek_v41_rope_quantize_cache
++from .test_deepseek_v41 import reference
++
++
++def gate():
++    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
++        (10, 0),
++        (10, 3),
++    ):
++        pytest.skip("V4.1 RoPE/cache requires SM100/SM103")
++
++
++def rotate_reference(x, freqs, positions):
++    result = x.clone()
++    pairs = torch.view_as_complex(x[:, -64:].float().reshape(-1, 32, 2))
++    rotations = torch.view_as_complex(freqs)[positions.clamp_min(0).long()]
++    result[:, -64:] = torch.view_as_real(pairs * rotations).flatten(-2).bfloat16()
++    return result
++
++
++@pytest.mark.parametrize("page", [32, 64, 128])
++@pytest.mark.parametrize("fmt", ["index_mxfp4", "main_kv_fp4", "swa_mxfp8"])
++def test_rope_quant_cache_exact_regions_and_changing_graph(page, fmt):
++    gate()
++    torch.manual_seed(41533 + page)
++    n = page + 7
++    dim, width, sf = (
++        (128, 64, 4)
++        if fmt == "index_mxfp4"
++        else (512, 256, 32)
++        if fmt == "main_kv_fp4"
++        else (512, 512, 16)
++    )
++    x = torch.randn(n, dim, device="cuda", dtype=torch.bfloat16)
++    phases = torch.randn(65537, 32, device="cuda") * 10
++    freqs = torch.view_as_real(torch.polar(torch.ones_like(phases), phases))
++    positions = torch.randint(65537, (n,), device="cuda", dtype=torch.int32)
++    positions[:4] = torch.tensor([0, 1, 65536, -1], device="cuda", dtype=torch.int32)
++    stride = page * (width + sf)
++    if fmt == "index_mxfp4":
++        stride = (stride + 511) // 512 * 512
++    storage = torch.full((3, stride), 197, device="cuda", dtype=torch.uint8)
++    cache = storage.as_strided(
++        (3, page, 1, width + sf), (stride, width + sf, width + sf, 1)
++    )
++    slots = torch.randperm(3 * page, device="cuda")[:n].int()
++    slots[2] = -1
++    expected = storage.clone()
++
++    def run():
++        return deepseek_v41_rope_quantize_cache(
++            x, freqs, positions, format=fmt, out=cache, slots=slots, page_size=page
++        )
++
++    def verify():
++        rotated = rotate_reference(x, freqs, positions)
++        data, scales = reference(rotated, "mxfp4" if fmt == "index_mxfp4" else fmt)
++        valid = (slots >= 0) & (positions >= 0)
++        pages, local = slots[valid].long() // page, slots[valid].long() % page
++        expected[
++            pages[:, None], local[:, None] * width + torch.arange(width, device="cuda")
++        ] = data[valid]
++        expected[
++            pages[:, None],
++            page * width + local[:, None] * sf + torch.arange(sf, device="cuda"),
++        ] = scales[valid]
++        torch.testing.assert_close(storage, expected, rtol=0, atol=0)
++
++    original = x.clone()
++    run()
++    verify()
++    torch.testing.assert_close(x, original, rtol=0, atol=0)
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        run()
++    for step in range(3):
++        x.copy_(torch.randn_like(x))
++        positions.copy_(torch.randint(65537, (n,), device="cuda", dtype=torch.int32))
++        positions[step] = -1
++        slots.copy_(torch.randperm(3 * page, device="cuda")[:n].int())
++        freqs.copy_(freqs.flip(-1))
++        graph.replay()
++        verify()
++    torch.cuda.set_sync_debug_mode("error")
++    try:
++        run()
++    finally:
++        torch.cuda.set_sync_debug_mode("default")
++    with pytest.raises(ValueError, match="overlap"):
++        deepseek_v41_rope_quantize_cache(
++            x,
++            freqs,
++            positions,
++            format=fmt,
++            out=freqs.view(torch.uint8)
++            .flatten()[: storage.numel()]
++            .view_as(storage)
++            .as_strided(cache.shape, cache.stride()),
++            slots=slots,
++            page_size=page,
++        )
++
++
++@pytest.mark.parametrize("fmt", ["index_mxfp4", "main_kv_fp4", "swa_mxfp8"])
++def test_rope_quant_cache_long_batch_rounding_boundary(fmt):
++    gate()
++    from flashinfer.deepseek_v41 import (
++        deepseek_v41_quantize_cache,
++        deepseek_v41_quantize_index_cache,
++    )
++
++    torch.manual_seed(415331)
++    n, dim = 32768, 128 if fmt == "index_mxfp4" else 512
++    x = torch.randn(n, dim, device="cuda", dtype=torch.bfloat16)
++    phase = torch.randn(n, 32, device="cuda") * 100
++    freqs = torch.view_as_real(torch.polar(torch.ones_like(phase), phase))
++    positions = torch.arange(n, device="cuda", dtype=torch.int32)
++    rotated = rotate_reference(x, freqs, positions)
++    if fmt == "index_mxfp4":
++        expected = deepseek_v41_quantize_index_cache(rotated)
++    else:
++        expected = deepseek_v41_quantize_cache(rotated, format=fmt)
++    out = torch.empty_strided(
++        expected.shape, expected.stride(), device="cuda", dtype=torch.uint8
++    )
++    deepseek_v41_rope_quantize_cache(
++        x, freqs, positions, format=fmt, out=out, slots=positions
++    )
++    torch.testing.assert_close(out, expected, rtol=0, atol=0)
++
++
++@pytest.mark.parametrize("fmt", ["index_mxfp4", "main_kv_fp4", "swa_mxfp8"])
++def test_rope_and_component_cache_byte_offsets_beyond_int32(fmt):
++    gate()
++    from flashinfer.deepseek_v41 import (
++        deepseek_v41_pack_cache,
++        deepseek_v41_quantize_cache,
++        deepseek_v41_quantize_index_cache,
++    )
++
++    dim, width, sf = (
++        (128, 64, 4)
++        if fmt == "index_mxfp4"
++        else (512, 256, 32)
++        if fmt == "main_kv_fp4"
++        else (512, 512, 16)
++    )
++    page = 64
++    stride = page * (width + sf)
++    if fmt == "index_mxfp4":
++        stride = (stride + 511) // 512 * 512
++    pages = (1 << 31) // stride + 2
++    # Allocate virtual cache capacity, initialize only the guarded/target pages.
++    storage = torch.empty(pages, stride, device="cuda", dtype=torch.uint8)
++    cache = storage.as_strided(
++        (pages, page, 1, width + sf), (stride, width + sf, width + sf, 1)
++    )
++    storage[0].fill_(213)
++    x = torch.linspace(-6, 6, dim, device="cuda").bfloat16().view(1, dim)
++    freqs = torch.zeros(1, 32, 2, device="cuda")
++    freqs[:, :, 0] = 1
++    position = torch.zeros(1, device="cuda", dtype=torch.int32)
++    slot = torch.tensor([pages * page - 1], device="cuda", dtype=torch.int32)
++    data, scale = reference(x, "mxfp4" if fmt == "index_mxfp4" else fmt)
++    expected = torch.full((stride,), 197, device="cuda", dtype=torch.uint8)
++    expected[(page - 1) * width : page * width] = data[0]
++    expected[page * width + (page - 1) * sf : page * (width + sf)] = scale[0]
++    for arm in ("fused", "quantize", "pack"):
++        if arm == "pack" and fmt == "index_mxfp4":
++            # The separate pack API only declares D512 main/window formats.
++            continue
++        storage[-1].fill_(197)
++        if arm == "fused":
++            deepseek_v41_rope_quantize_cache(
++                x, freqs, position, format=fmt, out=cache, slots=slot
++            )
++        elif arm == "pack":
++            deepseek_v41_pack_cache(data, scale, out=cache, slots=slot)
++        elif fmt == "index_mxfp4":
++            deepseek_v41_quantize_index_cache(x, out=cache, slots=slot)
++        else:
++            deepseek_v41_quantize_cache(x, format=fmt, out=cache, slots=slot)
++        torch.testing.assert_close(storage[-1], expected, rtol=0, atol=0)
++        torch.testing.assert_close(
++            storage[0], torch.full_like(storage[0], 213), rtol=0, atol=0
++        )

@@ -1,0 +1,254 @@
+diff --git a/tests/kernels/moe/test_mxfp8_dp_scale_swizzle.py b/tests/kernels/moe/test_mxfp8_dp_scale_swizzle.py
+new file mode 100644
+index 000000000000..25d2f3a11df7
+--- /dev/null
++++ b/tests/kernels/moe/test_mxfp8_dp_scale_swizzle.py
+@@ -0,0 +1,87 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Tests for restore_dispatched_scale_layout on mxfp8 activation scales.
++
++The DP/EP prepare paths quantize with row-major scales for the a2a and
++restore the swizzled 128x4 layout afterwards; the result must be
++bit-identical to quantizing directly into the swizzled layout, and scales
++for kernels that take row-major scales must pass through unchanged.
++"""
++
++import pytest
++import torch
++
++from vllm.model_executor.layers.fused_moe.config import (
++    mxfp4_mxfp8_moe_quant_config,
++)
++from vllm.model_executor.layers.fused_moe.prepare_finalize.naive_dp_ep import (
++    _unwrap_scale_and_prepare_for_moe,
++)
++from vllm.model_executor.layers.fused_moe.utils import (
++    restore_dispatched_scale_layout,
++)
++from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
++    mxfp8_e4m3_quantize,
++)
++from vllm.platforms import current_platform
++from vllm.utils.flashinfer import has_flashinfer
++
++if not current_platform.is_cuda():
++    pytest.skip("CUDA required", allow_module_level=True)
++
++if not has_flashinfer():
++    # restore_dispatched_scale_layout uses flashinfer's block_scale_interleave.
++    pytest.skip("flashinfer required", allow_module_level=True)
++
++
++def _quantize_both_layouts(
++    num_tokens: int, hidden_size: int
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Return (swizzled reference, row-major) mxfp8 scales for one input."""
++    torch.manual_seed(0)
++    x = torch.randn(num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
++
++    # The layout the kernel expects (what the no-DP path produces directly).
++    _, want = mxfp8_e4m3_quantize(x, is_sf_swizzled_layout=True)
++    # The layout the DP paths quantize to before the dispatch.
++    _, linear = mxfp8_e4m3_quantize(x, is_sf_swizzled_layout=False)
++    return want, linear
++
++
++@pytest.mark.parametrize("num_tokens", [1, 5, 37, 128, 300, 511])
++@pytest.mark.parametrize("hidden_size", [2048, 7168])
++@torch.inference_mode()
++def test_swizzle_dispatched_mxfp8_scales(num_tokens: int, hidden_size: int):
++    want, linear = _quantize_both_layouts(num_tokens, hidden_size)
++
++    got = restore_dispatched_scale_layout(
++        linear, quant_dtype="mxfp8", is_scale_swizzled=True
++    )
++
++    assert got is not None
++    assert torch.equal(
++        got.view(torch.uint8).flatten(), want.view(torch.uint8).flatten()
++    )
++
++    # Unswizzled consumers (e.g. FLASHINFER_TRTLLM_MXFP4_MXFP8) are untouched.
++    passthrough = restore_dispatched_scale_layout(
++        linear, quant_dtype="mxfp8", is_scale_swizzled=False
++    )
++    assert passthrough is linear
++
++
++@torch.inference_mode()
++def test_naive_dp_ep_unwrap_swizzles_mxfp8_scales():
++    """The naive DP/EP prepare path must hand the MoE kernel swizzled scales."""
++    want, linear = _quantize_both_layouts(300, 7168)
++
++    quant_config = mxfp4_mxfp8_moe_quant_config(
++        w1_scale=torch.empty(1),
++        w2_scale=torch.empty(1),
++        is_scale_swizzled=True,
++    )
++    got = _unwrap_scale_and_prepare_for_moe([linear], quant_config)
++
++    assert torch.equal(
++        got.view(torch.uint8).flatten(), want.view(torch.uint8).flatten()
++    )
+diff --git a/vllm/model_executor/layers/fused_moe/prepare_finalize/flashinfer_nvlink_one_sided.py b/vllm/model_executor/layers/fused_moe/prepare_finalize/flashinfer_nvlink_one_sided.py
+index 74341e7681f8..08c4beafd9fc 100644
+--- a/vllm/model_executor/layers/fused_moe/prepare_finalize/flashinfer_nvlink_one_sided.py
++++ b/vllm/model_executor/layers/fused_moe/prepare_finalize/flashinfer_nvlink_one_sided.py
+@@ -9,8 +9,10 @@
+ )
+ from vllm.forward_context import get_forward_context
+ from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+-from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
+-from vllm.utils.flashinfer import nvfp4_block_scale_interleave
++from vllm.model_executor.layers.fused_moe.utils import (
++    moe_kernel_quantize_input,
++    restore_dispatched_scale_layout,
++)
+ 
+ 
+ def get_local_sizes():
+@@ -128,11 +130,13 @@ def prepare(
+         )
+         if a1q_scale is not None:
+             a1q_recv, a1q_scale_recv, topk_ids_recv, topk_weights_recv = recv_payloads
+-            # Apply scale interleaving only for CUTLASS (not TRT-LLM)
+-            if quant_config.quant_dtype == "nvfp4" and quant_config.is_scale_swizzled:
+-                a1q_scale_recv = a1q_scale_recv.view(-1, a1q_scale_recv.shape[-1])
+-                a1q_scale_recv = a1q_scale_recv.view(torch.uint8)
+-                a1q_scale_recv = nvfp4_block_scale_interleave(a1q_scale_recv)
++            # Swizzle after the A2A if the MoE kernel expects swizzled scales.
++            a1q_scale_recv = restore_dispatched_scale_layout(
++                a1q_scale_recv.view(-1, a1q_scale_recv.shape[-1]),
++                quant_config.quant_dtype,
++                quant_config.is_scale_swizzled,
++            )
++            assert a1q_scale_recv is not None
+             assert self.scale_elems_per_token > 0
+             a1q_scale_recv = a1q_scale_recv.view(-1, self.scale_elems_per_token)
+         else:
+diff --git a/vllm/model_executor/layers/fused_moe/prepare_finalize/flashinfer_nvlink_two_sided.py b/vllm/model_executor/layers/fused_moe/prepare_finalize/flashinfer_nvlink_two_sided.py
+index 73083db139fa..11d1f352d062 100644
+--- a/vllm/model_executor/layers/fused_moe/prepare_finalize/flashinfer_nvlink_two_sided.py
++++ b/vllm/model_executor/layers/fused_moe/prepare_finalize/flashinfer_nvlink_two_sided.py
+@@ -10,8 +10,10 @@
+ )
+ from vllm.forward_context import get_forward_context
+ from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+-from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
+-from vllm.utils.flashinfer import nvfp4_block_scale_interleave
++from vllm.model_executor.layers.fused_moe.utils import (
++    moe_kernel_quantize_input,
++    restore_dispatched_scale_layout,
++)
+ 
+ 
+ def get_local_sizes():
+@@ -195,14 +197,9 @@ def flashinfer_alltoall_dispatch(
+             )
+ 
+         # Swizzle after the A2A if MoE kernel expects swizzled scales.
+-        if (
+-            x_sf is not None
+-            and quant_config.quant_dtype == "nvfp4"
+-            and quant_config.is_scale_swizzled
+-        ):
+-            if x_sf.element_size() == 1:
+-                x_sf = x_sf.view(torch.uint8)
+-            x_sf = nvfp4_block_scale_interleave(x_sf)
++        x_sf = restore_dispatched_scale_layout(
++            x_sf, quant_config.quant_dtype, quant_config.is_scale_swizzled
++        )
+     else:
+         # Block-scale path: pass activations through without quantization
+         x_sf = None
+diff --git a/vllm/model_executor/layers/fused_moe/prepare_finalize/naive_dp_ep.py b/vllm/model_executor/layers/fused_moe/prepare_finalize/naive_dp_ep.py
+index 89f3843cc504..708307ccd284 100644
+--- a/vllm/model_executor/layers/fused_moe/prepare_finalize/naive_dp_ep.py
++++ b/vllm/model_executor/layers/fused_moe/prepare_finalize/naive_dp_ep.py
+@@ -9,8 +9,10 @@
+     TopKWeightAndReduceContiguous,
+     TopKWeightAndReduceDelegate,
+ )
+-from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
+-from vllm.utils.flashinfer import nvfp4_block_scale_interleave
++from vllm.model_executor.layers.fused_moe.utils import (
++    moe_kernel_quantize_input,
++    restore_dispatched_scale_layout,
++)
+ 
+ 
+ def _quantize_and_setup_dispatch(
+@@ -57,14 +59,11 @@ def _unwrap_scale_and_prepare_for_moe(
+     quant_config: FusedMoEQuantConfig,
+ ) -> torch.Tensor:
+     assert scales is not None and len(scales) == 1
+-    a1q_scale = scales[0]
+     # Apply swizzling after a2a if the MoE kernel needs it.
+-    if quant_config.quant_dtype == "nvfp4" and quant_config.is_scale_swizzled:
+-        assert a1q_scale is not None
+-        if a1q_scale.element_size() == 1:
+-            a1q_scale = a1q_scale.view(torch.uint8)
+-        a1q_scale = nvfp4_block_scale_interleave(a1q_scale)
+-
++    a1q_scale = restore_dispatched_scale_layout(
++        scales[0], quant_config.quant_dtype, quant_config.is_scale_swizzled
++    )
++    assert a1q_scale is not None
+     return a1q_scale
+ 
+ 
+diff --git a/vllm/model_executor/layers/fused_moe/utils.py b/vllm/model_executor/layers/fused_moe/utils.py
+index e3d6493dda21..dc729e491992 100644
+--- a/vllm/model_executor/layers/fused_moe/utils.py
++++ b/vllm/model_executor/layers/fused_moe/utils.py
+@@ -34,6 +34,9 @@
+ )
+ from vllm.platforms import current_platform
+ from vllm.triton_utils import tl, triton
++from vllm.utils.flashinfer import (
++    nvfp4_block_scale_interleave as block_scale_interleave,
++)
+ from vllm.utils.math_utils import cdiv
+ 
+ if TYPE_CHECKING:
+@@ -359,6 +362,39 @@ def moe_kernel_quantize_input(
+         return A, A_scale
+ 
+ 
++# Quant dtypes whose activation scales use the swizzled 128x4 layout when the
++# kernel declares is_scale_swizzled=True. Must cover every quant_dtype branch in
++# moe_kernel_quantize_input that honors is_scale_swizzled.
++_SWIZZLED_SCALE_DTYPES = ("nvfp4", "mxfp8")
++
++
++def restore_dispatched_scale_layout(
++    a1q_scale: torch.Tensor | None,
++    quant_dtype: None | torch.dtype | str,
++    is_scale_swizzled: bool,
++) -> torch.Tensor | None:
++    """Swizzle activation scales after an a2a dispatch, if the kernel
++    expects it.
++
++    Dispatch paths quantize with is_scale_swizzled=False, since the swizzled
++    layout is padded and would not line up row-for-row with the hidden states
++    in the a2a. For kernels that expect swizzled scales, convert the
++    dispatched row-major scales to the swizzled 128x4 layout here; otherwise
++    return the scales unchanged.
++    """
++    if (
++        a1q_scale is None
++        or not is_scale_swizzled
++        or quant_dtype not in _SWIZZLED_SCALE_DTYPES
++    ):
++        return a1q_scale
++    if a1q_scale.element_size() == 1:
++        a1q_scale = a1q_scale.view(torch.uint8)
++    # despite its name, this is flashinfer's generic block_scale_interleave
++    # and handles mxfp8 scale vectors as well
++    return block_scale_interleave(a1q_scale)
++
++
+ def normalize_scales_shape(scales: torch.Tensor | None) -> torch.Tensor | None:
+     if scales is not None:
+         if scales.numel() == 1:

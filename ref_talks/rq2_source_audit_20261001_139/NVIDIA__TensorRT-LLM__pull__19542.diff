@@ -1,0 +1,3557 @@
+diff --git a/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py b/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py
+index 6dee9d457621..ebb1550314bc 100644
+--- a/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py
++++ b/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py
+@@ -141,6 +141,10 @@ def _validate_16_byte_aligned_dense_tensor(tensor: torch.Tensor,
+ 
+ 
+ def _canonicalize_swiglu_limit_scalar(swiglu_limit_scalar: float) -> float:
++    if math.isnan(swiglu_limit_scalar):
++        raise ValueError(
++            "swiglu_limit_scalar must not be NaN; pass a negative value or "
++            "+inf to disable the clamp.")
+     return float("inf") if swiglu_limit_scalar < 0 else swiglu_limit_scalar
+ 
+ 
+@@ -14775,16 +14779,17 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionRunner(
+             tuning_config_cache = dict()
+ 
+             def __init__(
+-                    self,
+-                    num_experts: int,
+-                    top_k: int,
+-                    num_local_experts: int,
+-                    local_expert_offset: int,
+-                    tile_size: int,
+-                    scaling_vector_size: int = 16,
+-                    activation_type: ActivationType = ActivationType.Swiglu,
+-                    situ_beta: Optional[float] = None,
+-                    situ_linear_beta: Optional[float] = None):
++                self,
++                num_experts: int,
++                top_k: int,
++                num_local_experts: int,
++                local_expert_offset: int,
++                tile_size: int,
++                scaling_vector_size: int = 16,
++                activation_type: ActivationType = ActivationType.Swiglu,
++                situ_beta: Optional[float] = None,
++                situ_linear_beta: Optional[float] = None,
++                swiglu_limit_scalar: float = float("inf")):
+                 super().__init__()
+                 self.num_experts = num_experts
+                 self.top_k = top_k
+@@ -14796,6 +14801,11 @@ def __init__(
+                     activation_type)
+                 self.situ_beta = situ_beta
+                 self.situ_linear_beta = situ_linear_beta
++                # Trace-time constant folded into the kernel; part of unique_id
++                # and the kernel cache key so clamped / unclamped kernels never
++                # share a compilation or a tuning result.
++                self.swiglu_limit = _canonicalize_swiglu_limit_scalar(
++                    swiglu_limit_scalar)
+                 self.is_gated = is_gated_activation(self.activation_type)
+ 
+                 if (sm_version := get_sm_version()) != 107:
+@@ -14819,6 +14829,7 @@ def unique_id(self):
+                     int(self.activation_type),
+                     self.situ_beta,
+                     self.situ_linear_beta,
++                    self.swiglu_limit,
+                 )
+ 
+             def get_valid_tactics(
+@@ -15122,7 +15133,8 @@ def forward(self, inputs: List[torch.Tensor],
+                              cluster_shape_mn, raster_along_m,
+                              locality_domain_half_gemm, a_path,
+                              int(self.activation_type), self.situ_beta,
+-                             self.situ_linear_beta, max_active_clusters)
++                             self.situ_linear_beta, self.swiglu_limit,
++                             max_active_clusters)
+                 if cache_key not in self.__class__.kernel_cache:
+                     gemm = self.__class__.kernel_class(
+                         sf_vec_size=self.scaling_vector_size,
+@@ -15137,6 +15149,7 @@ def forward(self, inputs: List[torch.Tensor],
+                         activation_type=self.activation_type,
+                         situ_beta=self.situ_beta,
+                         situ_linear_beta=self.situ_linear_beta,
++                        swiglu_limit=self.swiglu_limit,
+                     )
+                     compiled_gemm = cute.compile(
+                         gemm.wrapper,
+@@ -15215,6 +15228,7 @@ def _run_nvfp4_gather_grouped_gemm_act_fusion_rubin(
+             activation_type: ActivationType,
+             situ_beta: float,
+             situ_linear_beta: float,
++            swiglu_limit_scalar: float,
+             precomputed_tactic: Optional[str],
+             tuner_key: str,
+         ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+@@ -15243,6 +15257,8 @@ def _run_nvfp4_gather_grouped_gemm_act_fusion_rubin(
+                 activation_type=activation_type,
+                 situ_beta=_canonicalize_situ_beta(situ_beta),
+                 situ_linear_beta=_canonicalize_situ_beta(situ_linear_beta),
++                swiglu_limit_scalar=_canonicalize_swiglu_limit_scalar(
++                    swiglu_limit_scalar),
+             )
+             inputs = [
+                 input, weight, input_scale, weight_scale, alpha,
+@@ -15284,6 +15300,7 @@ def _run_nvfp4_gather_grouped_gemm_act_fusion_rubin(
+             "SymInt scaling_vector_size=16, SymInt partition_id=-1, "
+             f"SymInt activation_type={int(ActivationType.Swiglu)}, "
+             "float situ_beta=-1.0, float situ_linear_beta=-1.0, "
++            "float swiglu_limit_scalar=-1.0, "
+             "str? precomputed_tactic=None) -> (Tensor?, Tensor?)",
+             device_types="cuda")
+         def cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin(
+@@ -15309,6 +15326,7 @@ def cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin(
+             activation_type: int = int(ActivationType.Swiglu),
+             situ_beta: float = SITU_BETA_DISABLED,
+             situ_linear_beta: float = SITU_BETA_DISABLED,
++            swiglu_limit_scalar: float = SWIGLU_LIMIT_SCALAR_DISABLED,
+             precomputed_tactic: Optional[str] = None,
+         ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+             return _run_nvfp4_gather_grouped_gemm_act_fusion_rubin(
+@@ -15319,7 +15337,7 @@ def cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin(
+                 tile_size, output_tensor, output_sf_tensor,
+                 scaling_vector_size, partition_id,
+                 ActivationType(activation_type), situ_beta, situ_linear_beta,
+-                precomputed_tactic,
++                swiglu_limit_scalar, precomputed_tactic,
+                 "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin")
+ 
+         @torch.library.register_fake(
+@@ -15347,6 +15365,7 @@ def _(
+             activation_type: int = int(ActivationType.Swiglu),
+             situ_beta: float = SITU_BETA_DISABLED,
+             situ_linear_beta: float = SITU_BETA_DISABLED,
++            swiglu_limit_scalar: float = SWIGLU_LIMIT_SCALAR_DISABLED,
+             precomputed_tactic: Optional[str] = None,
+         ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+             m = permuted_idx_to_expanded_idx.size(0)
+@@ -15379,7 +15398,8 @@ def _(
+             "SymInt tile_size, Tensor(a!) output_tensor, "
+             "Tensor(b!) output_sf_tensor, SymInt scaling_vector_size=16, "
+             f"SymInt activation_type={int(ActivationType.Swiglu)}, "
+-            "float situ_beta=-1.0, float situ_linear_beta=-1.0) -> ()",
++            "float situ_beta=-1.0, float situ_linear_beta=-1.0, "
++            "float swiglu_limit_scalar=-1.0) -> ()",
+             device_types="cuda")
+         def cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_locality_domain_inplace_rubin(
+             input: torch.Tensor,
+@@ -15405,6 +15425,7 @@ def cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_locality_domain_inplace_rubin(
+             activation_type: int = int(ActivationType.Swiglu),
+             situ_beta: float = SITU_BETA_DISABLED,
+             situ_linear_beta: float = SITU_BETA_DISABLED,
++            swiglu_limit_scalar: float = SWIGLU_LIMIT_SCALAR_DISABLED,
+         ) -> None:
+             """Tune and launch both Rubin locality domain NVFP4 MoE FC1 partitions.
+ 
+@@ -15448,6 +15469,8 @@ def cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_locality_domain_inplace_rubin(
+                     activation_type=ActivationType(activation_type),
+                     situ_beta=_canonicalize_situ_beta(situ_beta),
+                     situ_linear_beta=_canonicalize_situ_beta(situ_linear_beta),
++                    swiglu_limit_scalar=_canonicalize_swiglu_limit_scalar(
++                        swiglu_limit_scalar),
+                 ))
+             inputs = [
+                 input,
+@@ -15495,6 +15518,7 @@ def launch_partition(
+                     activation_type=activation_type,
+                     situ_beta=situ_beta,
+                     situ_linear_beta=situ_linear_beta,
++                    swiglu_limit_scalar=swiglu_limit_scalar,
+                     precomputed_tactic=repr(tactic),
+                 )
+ 
+@@ -15536,6 +15560,7 @@ def _(
+             activation_type: int = int(ActivationType.Swiglu),
+             situ_beta: float = SITU_BETA_DISABLED,
+             situ_linear_beta: float = SITU_BETA_DISABLED,
++            swiglu_limit_scalar: float = SWIGLU_LIMIT_SCALAR_DISABLED,
+         ) -> None:
+             return None
+ 
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/rubin/moe/rubin_contiguous_gather_grouped_blockscaled_gemm_act_fusion.py b/tensorrt_llm/_torch/cute_dsl_kernels/rubin/moe/rubin_contiguous_gather_grouped_blockscaled_gemm_act_fusion.py
+index 89351bf6c0d1..238b0d7a378d 100644
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/rubin/moe/rubin_contiguous_gather_grouped_blockscaled_gemm_act_fusion.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/rubin/moe/rubin_contiguous_gather_grouped_blockscaled_gemm_act_fusion.py
+@@ -28,11 +28,11 @@
+ import cutlass.utils.blockscaled_layout as blockscaled_utils
+ import cutlass.utils.rubin_helpers as sm107_utils
+ import torch
+-from cutlass._mlir.dialects import math, nvvm
++from cutlass._mlir.dialects import llvm, math, nvvm
+ from cutlass.cute.nvgpu import cpasync, tcgen05
+ from cutlass.cute.nvgpu.tcgen05.mma import CollectorOp
+ from cutlass.cute.runtime import from_dlpack
+-from cutlass.cutlass_dsl import dsl_user_op
++from cutlass.cutlass_dsl import T, dsl_user_op
+ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
+ from cutlass.utils.gemm.sm100 import (
+     epilogue_smem_copy_and_partition,
+@@ -76,6 +76,80 @@ def fmin(
+     )
+ 
+ 
++@dsl_user_op
++def fclip_xorsign(
++    a: Union[float, cutlass.Float32],
++    limit: Union[float, cutlass.Float32],
++    *,
++    loc=None,
++    ip=None,
++) -> cutlass.Float32:
++    """Clip to ``[-limit, limit]`` with PTX ``min.NaN.xorsign.abs.f32``.
++
++    The ``.NaN`` variant propagates a NaN operand instead of returning the
++    finite one, matching ``torch.clamp`` and the NaN-preserving ``fmin`` used
++    by the quantization path.
++    """
++    return cutlass.Float32(
++        llvm.inline_asm(
++            T.f32(),
++            [
++                cutlass.Float32(a).ir_value(loc=loc, ip=ip),
++                cutlass.Float32(limit).ir_value(loc=loc, ip=ip),
++            ],
++            "min.NaN.xorsign.abs.f32 $0, $1, $2;",
++            "=f,f,f",
++            has_side_effects=False,
++            is_align_stack=False,
++            asm_dialect=llvm.AsmDialect.AD_ATT,
++        )
++    )
++
++
++@cute.jit
++def store_output_halves(source: cute.Tensor, destination: cute.Tensor, first_half: cutlass.Int32):
++    """Store the first/second register halves at their logical output positions.
++
++    The N64 output is contiguous per thread. Preserve the destination iterator
++    (including any SMEM swizzle) and select only the destination half; register
++    indices remain compile-time constants.
++    """
++    source = cute.coalesce(source)
++    destination = cute.coalesce(destination)
++    assert cute.rank(source.layout) == 1 and source.layout.stride == 1
++    assert cute.rank(destination.layout) == 1 and destination.layout.stride == 1
++    assert cute.size(source) == cute.size(destination)
++    assert cute.size(source) % 2 == 0
++    half = cute.make_layout(cute.size(source) // 2)
++    source_halves = cute.logical_divide(source, half)
++    destination_halves = cute.logical_divide(destination, half)
++    for slot in cutlass.range_constexpr(2):
++        cute.autovec_copy(
++            source_halves[(None, slot)],
++            destination_halves[(None, slot ^ first_half)],
++        )
++
++
++@cute.jit
++def store_sfc_word(source: cute.Tensor, destination: cute.Tensor, first_half: cutlass.Int32):
++    """Store four FP8 scales as one word in logical output-column order.
++
++    The source scales stay in First/Second (load) order for quantization; only
++    the stored value swaps its 16-bit halves when First is the high half.
++    """
++    source = cute.coalesce(source)
++    destination = cute.coalesce(destination)
++    assert source.element_type.width == destination.element_type.width == 8
++    assert cute.rank(source.layout) == 1 and source.layout.stride == 1
++    assert cute.rank(destination.layout) == 1 and destination.layout.stride == 1
++    assert cute.size(source) == cute.size(destination) == 4
++    source_word = cute.recast_tensor(source, cutlass.Uint32)[0]
++    destination_word = cute.recast_tensor(destination, cutlass.Uint32)
++    # PRMT selectors: 0x3210 keeps bytes [0,1,2,3]; 0x1032 gives [2,3,0,1].
++    selector = cutlass.Int32(0x3210) ^ (first_half * 0x2222)
++    destination_word[0] = cutlass.Uint32(cute.arch.prmt(source_word, source_word, selector))
++
++
+ def sigmoid_f32(
+     a: Union[float, cutlass.Float32], fastmath: bool = False
+ ) -> Union[float, cutlass.Float32]:
+@@ -124,9 +198,9 @@ class S2TCopyBundle(NamedTuple):
+   C   = up * silu(gate) or relu(acc)^2                    # selected activation
+   + optional NVFP4 quantization (generates SFC) when c_dtype == Float4E2M1FN.
+ 
+-Shapes: A is M×K×1; B is N×K×L (L = num experts). SwiGLU uses interleaved
+-[up, gate] weights at granularity=64 and produces M×(N/2)×1; Relu2 uses
+-plain weights and produces M×N×1. SFA/SFB layouts follow BlockScaledBasicChunk.
++Shapes: A is M×K×1; B is N×K×L (L = num experts). Gated activations use
++interleaved [gate, up] weights at granularity=16 (B and SFB share the N order)
++and produce M×(N/2)×1; Relu2 uses plain weights and produces M×N×1. SFA/SFB layouts follow BlockScaledBasicChunk.
+ token_id_mapping drives the row gather for A/SFA; token_id == -1 marks padding.
+ 
+ Within a tile, valid_m varies per group; padding rows are handled at load:
+@@ -163,8 +237,8 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
+             merged ab_pipeline (no relay warp needed).
+         SFA is always loaded via CpAsync128.CG, then reorganized into SFA
+         TMEM by transform warps via LDS + STTM (sfa_transform_pipeline).
+-      - Gated epilogue (SwiGLU or SiTU): C = up * silu(gate), where up/gate come from
+-        interleaved accumulator at granularity=64 → output N is halved.
++      - Gated epilogue (SwiGLU or SiTU): C = up * silu(gate), where gate/up are
++        decoded from the [gate16, up16] accumulator groups → output N is halved.
+       - Optional NVFP4 quant: when c_dtype == Float4E2M1FN, the epilogue
+         also generates SFC and quantizes the output.
+ 
+@@ -203,6 +277,7 @@ def __init__(
+         activation_type: ActivationType = ActivationType.Swiglu,
+         situ_beta: Optional[float] = None,
+         situ_linear_beta: Optional[float] = None,
++        swiglu_limit: float = float("inf"),
+     ):
+         self.a_path = a_path
+         # locality domain half-GEMM: two partitions write their N-half into a shared
+@@ -228,6 +303,18 @@ def __init__(
+             )
+         self.situ_beta = None if situ_beta is None else float(situ_beta)
+         self.situ_linear_beta = None if situ_linear_beta is None else float(situ_linear_beta)
++        # DS-V4 / GPT-OSS style SwiGLU clamp: gate is capped at +limit, up is clipped
++        # to [-limit, limit] before the activation. ``+inf`` (or any negative value,
++        # the op-level "disabled" sentinel) means no clamp and generates no code.
++        if swiglu_limit < 0:
++            swiglu_limit = float("inf")
++        self.swiglu_limit = float(swiglu_limit)
++        self.has_swiglu_limit = self.swiglu_limit != float("inf")
++        if self.has_swiglu_limit and self.activation_type != ActivationType.Swiglu:
++            raise ValueError(
++                "swiglu_limit applies to ActivationType.Swiglu only; "
++                f"got {self.activation_type.name} with swiglu_limit={self.swiglu_limit}."
++            )
+         self.is_gated = is_gated_activation(self.activation_type)
+         if locality_domain_half_gemm and not self.is_gated:
+             raise ValueError("Rubin locality domain half-GEMM currently supports SwiGLU only")
+@@ -492,6 +579,17 @@ def _setup_attributes(self):
+         # 32-bit alignment). (128, 64) works for all configs.
+         self.epi_tile = (128, 64)
+         self.epi_tile_n = cute.size(self.epi_tile[1])
++        # Gated N256 tiles without B reuse keep two overlapping accumulator
++        # slots. On the contiguous NVFP4/sf16 output path the epilogue reads
++        # the shared TMEM columns first and releases the slot after that single
++        # load; other output layouts keep the two-load release protocol.
++        self.use_first_second_release = (
++            self.is_gated
++            and self.use_overlap_accum
++            and self.c_layout == utils.LayoutEnum.ROW_MAJOR
++            and self.c_dtype == cutlass.Float4E2M1FN
++            and self.sf_vec_size == 16
++        )
+         self.epi_tile_cnt = (
+             self.cta_tile_shape_mnk_c[0] // cute.size(self.epi_tile[0]),
+             self.cta_tile_shape_mnk_c[1] // cute.size(self.epi_tile[1]),
+@@ -743,13 +841,13 @@ def __call__(
+ 
+         This method performs FC1 layer computation:
+         1. GEMM: acc = alpha * (SFA * A[token_ids]) * (SFB * B)
+-        2. SwiGLU: C = up * silu(gate), where up/gate are extracted from interleaved acc (granularity=64)
++        2. SwiGLU: C = up * silu(gate), where gate/up are decoded from interleaved acc (granularity=16)
+         3. Optional Quant: When c_dtype is Float4E2M1FN, generates SFC and quantizes output
+ 
+         Data loading:
+         - A and SFA are loaded using CpAsync instructions with token-based gather
+         - B and SFB are loaded using TMA instructions with multicast
+-        - B weights are interleaved: [up_0:64, gate_64:128, up_128:192, gate_192:256, ...]
++        - B and SFB use matching [gate16, up16] pairs along N
+ 
+         Execution steps:
+         1. Setup static attributes before smem/grid computation
+@@ -2842,8 +2940,8 @@ def kernel(
+             (
+                 tiled_copy_t2r,
+                 tTR_tAcc_base,
+-                tTR_rAcc_up,
+-                tTR_rAcc_gate,
++                tTR_rPackedFirst,
++                tTR_rPackedSecond,
+             ) = self.epilog_tmem_copy_and_partition(
+                 epi_tidx, tCtAcc_transformed, tCgC_for_epi, epi_tile, use_2cta_instrs
+             )
+@@ -2854,7 +2952,9 @@ def kernel(
+             tRS_sC = None
+             bSG_sC = None
+             bSG_gC_partitioned = None
+-            tTR_rC = cute.make_rmem_tensor(tTR_rAcc_up.shape, self.c_dtype)
++            # One logical output fragment has the shape of one packed load
++            # fragment: two packed chunks become gate/up, then one C.
++            tTR_rC = cute.make_rmem_tensor(tTR_rPackedFirst.shape, self.c_dtype)
+             tiled_copy_r2s, tRS_rC, tRS_sC = epilogue_smem_copy_and_partition(
+                 self, tiled_copy_t2r, tTR_rC, epi_tidx, sC
+             )
+@@ -2963,8 +3063,14 @@ def kernel(
+                     reverse_subtile = (
+                         cutlass.Boolean(True) if acc_stage_index == 0 else cutlass.Boolean(False)
+                     )
++                    # Slot 0 reads its N64 chunks in reverse, slot 1 forward;
++                    # keep that direction before release advances the phase.
++                    first_half = cutlass.Int32(0)
++                    if cutlass.const_expr(self.use_first_second_release):
++                        first_half = cutlass.Int32(reverse_subtile)
+                 else:
+                     acc_stage_index = acc_consumer_state.index
++                    first_half = cutlass.Int32(0)
+ 
+                 # Set tensor memory buffer for current tile
+                 # (T2R, T2R_M, T2R_N, EPI_M, EPI_M)
+@@ -2986,24 +3092,26 @@ def kernel(
+                 #
+                 acc_pipeline.consumer_wait(acc_consumer_state)
+ 
+-                # Activation epilogue. SwiGLU consumes interleaved [up, gate]
+-                # accumulator subtiles and halves N; Relu2 consumes each
+-                # accumulator subtile directly and preserves N.
++                # Activation epilogue. A gated activation (SwiGLU / SiTU)
++                # consumes two consecutive N64 accumulator chunks per N64
++                # output subtile, each packed [gate16, up16, gate16, up16],
++                # decodes them into logical gate/up fragments and halves N;
++                # Relu2 consumes each accumulator subtile directly and
++                # preserves N.
+                 #   tTR_tAcc: (T2R, T2R_M, T2R_N, EPI_M, EPI_N, STAGE), sliced on STAGE.
+                 #   bSG_gC:   ((ATOM_V, REST_V), EPI_M, EPI_N, loopM, loopN, loopL).
+-                interleave_granularity = 64
+-                gate_offset = interleave_granularity // self.epi_tile_n
+                 epi_m_cnt = cute.size(tTR_tAcc.shape, mode=[3])
+                 acc_n_subtile_cnt = cute.size(tTR_tAcc.shape, mode=[4])
+                 out_n_subtile_cnt = acc_n_subtile_cnt // 2 if self.is_gated else acc_n_subtile_cnt
++                if cutlass.const_expr(self.use_first_second_release):
++                    assert epi_m_cnt == 1, (
++                        "single-load release requires all CTA rows in one epilogue subtile"
++                    )
+ 
+                 for epi_m_idx in cutlass.range(epi_m_cnt):
+                     for out_n_idx in cutlass.range(out_n_subtile_cnt):
+-                        # Map output N subtile → acc N subtile. Each
+-                        # interleave block of 2*gate_offset subtiles is
+-                        # [up*gate_offset, gate*gate_offset]. acc[0] in
+-                        # overlap mode iterates in reverse (consume high-col
+-                        # overlap region first).
++                        # acc[0] in overlap mode iterates in reverse (consume
++                        # the high-col overlap region first).
+                         if cutlass.const_expr(self.use_overlap_accum):
+                             real_out_n_idx = (
+                                 (out_n_subtile_cnt - 1 - out_n_idx)
+@@ -3012,38 +3120,77 @@ def kernel(
+                             )
+                         else:
+                             real_out_n_idx = out_n_idx
+-                        if cutlass.const_expr(self.is_gated):
+-                            block_idx = real_out_n_idx // gate_offset
+-                            within_block = real_out_n_idx % gate_offset
+-                            up_n_subtile = block_idx * 2 * gate_offset + within_block
+-                            gate_n_subtile = (
+-                                block_idx * 2 * gate_offset + gate_offset + within_block
+-                            )
+-                        else:
+-                            up_n_subtile = real_out_n_idx
+                         #
+                         # Load accumulator from tensor memory buffer to register
+                         #
+-                        tTR_tAcc_mn_up = tTR_tAcc[(None, None, None, epi_m_idx, up_n_subtile)]
+-
+-                        cute.copy(tiled_copy_t2r, tTR_tAcc_mn_up, tTR_rAcc_up)
+                         if cutlass.const_expr(self.is_gated):
+-                            tTR_tAcc_mn_gate = tTR_tAcc[
+-                                (None, None, None, epi_m_idx, gate_n_subtile)
++                            # Output N64 subtile -> its two packed N64 chunks.
++                            # First/Second denote load order, not logical
++                            # lo/hi: select the TMEM address, never the
++                            # register destination.
++                            tTR_tAcc_mn_first = tTR_tAcc[
++                                (None, None, None, epi_m_idx, 2 * real_out_n_idx + first_half)
+                             ]
+-                            cute.copy(tiled_copy_t2r, tTR_tAcc_mn_gate, tTR_rAcc_gate)
+-
+-                        # Overlap mode: after iter 0 the up/gate LDTM has
+-                        # covered cols 192..255 (reverse for acc[0], forward
+-                        # for acc[1]). Fence + early-release so MMA can write
+-                        # the next stage into the overlap region without racing.
+-                        if cutlass.const_expr(self.use_overlap_accum):
++                            tTR_tAcc_mn_second = tTR_tAcc[
++                                (
++                                    None,
++                                    None,
++                                    None,
++                                    epi_m_idx,
++                                    2 * real_out_n_idx + (first_half ^ 1),
++                                )
++                            ]
++                            cute.copy(tiled_copy_t2r, tTR_tAcc_mn_first, tTR_rPackedFirst)
++                            if cutlass.const_expr(self.use_first_second_release):
++                                # Slots [0,256) and [192,448) share [192,256).
++                                # On the first output subtile, slot 0's high
++                                # half and slot 1's low half cover exactly
++                                # those 64 columns: wait for that load and
++                                # release; the next MMA cannot overwrite the
++                                # remaining, nonshared half.
++                                if out_n_idx == 0:
++                                    cute.arch.fence_view_async_tmem_load()
++                                    with cute.arch.elect_one():
++                                        acc_pipeline.consumer_release(acc_consumer_state)
++                                    acc_consumer_state.advance()
++                            cute.copy(tiled_copy_t2r, tTR_tAcc_mn_second, tTR_rPackedSecond)
++                        else:
++                            tTR_tAcc_mn_up = tTR_tAcc[(None, None, None, epi_m_idx, real_out_n_idx)]
++                            cute.copy(tiled_copy_t2r, tTR_tAcc_mn_up, tTR_rPackedFirst)
++
++                        # Overlap mode with the two-load protocol: after iter 0
++                        # the LDTMs have covered cols 192..255 (reverse for
++                        # acc[0], forward for acc[1]). Fence + early-release so
++                        # MMA can write the next stage into the overlap region
++                        # without racing.
++                        if cutlass.const_expr(
++                            self.use_overlap_accum and not self.use_first_second_release
++                        ):
+                             if out_n_idx == 0:
+                                 cute.arch.fence_view_async_tmem_load()
+                                 with cute.arch.elect_one():
+                                     acc_pipeline.consumer_release(acc_consumer_state)
+                                 acc_consumer_state.advance()
+ 
++                        # The two load buffers become the logical up/gate
++                        # fragments; a non-gated activation reads First as-is.
++                        tTR_rAcc_up = tTR_rPackedFirst
++                        tTR_rAcc_gate = tTR_rPackedSecond
++                        if cutlass.const_expr(self.is_gated):
++                            # Snapshot the packed values before overwriting
++                            # the buffers. Packed axes: (channel within N16,
++                            # gate/up, group); compute axes: (channel within
++                            # N16, group, load slot).
++                            packed_first = tTR_rPackedFirst.load().reshape((16, 2, 2))
++                            packed_second = tTR_rPackedSecond.load().reshape((16, 2, 2))
++                            gate_up_layout = cute.make_layout((16, 2, 2))
++                            gate = cute.make_tensor(tTR_rAcc_gate.iterator, gate_up_layout)
++                            up = cute.make_tensor(tTR_rAcc_up.iterator, gate_up_layout)
++                            gate[None, None, 0].store(packed_first[None, 0, None])
++                            gate[None, None, 1].store(packed_second[None, 0, None])
++                            up[None, None, 0].store(packed_first[None, 1, None])
++                            up[None, None, 1].store(packed_second[None, 1, None])
++
+                         acc_vec_up = tTR_rAcc_up.load()
+                         tCompute = cute.make_rmem_tensor(acc_vec_up.shape, self.acc_dtype)
+                         if cutlass.const_expr(self.activation_type == ActivationType.Swiglu):
+@@ -3140,7 +3287,12 @@ def kernel(
+ 
+                             # Store SFC to gmem.
+                             # TODO: predicate (cute.elem_less)
+-                            cute.autovec_copy(tCrSFC, tCgSFC)
++                            if cutlass.const_expr(self.use_first_second_release):
++                                # Restore logical order in one packed store;
++                                # tCrSFC itself stays in load order.
++                                store_sfc_word(tCrSFC, tCgSFC, first_half)
++                            else:
++                                cute.autovec_copy(tCrSFC, tCgSFC)
+ 
+                             # Quantize output and convert to c_dtype.
+                             # TODO: need to add f8x2 -> f32x2 conversion
+@@ -3193,11 +3345,20 @@ def kernel(
+                         num_prev_subtiles = num_prev_subtiles + 1
+                         c_buffer = num_prev_subtiles % self.num_c_stage
+ 
+-                        cute.copy(
+-                            tiled_copy_r2s,
+-                            tRS_rC,
+-                            tRS_sC[(None, None, None, c_buffer)],
+-                        )
++                        if cutlass.const_expr(self.use_first_second_release):
++                            # Restore canonical column order ahead of the
++                            # unchanged N64 TMA store.
++                            store_output_halves(
++                                tRS_rC,
++                                tRS_sC[(None, None, None, c_buffer)],
++                                first_half,
++                            )
++                        else:
++                            cute.copy(
++                                tiled_copy_r2s,
++                                tRS_rC,
++                                tRS_sC[(None, None, None, c_buffer)],
++                            )
+                         # Fence and barrier to make sure shared memory store is visible to TMA store
+                         cute.arch.fence_proxy(
+                             "async.shared",
+@@ -3261,7 +3422,11 @@ def _apply_swiglu_epilogue(
+         alpha_val,
+         tCompute: cute.Tensor,
+     ):
+-        """SwiGLU: ``tCompute[i] = (alpha * up[i]) * silu(alpha * gate[i])``."""
++        """SwiGLU: ``tCompute[i] = (alpha * up[i]) * silu(alpha * gate[i])``.
++
++        With ``has_swiglu_limit`` the scaled gate is capped at ``+swiglu_limit`` and
++        the scaled up is clipped to ``[-swiglu_limit, swiglu_limit]`` first.
++        """
+         if cutlass.const_expr(self.vectorized_f32):
+             LOG2_E = cutlass.Float32(1.4426950408889634)
+             for i in cutlass.range_constexpr(0, cute.size(acc_vec_up.shape), 2):
+@@ -3273,6 +3438,15 @@ def _apply_swiglu_epilogue(
+                     (acc_vec_gate[i], acc_vec_gate[i + 1]),
+                     (cutlass.Float32(alpha_val), cutlass.Float32(alpha_val)),
+                 )
++                if cutlass.const_expr(self.has_swiglu_limit):
++                    acc_vec_gate_alpha = (
++                        fmin(acc_vec_gate_alpha[0], self.swiglu_limit, nan=True),
++                        fmin(acc_vec_gate_alpha[1], self.swiglu_limit, nan=True),
++                    )
++                    acc_vec_up_alpha = (
++                        fclip_xorsign(acc_vec_up_alpha[0], self.swiglu_limit),
++                        fclip_xorsign(acc_vec_up_alpha[1], self.swiglu_limit),
++                    )
+                 tCompute_log2e = cute.arch.mul_packed_f32x2(
+                     (acc_vec_gate_alpha[0], acc_vec_gate_alpha[1]),
+                     (-LOG2_E, -LOG2_E),
+@@ -3307,6 +3481,9 @@ def _apply_swiglu_epilogue(
+             for i in cutlass.range_constexpr(cute.size(acc_vec_up.shape)):
+                 acc_vec_up_alpha = acc_vec_up[i] * cutlass.Float32(alpha_val)
+                 acc_vec_gate_alpha = acc_vec_gate[i] * cutlass.Float32(alpha_val)
++                if cutlass.const_expr(self.has_swiglu_limit):
++                    acc_vec_gate_alpha = fmin(acc_vec_gate_alpha, self.swiglu_limit, nan=True)
++                    acc_vec_up_alpha = fclip_xorsign(acc_vec_up_alpha, self.swiglu_limit)
+                 tCompute[i] = acc_vec_up_alpha * silu_f32(acc_vec_gate_alpha, fastmath=True)
+ 
+     @cute.jit
+@@ -3448,11 +3625,11 @@ def epilog_tmem_copy_and_partition(
+         :param use_2cta_instrs: Whether use_2cta_instrs is enabled
+         :type use_2cta_instrs: bool
+ 
+-        :return: A tuple containing (tiled_copy_t2r, tTR_tAcc, tTR_rAcc_up, tTR_rAcc_gate) where:
++        :return: A tuple containing (tiled_copy_t2r, tTR_tAcc, tTR_rPackedFirst, tTR_rPackedSecond) where:
+             - tiled_copy_t2r: The tiled copy operation for tmem to register copy(t2r)
+             - tTR_tAcc: The partitioned accumulator tensor
+-            - tTR_rAcc_up: The partitioned accumulator tensor for acc up
+-            - tTR_rAcc_gate: The partitioned accumulator tensor for acc gate
++            - tTR_rPackedFirst: First loaded N64 chunk (two gate16/up16 pairs when gated)
++            - tTR_rPackedSecond: Second loaded N64 chunk (two gate16/up16 pairs when gated)
+         :rtype: Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor, cute.Tensor]
+         """
+         # Make tiledCopy for tensor memory load (Rubin uses transformed layout)
+@@ -3486,14 +3663,14 @@ def epilog_tmem_copy_and_partition(
+         tTR_gC = thr_copy_t2r.partition_D(gC_mnl_epi)
+ 
+         # (T2R, T2R_M, T2R_N)
+-        tTR_rAcc_up = cute.make_rmem_tensor(
++        tTR_rPackedFirst = cute.make_rmem_tensor(
+             tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, self.acc_dtype
+         )
+         # (T2R, T2R_M, T2R_N)
+-        tTR_rAcc_gate = cute.make_rmem_tensor(
++        tTR_rPackedSecond = cute.make_rmem_tensor(
+             tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, self.acc_dtype
+         )
+-        return tiled_copy_t2r, tTR_tAcc, tTR_rAcc_up, tTR_rAcc_gate
++        return tiled_copy_t2r, tTR_tAcc, tTR_rPackedFirst, tTR_rPackedSecond
+ 
+     def epilog_smem_copy_and_partition(
+         self,
+@@ -4720,7 +4897,7 @@ def run(
+ 
+     if not skip_ref_check:
+         print("Verifying results...")
+-        interleave_granularity = 64
++        interleave_granularity = 16
+         n_out = n // 2
+ 
+         gemm_result = torch.empty((1, valid_m, n), dtype=torch.float32)
+@@ -4738,8 +4915,8 @@ def run(
+         assert n % (2 * interleave_granularity) == 0
+         ref = torch.empty((1, valid_m, n_out), dtype=torch.float32)
+         for n_block in range(0, n, 2 * interleave_granularity):
+-            up_result = gemm_result[0, :, n_block : n_block + interleave_granularity]
+-            gate_result = gemm_result[
++            gate_result = gemm_result[0, :, n_block : n_block + interleave_granularity]
++            up_result = gemm_result[
+                 0,
+                 :,
+                 n_block + interleave_granularity : n_block + 2 * interleave_granularity,
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/rubin/moe/rubin_contiguous_grouped_blockscaled_gemm_fused_fc12.py b/tensorrt_llm/_torch/cute_dsl_kernels/rubin/moe/rubin_contiguous_grouped_blockscaled_gemm_fused_fc12.py
+index 75e5bd11b463..7681fbde79bc 100644
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/rubin/moe/rubin_contiguous_grouped_blockscaled_gemm_fused_fc12.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/rubin/moe/rubin_contiguous_grouped_blockscaled_gemm_fused_fc12.py
+@@ -128,6 +128,292 @@ class FusedSmemStageConfig:
+     fc1_c: int
+ 
+ 
++@dataclass(frozen=True)
++class SeparatePhaseSmemStageBytes:
++    """Byte model for phase-specific AB pipelines with optional FC2 C aliasing.
++
++    SFA remains a separate low-address allocation because FC1 gathers it with
++    ``cp.async.cg``. A is also kept contiguous at the start of the mainloop
++    allocation for the same reason. With FC2 C aliasing, B and SFB are paired
++    by stage: the FC1-only A tail followed by the same number of leading B/SFB
++    stage pairs forms one contiguous region that FC2 can reinterpret as its
++    block-reduce source after the FC1 pipelines have drained. Without aliasing,
++    A, B, and SFB retain their separate, aligned operand-major regions.
++    """
++
++    a_per_stage: int
++    b_per_stage: int
++    sfa_per_stage: int
++    sfb_per_stage: int
++    fc1_c_per_stage: int
++    fc2_c: int
++    metadata: int
++    header_fixed: int
++    fc1_header_per_stage: int
++    fc2_header_per_stage: int
++    alignment: int
++
++    @property
++    def operand_bytes_per_stage(self) -> int:
++        """Return the total A/B/SFB bytes contributed by one stage."""
++
++        return self.a_per_stage + self.b_per_stage + self.sfb_per_stage
++
++    @property
++    def bsfb_stage_bytes(self) -> int:
++        """Return bytes in one physical stage pair of B and SFB."""
++
++        return self.b_per_stage + self.sfb_per_stage
++
++    def overlay_bytes(
++        self, *, fc1_ab_stages: int, fc2_ab_stages: int
++    ) -> int:
++        """Return FC1-only A/B/SFB bytes available to the FC2 epilogue."""
++
++        return (
++            max(fc1_ab_stages - fc2_ab_stages, 0)
++            * self.operand_bytes_per_stage
++        )
++
++    def total(
++        self,
++        *,
++        fc1_ab_stages: int,
++        fc2_ab_stages: int,
++        fc1_c_stages: int,
++        overlay_fc2_c: bool,
++    ) -> int:
++        """Return aligned shared storage required by one stage configuration."""
++
++        def align_up(value: int) -> int:
++            return (
++                (value + self.alignment - 1) // self.alignment
++            ) * self.alignment
++
++        operand_stages = max(fc1_ab_stages, fc2_ab_stages)
++        header = align_up(
++            self.header_fixed
++            + fc1_ab_stages * self.fc1_header_per_stage
++            + fc2_ab_stages * self.fc2_header_per_stage
++        )
++        epilogue_bytes = fc1_c_stages * self.fc1_c_per_stage
++        if not overlay_fc2_c:
++            epilogue_bytes = max(epilogue_bytes, self.fc2_c)
++        mainloop_bytes = align_up(
++            operand_stages * self.operand_bytes_per_stage
++        )
++        if not overlay_fc2_c:
++            mainloop_bytes = sum(
++                align_up(operand_stages * bytes_per_stage)
++                for bytes_per_stage in (
++                    self.a_per_stage,
++                    self.b_per_stage,
++                    self.sfb_per_stage,
++                )
++            )
++        return align_up(
++            header
++            + mainloop_bytes
++            + align_up(operand_stages * self.sfa_per_stage)
++            + align_up(epilogue_bytes)
++            + self.metadata
++        )
++
++
++@dataclass(frozen=True)
++class SeparatePhaseSmemStageConfig:
++    """Selected FC1/FC2 operand depths and epilogue ownership policy."""
++
++    fc1_ab: int
++    fc2_ab: int
++    fc1_c: int
++    overlay_fc2_c: bool
++
++
++@dataclass(frozen=True)
++class SeparatePhaseSmemLayout:
++    """Operand offsets and stage strides, pairing B/SFB only for FC2 C aliasing.
++
++    Offsets are relative to the mainloop allocation, not the SMEM base.
++    """
++
++    a_smem_offset_bytes: int
++    a_smem_alloc_bytes: int
++    fc1_b_smem_offset_bytes: int
++    fc1_sfb_smem_offset_bytes: int
++    fc2_b_smem_offset_bytes: int
++    fc2_sfb_smem_offset_bytes: int
++    b_stage_stride_bytes: int
++    sfb_stage_stride_bytes: int
++    fc2_bsfb_stage_offset: int
++    fc2_c_smem_offset_bytes: int
++    fc2_c_overlay_bytes: int
++    mainloop_smem_alloc_bytes: int
++
++
++def derive_separate_phase_smem_layout(
++    *,
++    stage_config: SeparatePhaseSmemStageConfig,
++    stage_bytes: SeparatePhaseSmemStageBytes,
++) -> SeparatePhaseSmemLayout:
++    """Derive physical operand offsets for one separate-phase specialization.
++
++    Without FC2 C aliasing, preserve the split-alpha layout:
++    ``[A stages][B stages][SFB stages]``, with each operand region aligned.
++    With aliasing, use ``[A stages][(B, SFB) stage pairs]``. FC2 C begins at
++    the first FC1-only A stage, and FC2 B/SFB skips the leading stage pairs
++    covered by FC2 C.
++    """
++
++    operand_stages = max(stage_config.fc1_ab, stage_config.fc2_ab)
++    a_smem_alloc_bytes = operand_stages * stage_bytes.a_per_stage
++    if not stage_config.overlay_fc2_c:
++
++        def align_up(value: int) -> int:
++            return (
++                (value + stage_bytes.alignment - 1) // stage_bytes.alignment
++            ) * stage_bytes.alignment
++
++        b_smem_offset_bytes = align_up(a_smem_alloc_bytes)
++        sfb_smem_offset_bytes = b_smem_offset_bytes + align_up(
++            operand_stages * stage_bytes.b_per_stage
++        )
++        return SeparatePhaseSmemLayout(
++            a_smem_offset_bytes=0,
++            a_smem_alloc_bytes=a_smem_alloc_bytes,
++            fc1_b_smem_offset_bytes=b_smem_offset_bytes,
++            fc1_sfb_smem_offset_bytes=sfb_smem_offset_bytes,
++            fc2_b_smem_offset_bytes=b_smem_offset_bytes,
++            fc2_sfb_smem_offset_bytes=sfb_smem_offset_bytes,
++            b_stage_stride_bytes=stage_bytes.b_per_stage,
++            sfb_stage_stride_bytes=stage_bytes.sfb_per_stage,
++            fc2_bsfb_stage_offset=0,
++            fc2_c_smem_offset_bytes=0,
++            fc2_c_overlay_bytes=0,
++            mainloop_smem_alloc_bytes=sfb_smem_offset_bytes
++            + align_up(operand_stages * stage_bytes.sfb_per_stage),
++        )
++
++    bsfb_smem_offset_bytes = a_smem_alloc_bytes
++    mainloop_smem_alloc_bytes = (
++        a_smem_alloc_bytes + operand_stages * stage_bytes.bsfb_stage_bytes
++    )
++
++    fc2_bsfb_stage_offset = 0
++    fc2_c_smem_offset_bytes = 0
++    fc2_c_overlay_bytes = 0
++    if stage_config.overlay_fc2_c:
++        if stage_config.fc1_ab < stage_config.fc2_ab:
++            raise ValueError(
++                "FC2 C cannot alias FC1-only operand stages when FC1 has "
++                "fewer stages than FC2"
++            )
++        fc2_bsfb_stage_offset = stage_config.fc1_ab - stage_config.fc2_ab
++        fc2_c_smem_offset_bytes = (
++            stage_config.fc2_ab * stage_bytes.a_per_stage
++        )
++        fc2_c_overlay_end_bytes = (
++            a_smem_alloc_bytes
++            + fc2_bsfb_stage_offset * stage_bytes.bsfb_stage_bytes
++        )
++        fc2_c_overlay_bytes = (
++            fc2_c_overlay_end_bytes - fc2_c_smem_offset_bytes
++        )
++        if fc2_c_overlay_bytes < stage_bytes.fc2_c:
++            raise ValueError(
++                "FC1-only operand stages do not hold FC2 C: "
++                f"available={fc2_c_overlay_bytes}, required={stage_bytes.fc2_c}"
++            )
++
++    fc1_b_smem_offset_bytes = bsfb_smem_offset_bytes
++    fc1_sfb_smem_offset_bytes = (
++        fc1_b_smem_offset_bytes + stage_bytes.b_per_stage
++    )
++    fc2_b_smem_offset_bytes = (
++        bsfb_smem_offset_bytes
++        + fc2_bsfb_stage_offset * stage_bytes.bsfb_stage_bytes
++    )
++    fc2_sfb_smem_offset_bytes = (
++        fc2_b_smem_offset_bytes + stage_bytes.b_per_stage
++    )
++    fc2_bsfb_end_bytes = (
++        fc2_b_smem_offset_bytes
++        + stage_config.fc2_ab * stage_bytes.bsfb_stage_bytes
++    )
++    if fc2_bsfb_end_bytes > mainloop_smem_alloc_bytes:
++        raise ValueError(
++            "FC2 B/SFB view exceeds mainloop shared memory: "
++            f"end={fc2_bsfb_end_bytes}, size={mainloop_smem_alloc_bytes}"
++        )
++
++    return SeparatePhaseSmemLayout(
++        a_smem_offset_bytes=0,
++        a_smem_alloc_bytes=a_smem_alloc_bytes,
++        fc1_b_smem_offset_bytes=fc1_b_smem_offset_bytes,
++        fc1_sfb_smem_offset_bytes=fc1_sfb_smem_offset_bytes,
++        fc2_b_smem_offset_bytes=fc2_b_smem_offset_bytes,
++        fc2_sfb_smem_offset_bytes=fc2_sfb_smem_offset_bytes,
++        b_stage_stride_bytes=stage_bytes.bsfb_stage_bytes,
++        sfb_stage_stride_bytes=stage_bytes.bsfb_stage_bytes,
++        fc2_bsfb_stage_offset=fc2_bsfb_stage_offset,
++        fc2_c_smem_offset_bytes=fc2_c_smem_offset_bytes,
++        fc2_c_overlay_bytes=fc2_c_overlay_bytes,
++        mainloop_smem_alloc_bytes=mainloop_smem_alloc_bytes,
++    )
++
++
++def select_separate_phase_smem_stages(
++    *,
++    capacity: int,
++    preferred_fc1_ab: int,
++    preferred_fc2_ab: int,
++    preferred_fc1_c: int,
++    minimum_fc1_c: int,
++    stage_bytes: SeparatePhaseSmemStageBytes,
++) -> SeparatePhaseSmemStageConfig:
++    """Select FC1 depth while preserving the preferred FC2 pipeline depth.
++
++    The FC2 depth is kept fixed: sacrificing FC2 stages merely to create a
++    larger alias would trade one mainloop regression for another. For each FC1
++    candidate, prefer the tail-stage alias when it can hold the complete FC2 C
++    tile; otherwise retain a separate FC2 C allocation.
++    """
++
++    for fc1_ab_stages in range(preferred_fc1_ab, 0, -1):
++        can_overlay_fc2_c = (
++            stage_bytes.overlay_bytes(
++                fc1_ab_stages=fc1_ab_stages,
++                fc2_ab_stages=preferred_fc2_ab,
++            )
++            >= stage_bytes.fc2_c
++        )
++        for fc1_c_stages in range(
++            preferred_fc1_c, minimum_fc1_c - 1, -1
++        ):
++            for overlay_fc2_c in (True, False):
++                if overlay_fc2_c and not can_overlay_fc2_c:
++                    continue
++                if stage_bytes.total(
++                    fc1_ab_stages=fc1_ab_stages,
++                    fc2_ab_stages=preferred_fc2_ab,
++                    fc1_c_stages=fc1_c_stages,
++                    overlay_fc2_c=overlay_fc2_c,
++                ) <= capacity:
++                    return SeparatePhaseSmemStageConfig(
++                        fc1_ab=fc1_ab_stages,
++                        fc2_ab=preferred_fc2_ab,
++                        fc1_c=fc1_c_stages,
++                        overlay_fc2_c=overlay_fc2_c,
++                    )
++    raise ValueError(
++        "no separate-phase FC12 shared-memory stage configuration fits: "
++        f"capacity={capacity}, preferred_fc1_ab={preferred_fc1_ab}, "
++        f"preferred_fc2_ab={preferred_fc2_ab}, "
++        f"preferred_fc1_c={preferred_fc1_c}, "
++        f"minimum_fc1_c={minimum_fc1_c}"
++    )
++
++
+ def select_fused_smem_stages(
+     *,
+     capacity: int,
+@@ -845,8 +1131,9 @@ def sm100_tcgen05_st_32x32b_x4(
+   fc2_acc = fc2_alpha * (SFC * C) * (FC2_SFB * FC2_B)
+   + optional NVFP4 quantization (generates SFC) when c_dtype == Float4E2M1FN.
+ 
+-Shapes: A is M×K×1; B is N×K×L (L = num experts), interleaved [up, gate] at
+-granularity=64; C is M×(N/2)×1 (N halved by SwiGLU). SFA/SFB layouts follow
++Shapes: A is M×K×1; B is N×K×L (L = num experts), with FC1 N ordered as
++[gate16, up16] groups. B and SFB must use the same N order;
++C is M×(N/2)×1 in logical channel order. SFA/SFB layouts follow
+ BlockScaledBasicChunk. ``permuted_idx_to_expanded_idx`` is shared by both
+ phases: FC1 divides by ``topk`` to recover the receive row, while FC2 also
+ uses the remainder to select the route scale.
+@@ -855,7 +1142,7 @@ def sm100_tcgen05_st_32x32b_x4(
+ predicating CpAsync on `abs_row < mn_limit`.
+ 
+ Constraints: A/B share dtype (mxf8 | mxf4 | nvf4); mma_tiler M in {128, 256};
+-mma_tiler N in {64, 128, 192, 256}; cluster M/N pow-2, total ≤ 16;
++mma_tiler N in {128, 256}; cluster M/N pow-2, total ≤ 16;
+ contiguous dim ≥ 16B aligned (16/32 elems for f8/f4).
+ 
+ For CUDA graph, A/C/SFA/permuted_idx_to_expanded_idx/tile_idx_to_expert_idx can
+@@ -882,8 +1169,8 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
+       - A/SFA load: four gather warps issue CpAsync128.CG into a shared
+         fc1_a_pipeline. SFA is consumed directly by a Cp128x128b UTCCP in the MMA
+         warp using the 128dp_Unique layout.
+-      - SwiGLU epilogue: C = up * silu(gate), where up/gate come from
+-        interleaved accumulator at granularity=64 → output N is halved.
++      - SwiGLU epilogue: C = up * silu(gate), where up/gate come from the
++        gate16/up16 FC1 weight layout → output N is halved.
+       - Optional NVFP4 quant: when c_dtype == Float4E2M1FN, the epilogue
+         also generates SFC and quantizes the output.
+ 
+@@ -903,6 +1190,8 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
+     :param topk: Experts selected per token.
+     :param swiglu_limit: DS-v4 SwiGLU clamp limit; ``+inf`` disables clamp.
+     :param scheduler: Persistent work-ID scheduler: ``static`` or ``l2_atomic``.
++    FC1 B and SFB must already use gate16/up16 order (tile N 128/256).
++    FC1 output remains in logical channel order; FC2 weight layout is unchanged.
+     """
+ 
+     def __init__(
+@@ -1168,12 +1457,13 @@ def _setup_attributes(self):
+         self.num_mcast_ctas_a = cute.size(self.cluster_layout_vmnk.shape[2])
+         self.is_a_mcast = self.num_mcast_ctas_a > 1
+ 
+-        # Fixed epilogue tile (128, 64). SwiGLU halves N, so the default
++        # Logical output tile (128, 64). Each output subtile consumes two
++        # packed N64 accumulator chunks, not separate up64/gate64 chunks.
++        # SwiGLU halves N, so the default
+         # SM107_TILES lookup (keyed on full cta_n) can pick epi_tile_n too
+         # small (wrong TMA store strides + insufficient SFC for cvt_fptrunc
+         # 32-bit alignment). (128, 64) works for all configs.
+         self.fc1_epi_tile = (128, 64)
+-        self.fc1_epi_tile_n = cute.size(self.fc1_epi_tile[1])
+         self.fc1_epi_tile_cnt = (
+             self.fc1_cta_tile_shape_mnk_c[0] // cute.size(self.fc1_epi_tile[0]),
+             self.fc1_cta_tile_shape_mnk_c[1] // cute.size(self.fc1_epi_tile[1]),
+@@ -1215,9 +1505,12 @@ def _setup_attributes(self):
+         # Setup A/B/C/Scale stage count in shared memory and ACC stage count in tensor memory
+         (
+             self.num_acc_stage,
+-            self.num_ab_stage,
++            self.fc1_num_ab_stage,
++            self.fc2_num_ab_stage,
+             self.fc1_num_c_stage,
+             self.num_tile_stage,
++            self.overlay_fc2_c_on_fc1_ab_tail,
++            separate_phase_stage_bytes,
+         ) = self._compute_stages(
+             tiled_mma,
+             self.mma_tiler,
+@@ -1239,24 +1532,139 @@ def _setup_attributes(self):
+             self.mma_cta_group_int,
+         )
+ 
+-        # Compute A/B/C/Scale shared memory layout
+-        self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
++        # Keep every A stage contiguous at the low end of the mainloop buffer:
++        # FC1 gathers A with cp.async.cg, whose cache-mode hint requires a low
++        # SMEM destination address. Only an FC2 C overlay pairs B/SFB by stage
++        # and skips the leading pairs for FC2, forming one contiguous alias
++        # with the FC1-only A tail. Otherwise preserve the original separate
++        # B and SFB regions and their compact stage strides.
++        a_smem_layout_stage_one = sm100_utils.make_smem_layout_a(
+             tiled_mma,
+             self.mma_tiler,
+             self.a_dtype,
+-            self.num_ab_stage,
++            1,
+         )
+-        self.b_smem_layout_staged = sm100_utils.make_smem_layout_b(
++        b_smem_layout_stage_one = sm100_utils.make_smem_layout_b(
+             tiled_mma,
+             self.mma_tiler,
+             self.b_dtype,
+-            self.num_ab_stage,
++            1,
+         )
+-        self.sfb_smem_layout_staged = blockscaled_utils.make_smem_layout_sfb(
++        sfb_smem_layout_stage_one = blockscaled_utils.make_smem_layout_sfb(
+             tiled_mma,
+             self.mma_tiler,
+             self.sf_vec_size,
+-            self.num_ab_stage,
++            1,
++        )
++        self.a_smem_bytes_per_stage = cute.size_in_bytes(
++            self.a_dtype, a_smem_layout_stage_one
++        )
++        self.b_smem_bytes_per_stage = cute.size_in_bytes(
++            self.b_dtype, b_smem_layout_stage_one
++        )
++        self.sfb_smem_bytes_per_stage = cute.size_in_bytes(
++            self.sf_dtype, sfb_smem_layout_stage_one
++        )
++        self.mainloop_stage_bytes = (
++            self.a_smem_bytes_per_stage
++            + self.b_smem_bytes_per_stage
++            + self.sfb_smem_bytes_per_stage
++        )
++        assert (
++            separate_phase_stage_bytes.a_per_stage
++            == self.a_smem_bytes_per_stage
++        )
++        assert (
++            separate_phase_stage_bytes.b_per_stage
++            == self.b_smem_bytes_per_stage
++        )
++        assert (
++            separate_phase_stage_bytes.sfb_per_stage
++            == self.sfb_smem_bytes_per_stage
++        )
++        separate_phase_layout = derive_separate_phase_smem_layout(
++            stage_config=SeparatePhaseSmemStageConfig(
++                fc1_ab=self.fc1_num_ab_stage,
++                fc2_ab=self.fc2_num_ab_stage,
++                fc1_c=self.fc1_num_c_stage,
++                overlay_fc2_c=self.overlay_fc2_c_on_fc1_ab_tail,
++            ),
++            stage_bytes=separate_phase_stage_bytes,
++        )
++
++        self.a_smem_offset_bytes = separate_phase_layout.a_smem_offset_bytes
++        self.a_smem_alloc_bytes = separate_phase_layout.a_smem_alloc_bytes
++        self.fc1_b_smem_offset_bytes = (
++            separate_phase_layout.fc1_b_smem_offset_bytes
++        )
++        self.fc1_sfb_smem_offset_bytes = (
++            separate_phase_layout.fc1_sfb_smem_offset_bytes
++        )
++        self.fc2_b_smem_offset_bytes = (
++            separate_phase_layout.fc2_b_smem_offset_bytes
++        )
++        self.fc2_sfb_smem_offset_bytes = (
++            separate_phase_layout.fc2_sfb_smem_offset_bytes
++        )
++        self.fc2_bsfb_stage_offset = (
++            separate_phase_layout.fc2_bsfb_stage_offset
++        )
++        self.mainloop_smem_alloc_bytes = (
++            separate_phase_layout.mainloop_smem_alloc_bytes
++        )
++
++        operand_stages = max(self.fc1_num_ab_stage, self.fc2_num_ab_stage)
++        self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
++            tiled_mma,
++            self.mma_tiler,
++            self.a_dtype,
++            operand_stages,
++        )
++        b_outer_stage_one = cute.select(
++            b_smem_layout_stage_one.outer,
++            mode=list(range(cute.rank(b_smem_layout_stage_one.outer) - 1)),
++        )
++        sfb_stage_one = cute.select(
++            sfb_smem_layout_stage_one,
++            mode=list(range(cute.rank(sfb_smem_layout_stage_one) - 1)),
++        )
++        b_stage_stride = (
++            separate_phase_layout.b_stage_stride_bytes
++            * 8
++            // self.b_dtype.width
++        )
++        sfb_stage_stride = (
++            separate_phase_layout.sfb_stage_stride_bytes
++            * 8
++            // self.sf_dtype.width
++        )
++        self.fc1_b_smem_layout_staged = cute.make_composed_layout(
++            b_smem_layout_stage_one.inner,
++            b_smem_layout_stage_one.offset,
++            cute.append(
++                b_outer_stage_one,
++                cute.make_layout(
++                    self.fc1_num_ab_stage, stride=b_stage_stride
++                ),
++            ),
++        )
++        self.fc2_b_smem_layout_staged = cute.make_composed_layout(
++            b_smem_layout_stage_one.inner,
++            b_smem_layout_stage_one.offset,
++            cute.append(
++                b_outer_stage_one,
++                cute.make_layout(
++                    self.fc2_num_ab_stage, stride=b_stage_stride
++                ),
++            ),
++        )
++        self.fc1_sfb_smem_layout_staged = cute.append(
++            sfb_stage_one,
++            cute.make_layout(self.fc1_num_ab_stage, stride=sfb_stage_stride),
++        )
++        self.fc2_sfb_smem_layout_staged = cute.append(
++            sfb_stage_one,
++            cute.make_layout(self.fc2_num_ab_stage, stride=sfb_stage_stride),
+         )
+ 
+         # SFA SMEM is plain linear (M_per_cta, tile_K_sf, stage), no pad.
+@@ -1266,15 +1674,19 @@ def _setup_attributes(self):
+         sf_bytes_per_row = sfa_tile_k_sf * self.sf_dtype.width // 8
+         sfa_bytes_per_stage = self.cta_tile_shape_mnk[0] * sf_bytes_per_row
+         self.fc1_sfa_smem_layout_staged = cute.make_layout(
+-            (self.cta_tile_shape_mnk[0], sfa_tile_k_sf, self.num_ab_stage),
++            (
++                self.cta_tile_shape_mnk[0],
++                sfa_tile_k_sf,
++                self.fc1_num_ab_stage,
++            ),
+             stride=(sf_bytes_per_row, 1, sfa_bytes_per_stage),
+         )
+-        self.sfa_smem_alloc_bytes = self.num_ab_stage * sfa_bytes_per_stage
++        self.sfa_smem_alloc_bytes = self.fc1_num_ab_stage * sfa_bytes_per_stage
+         self.fc2_sfa_smem_layout_staged = blockscaled_utils.make_smem_layout_sfa(
+             tiled_mma,
+             self.mma_tiler,
+             self.sf_vec_size,
+-            self.num_ab_stage,
++            self.fc2_num_ab_stage,
+         )
+         self.sfa_smem_alloc_bytes = max(
+             self.sfa_smem_alloc_bytes,
+@@ -1289,16 +1701,27 @@ def _setup_attributes(self):
+             self.fc1_epi_tile,
+             self.fc1_num_c_stage,
+         )
+-        # FC1 and FC2 are sequential within one CTA, so their epilogue views
+-        # alias one allocation sized for the larger phase.
+-        self.epilogue_smem_alloc_bytes = max(
+-            cute.size_in_bytes(
+-                self.fc1_c_dtype, self.fc1_c_smem_layout_staged.outer
+-            ),
+-            cute.size_in_bytes(
+-                self.fc2_c_dtype, self.fc2_c_smem_layout_staged
+-            ),
++        fc1_c_smem_bytes = cute.size_in_bytes(
++            self.fc1_c_dtype, self.fc1_c_smem_layout_staged.outer
++        )
++        self.fc2_c_smem_bytes = cute.size_in_bytes(
++            self.fc2_c_dtype, self.fc2_c_smem_layout_staged
+         )
++        self.fc2_c_smem_offset_bytes = (
++            separate_phase_layout.fc2_c_smem_offset_bytes
++        )
++        if self.overlay_fc2_c_on_fc1_ab_tail:
++            assert (
++                separate_phase_layout.fc2_c_overlay_bytes
++                >= self.fc2_c_smem_bytes
++            )
++            self.epilogue_smem_alloc_bytes = fc1_c_smem_bytes
++        else:
++            # Other tile shapes keep the original phase-sequential epilogue
++            # alias when the FC1-only operand tail cannot contain FC2 C.
++            self.epilogue_smem_alloc_bytes = max(
++                fc1_c_smem_bytes, self.fc2_c_smem_bytes
++            )
+         self.fc2_c_copy_size = (
+             self.cta_tile_shape_mnk[1] * self.fc2_c_dtype.width // 8
+         )
+@@ -1308,7 +1731,10 @@ def _setup_attributes(self):
+             tiled_mma,
+             self.mma_tiler,
+             self.sf_vec_size,
+-            cute.slice_(self.sfb_smem_layout_staged, (None, None, None, 0)),
++            cute.slice_(
++                self.fc1_sfb_smem_layout_staged,
++                (None, None, None, 0),
++            ),
+         )
+ 
+         # SFA 128dp_Unique TMEM layout. Each of the 128 M-rows (tokens) maps
+@@ -1542,13 +1968,13 @@ def __call__(
+ 
+         This method performs FC1 layer computation:
+         1. GEMM: acc = fc1_alpha * (SFA * A[token_ids]) * (SFB * B)
+-        2. SwiGLU: C = up * silu(gate), where up/gate are extracted from interleaved acc (granularity=64)
++        2. SwiGLU: C = up * silu(gate), decoded from gate16/up16 accumulator groups
+         3. Optional Quant: When c_dtype is Float4E2M1FN, generates SFC and quantizes output
+ 
+         Data loading:
+         - A and SFA are loaded using CpAsync instructions with token-based gather
+         - B and SFB are loaded using TMA instructions with multicast
+-        - B weights are interleaved: [up_0:64, gate_64:128, up_128:192, gate_192:256, ...]
++        - FC1 B and SFB both use gate16/up16 N order
+ 
+         Execution steps:
+         1. Setup static attributes before smem/grid computation
+@@ -1566,7 +1992,7 @@ def __call__(
+ 
+         :param fc1_a: FC1 input A (MxKx1), gathered with the shared route mapping
+         :type fc1_a: cute.Tensor
+-        :param fc1_b: FC1 expert weight B (NxKxL), interleaved for SwiGLU
++        :param fc1_b: FC1 expert weight B (NxKxL), in gate16/up16 N order
+         :type fc1_b: cute.Tensor
+         :param fc1_c: Quantized FC1 SwiGLU output and FC2 input (Mx(N/2)x1)
+         :type fc1_c: cute.Tensor
+@@ -1754,7 +2180,9 @@ def __call__(
+         fc1_b_op = sm100_utils.cluster_shape_to_tma_atom_B(
+             self.cluster_shape_mn, tiled_mma.thr_id
+         )
+-        b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, None, 0))
++        b_smem_layout = cute.slice_(
++            self.fc1_b_smem_layout_staged, (None, None, None, 0)
++        )
+         tma_atom_fc1_b, tma_tensor_fc1_b = cute.nvgpu.make_tiled_tma_atom_B(
+             fc1_b_op,
+             fc1_b,
+@@ -1769,7 +2197,7 @@ def __call__(
+             self.cluster_shape_mn, tiled_mma.thr_id
+         )
+         sfb_smem_layout = cute.slice_(
+-            self.sfb_smem_layout_staged, (None, None, None, 0)
++            self.fc1_sfb_smem_layout_staged, (None, None, None, 0)
+         )
+         tma_atom_fc1_sfb, tma_tensor_fc1_sfb = cute.nvgpu.make_tiled_tma_atom_B(
+             fc1_sfb_op,
+@@ -1844,8 +2272,10 @@ def __call__(
+             self.cluster_shape_mn, tiled_mma.thr_id
+         )
+         fc2_b_smem_layout = cute.select(
+-            self.b_smem_layout_staged,
+-            mode=list(range(cute.rank(self.b_smem_layout_staged) - 1)),
++            self.fc2_b_smem_layout_staged,
++            mode=list(
++                range(cute.rank(self.fc2_b_smem_layout_staged) - 1)
++            ),
+         )
+         tma_atom_fc2_b, tma_tensor_fc2_b = cute.nvgpu.make_tiled_tma_atom_B(
+             fc2_b_op,
+@@ -1859,7 +2289,7 @@ def __call__(
+             self.cluster_shape_mn, tiled_mma.thr_id
+         )
+         fc2_sfb_smem_layout = cute.slice_(
+-            self.sfb_smem_layout_staged, (None, None, None, 0)
++            self.fc2_sfb_smem_layout_staged, (None, None, None, 0)
+         )
+         tma_atom_fc2_sfb, tma_tensor_fc2_sfb = cute.nvgpu.make_tiled_tma_atom_B(
+             fc2_sfb_op,
+@@ -1971,14 +2401,18 @@ class SharedStorageCpasync1cta:
+             ]
+             # cpasync mode: A and B use separate pipelines (CpAsync A is
+             # CpAsync type, B is TmaUmma type — they can't share one mbar).
+-            # Each mbar set holds num_ab_stage * 2 (full + empty per stage).
+-            fc1_a_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
+-            fc1_b_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
++            # Each mbar set holds two barriers (full + empty) per phase stage.
++            fc1_a_mbar_ptr: cute.struct.MemRange[
++                cutlass.Int64, self.fc1_num_ab_stage * 2
++            ]
++            fc1_b_mbar_ptr: cute.struct.MemRange[
++                cutlass.Int64, self.fc1_num_ab_stage * 2
++            ]
+             fc2_a_mbar_ptr: cute.struct.MemRange[
+-                cutlass.Int64, self.num_ab_stage * 2
++                cutlass.Int64, self.fc2_num_ab_stage * 2
+             ]
+             fc2_b_mbar_ptr: cute.struct.MemRange[
+-                cutlass.Int64, self.num_ab_stage * 2
++                cutlass.Int64, self.fc2_num_ab_stage * 2
+             ]
+             acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage * 2]
+             tile_info_mbar_ptr: cute.struct.MemRange[
+@@ -2018,21 +2452,9 @@ class SharedStorageCpasync1cta:
+                 cute.struct.MemRange[self.sf_dtype, self.sfa_smem_alloc_bytes],
+                 self.buffer_align_bytes,
+             ]
+-            sA: cute.struct.Align[
++            sMainloop: cute.struct.Align[
+                 cute.struct.MemRange[
+-                    self.a_dtype, cute.cosize(self.a_smem_layout_staged.outer)
+-                ],
+-                self.buffer_align_bytes,
+-            ]
+-            sB: cute.struct.Align[
+-                cute.struct.MemRange[
+-                    self.b_dtype, cute.cosize(self.b_smem_layout_staged.outer)
+-                ],
+-                self.buffer_align_bytes,
+-            ]
+-            sSFB: cute.struct.Align[
+-                cute.struct.MemRange[
+-                    self.sf_dtype, cute.cosize(self.sfb_smem_layout_staged)
++                    cutlass.Uint8, self.mainloop_smem_alloc_bytes
+                 ],
+                 self.buffer_align_bytes,
+             ]
+@@ -2056,16 +2478,20 @@ class SharedStorageCpasync2cta:
+                 cute.struct.MemRange[cutlass.Int32, 6 * self.num_tile_stage],
+                 1,
+             ]
+-            fc1_a_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
+-            fc1_b_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
++            fc1_a_mbar_ptr: cute.struct.MemRange[
++                cutlass.Int64, self.fc1_num_ab_stage * 2
++            ]
++            fc1_b_mbar_ptr: cute.struct.MemRange[
++                cutlass.Int64, self.fc1_num_ab_stage * 2
++            ]
+             fc1_a_sync_transform_mbar_ptr: cute.struct.MemRange[
+-                cutlass.Int64, self.num_ab_stage * 2
++                cutlass.Int64, self.fc1_num_ab_stage * 2
+             ]
+             fc2_a_mbar_ptr: cute.struct.MemRange[
+-                cutlass.Int64, self.num_ab_stage * 2
++                cutlass.Int64, self.fc2_num_ab_stage * 2
+             ]
+             fc2_b_mbar_ptr: cute.struct.MemRange[
+-                cutlass.Int64, self.num_ab_stage * 2
++                cutlass.Int64, self.fc2_num_ab_stage * 2
+             ]
+             acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage * 2]
+             tile_info_mbar_ptr: cute.struct.MemRange[
+@@ -2102,21 +2528,9 @@ class SharedStorageCpasync2cta:
+                 cute.struct.MemRange[self.sf_dtype, self.sfa_smem_alloc_bytes],
+                 self.buffer_align_bytes,
+             ]
+-            sA: cute.struct.Align[
+-                cute.struct.MemRange[
+-                    self.a_dtype, cute.cosize(self.a_smem_layout_staged.outer)
+-                ],
+-                self.buffer_align_bytes,
+-            ]
+-            sB: cute.struct.Align[
++            sMainloop: cute.struct.Align[
+                 cute.struct.MemRange[
+-                    self.b_dtype, cute.cosize(self.b_smem_layout_staged.outer)
+-                ],
+-                self.buffer_align_bytes,
+-            ]
+-            sSFB: cute.struct.Align[
+-                cute.struct.MemRange[
+-                    self.sf_dtype, cute.cosize(self.sfb_smem_layout_staged)
++                    cutlass.Uint8, self.mainloop_smem_alloc_bytes
+                 ],
+                 self.buffer_align_bytes,
+             ]
+@@ -2174,10 +2588,12 @@ class SharedStorageCpasync2cta:
+             self.cluster_layout_vmnk,
+             self.cluster_layout_sfb_vmnk,
+             self.a_smem_layout_staged,
+-            self.b_smem_layout_staged,
++            self.fc1_b_smem_layout_staged,
++            self.fc2_b_smem_layout_staged,
+             self.fc1_sfa_smem_layout_staged,
+             self.fc2_sfa_smem_layout_staged,
+-            self.sfb_smem_layout_staged,
++            self.fc1_sfb_smem_layout_staged,
++            self.fc2_sfb_smem_layout_staged,
+             self.tCtFC1SFA_layout,
+             self.tCtFC2SFA_layout,
+             self.tCtSFB_layout,
+@@ -2240,10 +2656,12 @@ def kernel(
+         cluster_layout_vmnk: cute.Layout,
+         cluster_layout_sfb_vmnk: cute.Layout,
+         a_smem_layout_staged: cute.ComposedLayout,
+-        b_smem_layout_staged: cute.ComposedLayout,
++        fc1_b_smem_layout_staged: cute.ComposedLayout,
++        fc2_b_smem_layout_staged: cute.ComposedLayout,
+         fc1_sfa_smem_layout_staged: cute.Layout,
+         fc2_sfa_smem_layout_staged: cute.Layout,
+-        sfb_smem_layout_staged: cute.Layout,
++        fc1_sfb_smem_layout_staged: cute.Layout,
++        fc2_sfb_smem_layout_staged: cute.Layout,
+         tCtFC1SFA_layout: cute.Layout,
+         tCtFC2SFA_layout: cute.Layout,
+         tCtSFB_layout: cute.Layout,
+@@ -2317,7 +2735,7 @@ def kernel(
+         )
+         fc1_a_pipeline = PipelineCpAsyncUmma.create(
+             barrier_storage=storage.fc1_a_mbar_ptr.data_ptr(),
+-            num_stages=self.num_ab_stage,
++            num_stages=self.fc1_num_ab_stage,
+             producer_group=fc1_a_pipeline_producer_group,
+             consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+             cta_layout_vmnk=cluster_layout_vmnk,
+@@ -2331,7 +2749,7 @@ def kernel(
+             )
+             fc1_a_sync_transform_pipeline = pipeline.PipelineAsyncUmma.create(
+                 barrier_storage=storage.fc1_a_sync_transform_mbar_ptr.data_ptr(),
+-                num_stages=self.num_ab_stage,
++                num_stages=self.fc1_num_ab_stage,
+                 producer_group=fc1_a_sync_transform_pipeline_producer_group,
+                 consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+                 cta_layout_vmnk=cluster_layout_vmnk,
+@@ -2345,7 +2763,7 @@ def kernel(
+         )
+         fc1_b_pipeline = pipeline.PipelineTmaUmma.create(
+             barrier_storage=storage.fc1_b_mbar_ptr.data_ptr(),
+-            num_stages=self.num_ab_stage,
++            num_stages=self.fc1_num_ab_stage,
+             producer_group=fc1_b_pipeline_producer_group,
+             consumer_group=fc1_b_pipeline_consumer_group,
+             tx_count=self.fc1_b_tma_load_bytes,
+@@ -2356,7 +2774,7 @@ def kernel(
+ 
+         fc2_a_pipeline = pipeline.PipelineTmaUmma.create(
+             barrier_storage=storage.fc2_a_mbar_ptr.data_ptr(),
+-            num_stages=self.num_ab_stage,
++            num_stages=self.fc2_num_ab_stage,
+             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+             consumer_group=pipeline.CooperativeGroup(
+                 pipeline.Agent.Thread, self.num_mcast_ctas_a
+@@ -2368,7 +2786,7 @@ def kernel(
+         )
+         fc2_b_pipeline = pipeline.PipelineTmaUmma.create(
+             barrier_storage=storage.fc2_b_mbar_ptr.data_ptr(),
+-            num_stages=self.num_ab_stage,
++            num_stages=self.fc2_num_ab_stage,
+             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+             consumer_group=pipeline.CooperativeGroup(
+                 pipeline.Agent.Thread, self.num_mcast_ctas_b
+@@ -2499,17 +2917,48 @@ def kernel(
+             ),
+             fc1_c_smem_layout_staged.outer,
+         )
++        sMainloopBytes = storage.sMainloop.get_tensor(
++            cute.make_layout((self.mainloop_smem_alloc_bytes,))
++        )
++        fc2_c_smem_ptr = sEpilogueBytes.iterator
++        if cutlass.const_expr(self.overlay_fc2_c_on_fc1_ab_tail):
++            # No additional hand-off barrier is required. Both FC2 operand
++            # producers execute the corresponding FC1 ``producer_tail`` before
++            # publishing their first FC2 stage. FC2 MMA therefore cannot make
++            # an accumulator available to this epilogue until every aliased
++            # FC1 operand stage has been released by its consumer.
++            fc2_c_smem_ptr = (
++                sMainloopBytes.iterator + self.fc2_c_smem_offset_bytes
++            )
+         sFC2C = cute.make_tensor(
+-            cute.recast_ptr(sEpilogueBytes.iterator, dtype=self.fc2_c_dtype),
++            cute.recast_ptr(fc2_c_smem_ptr, dtype=self.fc2_c_dtype),
+             fc2_c_smem_layout_staged,
+         )
+         # (MMA, MMA_M, MMA_K, STAGE)
+-        sA = storage.sA.get_tensor(
+-            a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner
++        sA = cute.make_tensor(
++            cute.recast_ptr(
++                sMainloopBytes.iterator + self.a_smem_offset_bytes,
++                a_smem_layout_staged.inner,
++                dtype=self.a_dtype,
++            ),
++            a_smem_layout_staged.outer,
+         )
+         # (MMA, MMA_N, MMA_K, STAGE)
+-        sB = storage.sB.get_tensor(
+-            b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner
++        sFC1B = cute.make_tensor(
++            cute.recast_ptr(
++                sMainloopBytes.iterator + self.fc1_b_smem_offset_bytes,
++                fc1_b_smem_layout_staged.inner,
++                dtype=self.b_dtype,
++            ),
++            fc1_b_smem_layout_staged.outer,
++        )
++        sFC2B = cute.make_tensor(
++            cute.recast_ptr(
++                sMainloopBytes.iterator + self.fc2_b_smem_offset_bytes,
++                fc2_b_smem_layout_staged.inner,
++                dtype=self.b_dtype,
++            ),
++            fc2_b_smem_layout_staged.outer,
+         )
+         # SFA SMEM (linear+pad layout for the cp.async gather).
+         sFC1SFA = storage.sSFAStorage.get_tensor(fc1_sfa_smem_layout_staged)
+@@ -2517,7 +2966,20 @@ def kernel(
+         # layout expected by TMA and the FC2 MMA descriptor.
+         sFC2SFA = storage.sSFAStorage.get_tensor(fc2_sfa_smem_layout_staged)
+         # (granularity_n, repeat_n), (granularity_k, repeat_k), num_scale_stage)
+-        sSFB = storage.sSFB.get_tensor(sfb_smem_layout_staged)
++        sFC1SFB = cute.make_tensor(
++            cute.recast_ptr(
++                sMainloopBytes.iterator + self.fc1_sfb_smem_offset_bytes,
++                dtype=self.sf_dtype,
++            ),
++            fc1_sfb_smem_layout_staged,
++        )
++        sFC2SFB = cute.make_tensor(
++            cute.recast_ptr(
++                sMainloopBytes.iterator + self.fc2_sfb_smem_offset_bytes,
++                dtype=self.sf_dtype,
++            ),
++            fc2_sfb_smem_layout_staged,
++        )
+         # (bidx, bidy, bidz, valid, mn_limit)
+         # (m_tile, n_tile, expert, valid, mn_limit, phase)
+         info_layout = cute.make_layout((6, self.num_tile_stage), stride=(1, 6))
+@@ -2652,7 +3114,7 @@ def kernel(
+             tma_atom_fc1_b,
+             block_in_cluster_coord_vmnk[1],
+             b_cta_layout,
+-            cute.group_modes(sB, 0, 3),
++            cute.group_modes(sFC1B, 0, 3),
+             cute.group_modes(tCgFC1B, 0, 3),
+         )
+ 
+@@ -2666,7 +3128,7 @@ def kernel(
+             tma_atom_fc1_sfb,
+             block_in_cluster_coord_sfb_vmnk[1],
+             sfb_cta_layout,
+-            cute.group_modes(sSFB, 0, 3),
++            cute.group_modes(sFC1SFB, 0, 3),
+             cute.group_modes(tCgFC1SFB, 0, 3),
+         )
+         tFC1BsSFB = cute.filter_zeros(tFC1BsSFB)
+@@ -2695,14 +3157,14 @@ def kernel(
+             tma_atom_fc2_b,
+             block_in_cluster_coord_vmnk[1],
+             b_cta_layout,
+-            cute.group_modes(sB, 0, 3),
++            cute.group_modes(sFC2B, 0, 3),
+             cute.group_modes(tCgFC2B, 0, 3),
+         )
+         tFC2BsSFB, tFC2BgSFB = cute.nvgpu.cpasync.tma_partition(
+             tma_atom_fc2_sfb,
+             block_in_cluster_coord_sfb_vmnk[1],
+             sfb_cta_layout,
+-            cute.group_modes(sSFB, 0, 3),
++            cute.group_modes(sFC2SFB, 0, 3),
+             cute.group_modes(tCgFC2SFB, 0, 3),
+         )
+         tFC2BsSFB = cute.filter_zeros(tFC2BsSFB)
+@@ -2714,7 +3176,8 @@ def kernel(
+         # (MMA, MMA_M, MMA_K, STAGE)
+         tCrA = tiled_mma.make_fragment_A(sA)
+         # (MMA, MMA_N, MMA_K, STAGE)
+-        tCrB = tiled_mma.make_fragment_B(sB)
++        tCrFC1B = tiled_mma.make_fragment_B(sFC1B)
++        tCrFC2B = tiled_mma.make_fragment_B(sFC2B)
+         # (MMA, MMA_M, MMA_N)
+         acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
+         # (MMA, MMA_M, MMA_N, STAGE)
+@@ -2991,12 +3454,12 @@ def kernel(
+                     (
+                         self.cta_tile_shape_mnk[0],
+                         self.cta_tile_shape_mnk[2],
+-                        self.num_ab_stage,
++                        self.fc1_num_ab_stage,
+                     ),
+                     stride=(
+                         self.cta_tile_shape_mnk[2],
+                         1,
+-                        self.cta_tile_shape_mnk[0] * self.cta_tile_shape_mnk[2],
++                        self.a_smem_bytes_per_stage * 8 // self.a_dtype.width,
+                     ),
+                 ),
+             )
+@@ -3033,7 +3496,7 @@ def kernel(
+                     (
+                         self.cta_tile_shape_mnk[0],
+                         sfa_tile_k_sf,
+-                        self.num_ab_stage,
++                        self.fc1_num_ab_stage,
+                     ),
+                     stride=(
+                         sfa_tile_k_sf,
+@@ -3044,7 +3507,7 @@ def kernel(
+             )
+ 
+             fc1_a_producer_state = pipeline.make_pipeline_state(
+-                pipeline.PipelineUserType.Producer, self.num_ab_stage
++                pipeline.PipelineUserType.Producer, self.fc1_num_ab_stage
+             )
+             tile_info_consumer_state = pipeline.make_pipeline_state(
+                 pipeline.PipelineUserType.Consumer, self.num_tile_stage
+@@ -3195,7 +3658,7 @@ def kernel(
+             fc1_a_pipeline.producer_tail(fc1_a_producer_state)
+ 
+             fc2_a_producer_state = pipeline.make_pipeline_state(
+-                pipeline.PipelineUserType.Producer, self.num_ab_stage
++                pipeline.PipelineUserType.Producer, self.fc2_num_ab_stage
+             )
+ 
+             # The descriptor that ended the FC1 loop is either the first
+@@ -3305,10 +3768,10 @@ def kernel(
+ 
+             if cutlass.const_expr(self.use_2cta_instrs):
+                 fc1_a_consumer_state = pipeline.make_pipeline_state(
+-                    pipeline.PipelineUserType.Consumer, self.num_ab_stage
++                    pipeline.PipelineUserType.Consumer, self.fc1_num_ab_stage
+                 )
+                 a_sync_transform_producer_state = pipeline.make_pipeline_state(
+-                    pipeline.PipelineUserType.Producer, self.num_ab_stage
++                    pipeline.PipelineUserType.Producer, self.fc1_num_ab_stage
+                 )
+                 is_valid_fc1_tile = (tile_info[3] == 1) and (
+                     tile_info[5] == FC1_PHASE
+@@ -3427,7 +3890,7 @@ def kernel(
+         # TMA B/SFB load warp (warp 9). Loads B/SFB GMEM → SMEM with multicast.
+         if warp_idx == self.tma_b_warp_id:
+             fc1_b_producer_state = pipeline.make_pipeline_state(
+-                pipeline.PipelineUserType.Producer, self.num_ab_stage
++                pipeline.PipelineUserType.Producer, self.fc1_num_ab_stage
+             )
+ 
+             tile_info_consumer_state = pipeline.make_pipeline_state(
+@@ -3567,7 +4030,7 @@ def kernel(
+ 
+             fc1_b_pipeline.producer_tail(fc1_b_producer_state)
+             fc2_b_producer_state = pipeline.make_pipeline_state(
+-                pipeline.PipelineUserType.Producer, self.num_ab_stage
++                pipeline.PipelineUserType.Producer, self.fc2_num_ab_stage
+             )
+             is_valid_fc2_tile = tile_info[3] == 1
+             while is_valid_fc2_tile:
+@@ -3698,17 +4161,22 @@ def kernel(
+             fc2_sfa_s2t_bundle = self._mainloop_s2t_copy_and_partition(
+                 sFC2SFA, tCtFC2SFA
+             )
+-            sfb_s2t_bundle = self._mainloop_s2t_copy_and_partition(sSFB, tCtSFB)
++            fc1_sfb_s2t_bundle = self._mainloop_s2t_copy_and_partition(
++                sFC1SFB, tCtSFB
++            )
++            fc2_sfb_s2t_bundle = self._mainloop_s2t_copy_and_partition(
++                sFC2SFB, tCtSFB
++            )
+ 
+             fc1_a_consumer_state = pipeline.make_pipeline_state(
+-                pipeline.PipelineUserType.Consumer, self.num_ab_stage
++                pipeline.PipelineUserType.Consumer, self.fc1_num_ab_stage
+             )
+             fc1_b_consumer_state = pipeline.make_pipeline_state(
+-                pipeline.PipelineUserType.Consumer, self.num_ab_stage
++                pipeline.PipelineUserType.Consumer, self.fc1_num_ab_stage
+             )
+             if cutlass.const_expr(self.use_2cta_instrs):
+                 a_sync_transform_consumer_state = pipeline.make_pipeline_state(
+-                    pipeline.PipelineUserType.Consumer, self.num_ab_stage
++                    pipeline.PipelineUserType.Consumer, self.fc1_num_ab_stage
+                 )
+             acc_producer_state = pipeline.make_pipeline_state(
+                 pipeline.PipelineUserType.Producer, self.num_acc_stage
+@@ -3852,7 +4320,9 @@ def kernel(
+                             sfa_s2t_bundle.sSF_compact[sfa_s2t_stage_coord],
+                             sfa_s2t_bundle.tSF_compact,
+                         )
+-                        self._mainloop_s2t_copies(b_stage_idx, sfb_s2t_bundle)
++                        self._mainloop_s2t_copies(
++                            b_stage_idx, fc1_sfb_s2t_bundle
++                        )
+ 
+                         num_kblocks = cute.size(tCrA, mode=[2])
+ 
+@@ -3885,7 +4355,10 @@ def kernel(
+                                         tCrA[a_kblk_crd_keep],
+                                         tCtFC1SFA[sfa_kblk_crd_keep],
+                                     ],
+-                                    [tCrB[b_kblk_crd], tCtSFB_mma[sfb_kblk_crd]],
++                                    [
++                                        tCrFC1B[b_kblk_crd],
++                                        tCtSFB_mma[sfb_kblk_crd],
++                                    ],
+                                     tCtAcc_bkeep,
+                                 )
+                                 # Breuse
+@@ -3900,7 +4373,10 @@ def kernel(
+                                         tCrA[a_kblk_crd_reuse],
+                                         tCtFC1SFA[sfa_kblk_crd_reuse],
+                                     ],
+-                                    [tCrB[b_kblk_crd], tCtSFB_mma[sfb_kblk_crd]],
++                                    [
++                                        tCrFC1B[b_kblk_crd],
++                                        tCtSFB_mma[sfb_kblk_crd],
++                                    ],
+                                     tCtAcc_breuse,
+                                 )
+                             else:
+@@ -3914,7 +4390,7 @@ def kernel(
+                                     acc_frag=tCtAcc,
+                                     a_frag=tCrA[a_kblock_coord],
+                                     sfa_frag=tCtFC1SFA_mma[sf_kblock_coord],
+-                                    b_frag=tCrB[b_kblock_coord],
++                                    b_frag=tCrFC1B[b_kblock_coord],
+                                     sfb_frag=tCtSFB_mma[sf_kblock_coord],
+                                     static_idesc_base=self.static_idesc_base,
+                                     accumulate=(k_tile != 0 or kblock_idx != 0),
+@@ -3988,10 +4464,10 @@ def kernel(
+ 
+             acc_pipeline.producer_tail(acc_producer_state)
+             fc2_a_consumer_state = pipeline.make_pipeline_state(
+-                pipeline.PipelineUserType.Consumer, self.num_ab_stage
++                pipeline.PipelineUserType.Consumer, self.fc2_num_ab_stage
+             )
+             fc2_b_consumer_state = pipeline.make_pipeline_state(
+-                pipeline.PipelineUserType.Consumer, self.num_ab_stage
++                pipeline.PipelineUserType.Consumer, self.fc2_num_ab_stage
+             )
+             is_valid_fc2_tile = tile_info[3] == 1
+             while is_valid_fc2_tile:
+@@ -4042,7 +4518,7 @@ def kernel(
+                             fc2_sfa_s2t_bundle.tSF_compact,
+                         )
+                         self._mainloop_s2t_copies(
+-                            b_stage_idx, sfb_s2t_bundle
++                            b_stage_idx, fc2_sfb_s2t_bundle
+                         )
+ 
+                         num_kblocks = cute.size(tCrA, mode=[2])
+@@ -4075,7 +4551,7 @@ def kernel(
+                                     tCtFC2SFA[sf_kblock_coord],
+                                 ],
+                                 [
+-                                    tCrB[b_kblock_coord],
++                                    tCrFC2B[b_kblock_coord],
+                                     tCtSFB[sf_kblock_coord],
+                                 ],
+                                 tCtAcc,
+@@ -4143,8 +4619,8 @@ def kernel(
+             (
+                 tiled_copy_t2r,
+                 tFC1TR_tAcc_base,
+-                tFC1TR_rAcc_up,
+-                tFC1TR_rAcc_gate,
++                tFC1TR_rPackedLo,
++                tFC1TR_rPackedHi,
+             ) = self.fc1_epilogue_tmem_copy_and_partition(
+                 epi_tidx,
+                 tCtAcc_transformed,
+@@ -4183,7 +4659,9 @@ def kernel(
+             tFC1RS_sC = None
+             bSG_sC = None
+             bSG_gC_partitioned = None
+-            tFC1TR_rC = cute.make_rmem_tensor(tFC1TR_rAcc_up.shape, self.fc1_c_dtype)
++            # One logical output fragment has the same shape as one packed
++            # load fragment: two packed chunks become gate/up, then one C.
++            tFC1TR_rC = cute.make_rmem_tensor(tFC1TR_rPackedLo.shape, self.fc1_c_dtype)
+             tiled_copy_r2s, tFC1RS_rC, tFC1RS_sC = (
+                 self.fc1_epilogue_smem_copy_and_partition(
+                     tiled_copy_t2r, tFC1TR_rC, epi_tidx, sFC1C
+@@ -4313,44 +4791,52 @@ def kernel(
+                 #
+                 acc_pipeline.consumer_wait(acc_consumer_state)
+ 
+-                # SwiGLU epilogue. Acc has full N cols with interleaved
+-                # [up, gate] at granularity=64; C has N/2 cols. Iterate M and
+-                # N output subtiles → up * silu(gate).
++                # Each N64 output subtile consumes two consecutive N64
++                # accumulator chunks, each [gate16, up16, gate16, up16].
+                 # tFC1TR_tAcc: (T2R, T2R_M, T2R_N, EPI_M, EPI_N,
+                 # STAGE), sliced on STAGE. bSG_gC: ((ATOM_V, REST_V),
+                 # EPI_M, EPI_N, loopM, loopN, loopL).
+-                interleave_granularity = 64
+-                gate_offset = interleave_granularity // self.fc1_epi_tile_n
+                 epi_m_cnt = cute.size(tFC1TR_tAcc.shape, mode=[3])
+-                acc_n_subtile_cnt = cute.size(tFC1TR_tAcc.shape, mode=[4])
+-                out_n_subtile_cnt = (
+-                    acc_n_subtile_cnt // 2
+-                )  # N/2 output subtiles per M subtile
++                packed_n_chunk_cnt = cute.size(tFC1TR_tAcc.shape, mode=[4])
++                out_n_subtile_cnt = packed_n_chunk_cnt // 2
+ 
+                 for epi_m_idx in cutlass.range(epi_m_cnt):
+                     for out_n_idx in cutlass.range(out_n_subtile_cnt):
+-                        # Map output N subtile → acc N subtile. Each
+-                        # interleave block of 2*gate_offset subtiles is
+-                        # [up*gate_offset, gate*gate_offset].
+-                        real_out_n_idx = out_n_idx
+-                        block_idx = real_out_n_idx // gate_offset
+-                        within_block = real_out_n_idx % gate_offset
+-                        up_n_subtile = block_idx * 2 * gate_offset + within_block
+-                        gate_n_subtile = (
+-                            block_idx * 2 * gate_offset + gate_offset + within_block
+-                        )
+-                        #
+-                        # Load accumulator from tensor memory buffer to register
+-                        #
+-                        tFC1TR_tAcc_mn_up = tFC1TR_tAcc[
+-                            (None, None, None, epi_m_idx, up_n_subtile)
++                        # N128 has one output subtile; N256 has two. Each
++                        # reads consecutive low/high halves of its N128 input.
++                        tFC1TR_tAcc_mn_lo = tFC1TR_tAcc[
++                            (None, None, None, epi_m_idx, 2 * out_n_idx)
+                         ]
+-                        tFC1TR_tAcc_mn_gate = tFC1TR_tAcc[
+-                            (None, None, None, epi_m_idx, gate_n_subtile)
++                        tFC1TR_tAcc_mn_hi = tFC1TR_tAcc[
++                            (None, None, None, epi_m_idx, 2 * out_n_idx + 1)
+                         ]
+ 
+-                        cute.copy(tiled_copy_t2r, tFC1TR_tAcc_mn_up, tFC1TR_rAcc_up)
+-                        cute.copy(tiled_copy_t2r, tFC1TR_tAcc_mn_gate, tFC1TR_rAcc_gate)
++                        cute.copy(tiled_copy_t2r, tFC1TR_tAcc_mn_lo, tFC1TR_rPackedLo)
++                        cute.copy(tiled_copy_t2r, tFC1TR_tAcc_mn_hi, tFC1TR_rPackedHi)
++
++                        # Preserve immutable packed values before reusing the
++                        # two load buffers as logical up64/gate64 destinations.
++                        # These aliases mark the change of meaning; they do
++                        # not allocate another pair of register fragments.
++                        packed_lo = tFC1TR_rPackedLo.load()
++                        packed_hi = tFC1TR_rPackedHi.load()
++                        tFC1TR_rAcc_up = tFC1TR_rPackedLo
++                        tFC1TR_rAcc_gate = tFC1TR_rPackedHi
++                        # Packed axes: (channel within N16, gate/up, group).
++                        # Logical axes: (channel within N16, group, lo/hi).
++                        packed_lo = packed_lo.reshape((16, 2, 2))
++                        packed_hi = packed_hi.reshape((16, 2, 2))
++                        gate_up_layout = cute.make_layout((16, 2, 2))
++                        gate = cute.make_tensor(
++                            tFC1TR_rAcc_gate.iterator, gate_up_layout
++                        )
++                        up = cute.make_tensor(
++                            tFC1TR_rAcc_up.iterator, gate_up_layout
++                        )
++                        gate[None, None, 0].store(packed_lo[None, 0, None])
++                        gate[None, None, 1].store(packed_hi[None, 0, None])
++                        up[None, None, 0].store(packed_lo[None, 1, None])
++                        up[None, None, 1].store(packed_hi[None, 1, None])
+ 
+                         acc_vec_up = tFC1TR_rAcc_up.load()
+                         acc_vec_gate = tFC1TR_rAcc_gate.load()
+@@ -4460,7 +4946,7 @@ def kernel(
+                             sfc_subtile_idx_mn = (
+                                 tile_info[0] * self.fc1_epi_tile_cnt[0] + epi_m_idx,
+                                 tile_info[1] * self.fc1_epi_tile_cnt[1]
+-                                + real_out_n_idx,
++                                + out_n_idx,
+                             )
+                             tCgFC1SFC = tCgFC1SFC_mn[
+                                 (
+@@ -4623,7 +5109,7 @@ def kernel(
+                             cute.copy(
+                                 tma_atom_fc1_c,
+                                 bSG_sC[(None, c_buffer)],
+-                                bSG_gC[(None, epi_m_idx, real_out_n_idx)],
++                                bSG_gC[(None, epi_m_idx, out_n_idx)],
+                             )
+                             # Fence and barrier to make sure shared memory store is visible to TMA store
+                             fc1_c_pipeline.producer_commit()
+@@ -4841,8 +5327,11 @@ def fc1_epilogue_tmem_copy_and_partition(
+         use_2cta_instrs: Union[cutlass.Boolean, bool],
+     ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor, cute.Tensor]:
+         """
+-        Make tiledCopy for tensor memory load, then use it to partition tensor memory
+-        (source) and register array (destination).
++        Partition packed gate16/up16 TMEM into N64 load chunks.
++
++        A pair of chunks supplies one logical N64 output subtile. Neither
++        load destination is a gate-only or up-only fragment. The epilogue
++        decodes the packed values into logical gate/up before SwiGLU.
+ 
+         :param tidx: The thread index in epilogue warp groups
+         :type tidx: cutlass.Int32
+@@ -4856,11 +5345,11 @@ def fc1_epilogue_tmem_copy_and_partition(
+         :type use_2cta_instrs: bool
+ 
+         :return: A tuple containing tiled_copy_t2r, tFC1TR_tAcc,
+-            tFC1TR_rAcc_up, and tFC1TR_rAcc_gate, where:
++            tFC1TR_rPackedLo, and tFC1TR_rPackedHi, where:
+             - tiled_copy_t2r: The tiled copy operation for tmem to register copy(t2r)
+             - tFC1TR_tAcc: The partitioned accumulator tensor
+-            - tFC1TR_rAcc_up: The partitioned accumulator tensor for acc up
+-            - tFC1TR_rAcc_gate: The partitioned accumulator tensor for acc gate
++            - tFC1TR_rPackedLo: First packed N64 chunk of an N128 input subtile
++            - tFC1TR_rPackedHi: Second packed N64 chunk of that input subtile
+         :rtype: Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor, cute.Tensor]
+         """
+         # Make tiledCopy for tensor memory load (Rubin uses transformed layout)
+@@ -4896,14 +5385,14 @@ def fc1_epilogue_tmem_copy_and_partition(
+         tFC1TR_gC = thr_copy_t2r.partition_D(gFC1C_mnl_epi)
+ 
+         # (T2R, T2R_M, T2R_N)
+-        tFC1TR_rAcc_up = cute.make_rmem_tensor(
++        tFC1TR_rPackedLo = cute.make_rmem_tensor(
+             tFC1TR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, self.acc_dtype
+         )
+         # (T2R, T2R_M, T2R_N)
+-        tFC1TR_rAcc_gate = cute.make_rmem_tensor(
++        tFC1TR_rPackedHi = cute.make_rmem_tensor(
+             tFC1TR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, self.acc_dtype
+         )
+-        return tiled_copy_t2r, tFC1TR_tAcc, tFC1TR_rAcc_up, tFC1TR_rAcc_gate
++        return tiled_copy_t2r, tFC1TR_tAcc, tFC1TR_rPackedLo, tFC1TR_rPackedHi
+ 
+     def fc1_epilogue_smem_copy_and_partition(
+         self,
+@@ -5010,7 +5499,15 @@ def _compute_stages(
+         fc2_num_meta_stage: int,
+         buffer_align_bytes: int,
+         mma_cta_group_size: int,
+-    ) -> Tuple[int, int, int, int]:
++    ) -> Tuple[
++        int,
++        int,
++        int,
++        int,
++        int,
++        bool,
++        SeparatePhaseSmemStageBytes,
++    ]:
+         """Computes the number of stages for A/B/C operands based on heuristics.
+ 
+         :param tiled_mma: The tiled MMA object defining the core computation.
+@@ -5048,9 +5545,12 @@ def _compute_stages(
+         :param mma_cta_group_size: Number of CTAs participating in one MMA.
+         :type mma_cta_group_size: int
+ 
+-        :return: A tuple containing the computed number of stages for:
+-                 (ACC stages, A/B operand stages, C stages, tile-info stages)
+-        :rtype: tuple[int, int, int, int]
++        :return: A tuple containing the computed stage configuration:
++                 (ACC stages, FC1 AB stages, FC2 AB stages, FC1 C stages,
++                 tile-info stages, whether FC2 C aliases the FC1 AB tail,
++                 and the byte model used to derive the physical layout)
++        :rtype: tuple[int, int, int, int, int, bool,
++                      SeparatePhaseSmemStageBytes]
+         """
+         # Default ACC stages
+         num_acc_stage = 1 if (with_breuse and mma_tiler_mnk[1] in {192, 256}) else 2
+@@ -5173,14 +5673,50 @@ def _compute_stages(
+             header_per_ab_stage=header_per_ab_stage,
+             alignment=buffer_align_bytes,
+         )
+-        selected = select_fused_smem_stages(
++        common_selected = select_fused_smem_stages(
+             capacity=num_smem_capacity // occupancy,
+             preferred_ab=preferred_num_ab_stage,
+             preferred_fc1_c=preferred_fc1_num_c_stage,
+             minimum_fc1_c=fc1_num_c_stage,
+             stage_bytes=stage_bytes,
+         )
+-        return num_acc_stage, selected.ab, selected.fc1_c, num_tile_stage
++        # Preserve the common selector's depth for FC2. FC1 may recover its
++        # standalone depth when its extra stage-major tail can replace the
++        # standalone FC2 C allocation.
++        fc1_header_per_stage = (
++            2 + (mma_cta_group_size - 1)
++        ) * 2 * int64_bytes
++        fc2_header_per_stage = 2 * 2 * int64_bytes
++        separate_stage_bytes = SeparatePhaseSmemStageBytes(
++            a_per_stage=a_bytes_per_stage,
++            b_per_stage=b_bytes_per_stage,
++            sfa_per_stage=sfa_bytes_per_stage_one,
++            sfb_per_stage=sfb_bytes_per_stage,
++            fc1_c_per_stage=fc1_c_bytes_per_stage,
++            fc2_c=fc2_c_smem_bytes,
++            metadata=fc2_metadata_smem_bytes,
++            header_fixed=header_fixed,
++            fc1_header_per_stage=fc1_header_per_stage,
++            fc2_header_per_stage=fc2_header_per_stage,
++            alignment=buffer_align_bytes,
++        )
++        separate_selected = select_separate_phase_smem_stages(
++            capacity=num_smem_capacity // occupancy,
++            preferred_fc1_ab=preferred_num_ab_stage,
++            preferred_fc2_ab=common_selected.ab,
++            preferred_fc1_c=preferred_fc1_num_c_stage,
++            minimum_fc1_c=fc1_num_c_stage,
++            stage_bytes=separate_stage_bytes,
++        )
++        return (
++            num_acc_stage,
++            separate_selected.fc1_ab,
++            separate_selected.fc2_ab,
++            separate_selected.fc1_c,
++            num_tile_stage,
++            separate_selected.overlay_fc2_c,
++            separate_stage_bytes,
++        )
+ 
+     @staticmethod
+     def _compute_tile_sched_params(
+diff --git a/tensorrt_llm/_torch/moe/fused_moe/fused_moe_cute_dsl.py b/tensorrt_llm/_torch/moe/fused_moe/fused_moe_cute_dsl.py
+index 5d5184717384..6ba564f1d77a 100644
+--- a/tensorrt_llm/_torch/moe/fused_moe/fused_moe_cute_dsl.py
++++ b/tensorrt_llm/_torch/moe/fused_moe/fused_moe_cute_dsl.py
+@@ -1308,9 +1308,6 @@ def run_moe_nvfp4_impl(
+         if use_rubin:
+             gather_act_kwargs["output_tensor"] = None
+             gather_act_kwargs["output_sf_tensor"] = None
+-        else:
+-            gather_act_kwargs["activation_type"] = self.activation_type
+-            gather_act_kwargs["swiglu_limit_scalar"] = self.act_clamp
+         gather_act_kwargs["activation_type"] = self.activation_type
+         # ``act_alpha`` / ``act_beta`` are where ``SiTuActivation.constants()``
+         # lands: gate_softcap -> alpha, linear_softcap -> beta, both reduced to
+@@ -1321,6 +1318,11 @@ def run_moe_nvfp4_impl(
+         if self.activation_type == ActivationType.SiTu:
+             gather_act_kwargs["situ_beta"] = self.act_alpha
+             gather_act_kwargs["situ_linear_beta"] = self.act_beta
++        # The clamp is a SwiGLU-only constant: Relu2 layers materialize
++        # act_clamp as +inf, and the kernels reject a finite limit on any
++        # other activation, so only SwiGLU layers forward it.
++        if self.activation_type == ActivationType.Swiglu:
++            gather_act_kwargs["swiglu_limit_scalar"] = self.act_clamp
+ 
+         x, x_sf = gather_act_op(**gather_act_kwargs)
+ 
+@@ -1715,6 +1717,8 @@ def _run_moe_nvfp4_locality_domain(
+             output_sf_tensor=fc1_out_sf,
+             scaling_vector_size=self.scaling_vector_size,
+             activation_type=self.activation_type,
++            swiglu_limit_scalar=(self.act_clamp if self.activation_type
++                                 == ActivationType.Swiglu else float("inf")),
+         )
+ 
+         fc1_out_sf_merged = fc1_out_sf
+diff --git a/tensorrt_llm/_torch/moe/fused_moe/quantization.py b/tensorrt_llm/_torch/moe/fused_moe/quantization.py
+index 5260513ab126..e46e62534d1d 100644
+--- a/tensorrt_llm/_torch/moe/fused_moe/quantization.py
++++ b/tensorrt_llm/_torch/moe/fused_moe/quantization.py
+@@ -274,6 +274,27 @@ def interleave_linear_and_gate(x: torch.Tensor,
+     return x
+ 
+ 
++def interleave_gate_and_linear(x: torch.Tensor,
++                               group_size: int = 16,
++                               dim: int = -1) -> torch.Tensor:
++    """Interleave a ``[linear | gate]`` FC1 tensor into ``[gate, linear]`` groups.
++
++    Same input contract as ``interleave_linear_and_gate`` (the two halves of
++    ``dim`` are the linear/up and gate projections), but every group of
++    ``group_size`` rows leads with the gate half. ``group_size=16`` is the FC1
++    B / block-scale row order the Rubin (SM107) NVFP4 CuTe DSL kernels read.
++    """
++    sizes = x.size()
++    dim = dim % x.dim()
++    assert sizes[dim] % (group_size * 2) == 0
++    prev_sizes = sizes[:dim]
++    post_sizes = sizes[dim + 1:]
++    x = x.view(*prev_sizes, 2, sizes[dim] // (group_size * 2), group_size,
++               *post_sizes)
++    x = x.flip(dim).transpose(dim, dim + 1).contiguous().view(*sizes)
++    return x
++
++
+ class EplbSupportStatus(Enum):
+     """EPLB support status for FusedMoEMethod classes."""
+     SUPPORTED = auto()
+@@ -3672,13 +3693,25 @@ def load_expert_w3_w1_weight(self,
+                                          expert_idx=expert_idx)
+         # CuteDsl interleave deferred to process_weights_after_loading().
+ 
++    @staticmethod
++    def _interleave_fc1_rows(x: torch.Tensor) -> torch.Tensor:
++        """Reorder FC1 rows (dim 0) into the gate/up interleave the fused
++        gather+GEMM+activation kernel of this GPU reads.
++
++        The Rubin (SM107) kernels consume ``[gate16, up16]`` groups; the
++        Blackwell kernels consume ``[up64, gate64]`` groups. Weights and their
++        block scales go through the same permutation.
++        """
++        if get_sm_version() == 107:
++            return interleave_gate_and_linear(x, group_size=16, dim=0)
++        return interleave_linear_and_gate(x, group_size=64, dim=0)
++
+     @staticmethod
+     def _interleave_w3_w1_weight(dst_w3_w1_weight: torch.Tensor):
+         """Interleave FC1 weight for GEMM1 + SwiGLU fusion."""
+         w3_w1_weight = dst_w3_w1_weight.cuda().view(float4_e2m1x2)
+-        w3_w1_weight_interleaved = interleave_linear_and_gate(w3_w1_weight,
+-                                                              group_size=64,
+-                                                              dim=0)
++        w3_w1_weight_interleaved = (
++            NVFP4CuteDslFusedMoEMethod._interleave_fc1_rows(w3_w1_weight))
+         dst_w3_w1_weight.copy_(
+             w3_w1_weight_interleaved.view(dst_w3_w1_weight.dtype))
+ 
+@@ -3711,8 +3744,8 @@ def _interleave_w3_w1_weight_scale_cute_dsl(
+         w3_w1_weight_scale = dst_w3_w1_weight_scale.cuda().view(float4_sf_dtype)
+         w3_w1_weight_scale_unswizzled = unswizzle_sf(
+             w3_w1_weight_scale, n, k).view(n, k // module.scaling_vector_size)
+-        w3_w1_weight_scale_unswizzled_interleaved = interleave_linear_and_gate(
+-            w3_w1_weight_scale_unswizzled, group_size=64, dim=0)
++        w3_w1_weight_scale_unswizzled_interleaved = self._interleave_fc1_rows(
++            w3_w1_weight_scale_unswizzled)
+         w3_w1_weight_scale_interleaved = swizzle_sf(
+             w3_w1_weight_scale_unswizzled_interleaved, n,
+             k).view(n, k // module.scaling_vector_size)
+diff --git a/tests/integration/test_lists/test-db/l0_b200.yml b/tests/integration/test_lists/test-db/l0_b200.yml
+index 6d5edcb10f32..420dc1593f3a 100644
+--- a/tests/integration/test_lists/test-db/l0_b200.yml
++++ b/tests/integration/test_lists/test-db/l0_b200.yml
+@@ -162,6 +162,7 @@ l0_b200:
+   - unittest/_torch/modules/tests_lora_modules
+   # ------------- MoE components tests ---------------
+   - unittest/_torch/moe/fused_moe/test_cutedsl_fc2_tuning.py
++  - unittest/_torch/moe/test_cutedsl_fc1_weight_layout.py
+   - unittest/_torch/moe/test_moe_load_balancer.py
+   - unittest/_torch/moe/test_moe_routing.py
+   - unittest/_torch/moe/fused_moe/test_deepgemm_fused_gather_finalize.py
+diff --git a/tests/unittest/_torch/moe/test_cutedsl_fc1_weight_layout.py b/tests/unittest/_torch/moe/test_cutedsl_fc1_weight_layout.py
+new file mode 100644
+index 000000000000..ad897def9779
+--- /dev/null
++++ b/tests/unittest/_torch/moe/test_cutedsl_fc1_weight_layout.py
+@@ -0,0 +1,199 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++"""FC1 gate/up weight interleave contracts of the CuTe DSL MoE weight method.
++
++The Rubin NVFP4 kernels read FC1 B and its block scales in ``[gate16, up16]``
++row groups, the Blackwell kernels in ``[up64, gate64]`` groups. These tests pin
++the helper that produces the Rubin order against the two other places that
++define the same layout (MegaMoE's packing and the kernel author's reference
++permutation), and check that the weight method picks the order by SM and
++applies the identical permutation on the device weights and on the EPLB host
++mirrors.
++"""
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from tensorrt_llm._torch.moe.fused_moe import quantization as quant_mod
++from tensorrt_llm._torch.moe.fused_moe.quantization import (
++    NVFP4CuteDslFusedMoEMethod,
++    interleave_gate_and_linear,
++    interleave_linear_and_gate,
++)
++from tensorrt_llm._torch.utils import swizzle_sf, unswizzle_sf
++
++# FC1 rows are [up (intermediate) | gate (intermediate)]; K is packed FP4 bytes.
++INTERMEDIATE = 256
++FC1_ROWS = 2 * INTERMEDIATE
++HIDDEN = 512
++SF_VEC = 16
++
++
++def _raw_fc1(num_experts: int = 1, seed: int = 0) -> torch.Tensor:
++    g = torch.Generator().manual_seed(seed)
++    return torch.randint(
++        0, 256, (num_experts, FC1_ROWS, HIDDEN // 2), dtype=torch.uint8, generator=g
++    )
++
++
++def test_gate16_helper_matches_megamoe_inline_packing():
++    raw = _raw_fc1(num_experts=3)
++    ours = interleave_gate_and_linear(raw, group_size=16, dim=1)
++
++    # The MegaMoE weight method packs the same layout inline
++    # (NVFP4MegaMoECuteDslMethod._build_mega_format_buffers): gate and up are
++    # split into 16-row atoms and stacked gate-first.
++    num_slots = raw.shape[0]
++    n_pairs = INTERMEDIATE // 16
++    up_part = raw[:, :INTERMEDIATE, :]
++    gate_part = raw[:, INTERMEDIATE:, :]
++    gate_p = gate_part.reshape(num_slots, n_pairs, 16, -1)
++    up_p = up_part.reshape(num_slots, n_pairs, 16, -1)
++    theirs = torch.stack([gate_p, up_p], dim=2).reshape(num_slots, FC1_ROWS, -1)
++
++    assert torch.equal(ours, theirs)
++
++
++def test_gate16_helper_matches_kernel_reference_permutation():
++    # The kernel author's host packer starts from the older [up64, gate64]
++    # interleave and reorders every 128-row block through the index map
++    # (N/128, [up, gate], 4, 16) -> flip(up/gate) -> transpose(groups, up/gate).
++    raw = _raw_fc1()[0]
++    assert FC1_ROWS % 128 == 0
++    canonical = interleave_linear_and_gate(raw, group_size=64, dim=0)
++    canonical_n = (
++        torch.arange(FC1_ROWS)
++        .reshape(FC1_ROWS // 128, 2, 4, 16)
++        .flip(1)
++        .transpose(1, 2)
++        .reshape(FC1_ROWS)
++    )
++    expected = canonical.index_select(0, canonical_n)
++
++    assert torch.equal(interleave_gate_and_linear(raw, group_size=16, dim=0), expected)
++
++
++def test_gate16_helper_is_one_row_permutation_for_weights_and_scales():
++    perm = interleave_gate_and_linear(
++        torch.arange(FC1_ROWS).view(FC1_ROWS, 1), group_size=16, dim=0
++    )
++    perm = perm.view(FC1_ROWS)
++    assert torch.equal(perm.sort().values, torch.arange(FC1_ROWS))
++    # First 32 rows: gate rows 0..15 (offset INTERMEDIATE) then up rows 0..15.
++    assert perm[:16].tolist() == list(range(INTERMEDIATE, INTERMEDIATE + 16))
++    assert perm[16:32].tolist() == list(range(0, 16))
++
++    weights = _raw_fc1()[0]
++    scales = torch.randint(0, 256, (FC1_ROWS, HIDDEN // SF_VEC), dtype=torch.uint8)
++    assert torch.equal(interleave_gate_and_linear(weights, group_size=16, dim=0), weights[perm])
++    assert torch.equal(interleave_gate_and_linear(scales, group_size=16, dim=0), scales[perm])
++
++
++def test_gate16_helper_dim_argument_is_per_expert():
++    raw = _raw_fc1(num_experts=2)
++    batched = interleave_gate_and_linear(raw, group_size=16, dim=1)
++    per_expert = torch.stack(
++        [interleave_gate_and_linear(raw[e], group_size=16, dim=0) for e in range(raw.shape[0])]
++    )
++    assert torch.equal(batched, per_expert)
++
++
++def _expected_rows(x: torch.Tensor, sm: int) -> torch.Tensor:
++    if sm == 107:
++        return interleave_gate_and_linear(x, group_size=16, dim=0)
++    return interleave_linear_and_gate(x, group_size=64, dim=0)
++
++
++def _module_namespace(is_gated_activation: bool = True, **extra) -> SimpleNamespace:
++    return SimpleNamespace(
++        intermediate_size_per_partition=INTERMEDIATE,
++        hidden_size=HIDDEN,
++        scaling_vector_size=SF_VEC,
++        is_gated_activation=is_gated_activation,
++        **extra,
++    )
++
++
++def _random_swizzled_scales(num_experts: int, seed: int) -> torch.Tensor:
++    g = torch.Generator().manual_seed(seed)
++    return torch.randint(
++        0, 256, (num_experts, FC1_ROWS, HIDDEN // SF_VEC), dtype=torch.uint8, generator=g
++    ).view(quant_mod.float4_sf_dtype)
++
++
++def _expected_scales(dst: torch.Tensor, sm: int) -> torch.Tensor:
++    # Mirrors _interleave_w3_w1_weight_scale_cute_dsl with an explicit helper.
++    unswizzled = unswizzle_sf(dst.cuda(), FC1_ROWS, HIDDEN).view(FC1_ROWS, HIDDEN // SF_VEC)
++    return swizzle_sf(_expected_rows(unswizzled, sm), FC1_ROWS, HIDDEN).view(
++        FC1_ROWS, HIDDEN // SF_VEC
++    )
++
++
++@pytest.mark.skipif(
++    not torch.cuda.is_available(), reason="the weight method interleaves on the GPU"
++)
++@pytest.mark.parametrize("sm", [107, 100], ids=["rubin_gate16", "blackwell_up64"])
++def test_weight_method_picks_the_interleave_by_sm(monkeypatch, sm):
++    monkeypatch.setattr(quant_mod, "get_sm_version", lambda: sm)
++    method = NVFP4CuteDslFusedMoEMethod()
++
++    raw = _raw_fc1()[0]
++    dst = raw.clone()
++    method._interleave_w3_w1_weight(dst)
++    assert torch.equal(dst, _expected_rows(raw, sm))
++
++    scales = _random_swizzled_scales(1, seed=1)[0]
++    dst_sf = scales.clone()
++    method._interleave_w3_w1_weight_scale_cute_dsl(_module_namespace(), dst_sf)
++    assert torch.equal(
++        dst_sf.view(torch.uint8), _expected_scales(scales, sm).cpu().view(torch.uint8)
++    )
++
++
++@pytest.mark.skipif(
++    not torch.cuda.is_available(), reason="the weight method interleaves on the GPU"
++)
++@pytest.mark.parametrize("sm", [107, 100], ids=["rubin_gate16", "blackwell_up64"])
++def test_eplb_host_mirrors_get_the_same_interleave_as_device_weights(monkeypatch, sm):
++    # Online EPLB copies experts into slots from the host mirrors, bypassing
++    # process_weights_after_loading, so the mirror hooks must apply the exact
++    # permutation the device path applies.
++    monkeypatch.setattr(quant_mod, "get_sm_version", lambda: sm)
++    method = NVFP4CuteDslFusedMoEMethod()
++    num_experts = 3
++
++    raw = _raw_fc1(num_experts, seed=2)
++    scales = _random_swizzled_scales(num_experts, seed=3)
++    module = _module_namespace(
++        local_shared_w3_w1_tensors=raw.clone(),
++        local_shared_w3_w1_scale_tensors=scales.clone(),
++    )
++    method._prepare_shared_weights_for_finalization(module)
++    method._prepare_shared_weight_scales_for_finalization(module)
++
++    for e in range(num_experts):
++        device_w = raw[e].clone()
++        method._interleave_w3_w1_weight(device_w)
++        assert torch.equal(module.local_shared_w3_w1_tensors[e], device_w)
++        assert torch.equal(module.local_shared_w3_w1_tensors[e], _expected_rows(raw[e], sm))
++
++        device_sf = scales[e].clone()
++        method._interleave_w3_w1_weight_scale_cute_dsl(_module_namespace(), device_sf)
++        assert torch.equal(
++            module.local_shared_w3_w1_scale_tensors[e].view(torch.uint8),
++            device_sf.view(torch.uint8),
++        )
++
++
++@pytest.mark.skipif(
++    not torch.cuda.is_available(), reason="the weight method interleaves on the GPU"
++)
++def test_eplb_hooks_skip_non_gated_modules(monkeypatch):
++    monkeypatch.setattr(quant_mod, "get_sm_version", lambda: 107)
++    method = NVFP4CuteDslFusedMoEMethod()
++    raw = _raw_fc1(2, seed=4)
++    module = _module_namespace(is_gated_activation=False, local_shared_w3_w1_tensors=raw.clone())
++    method._prepare_shared_weights_for_finalization(module)
++    assert torch.equal(module.local_shared_w3_w1_tensors, raw)
+diff --git a/tests/unittest/_torch/thop/parallel/test_cute_dsl_moe.py b/tests/unittest/_torch/thop/parallel/test_cute_dsl_moe.py
+index 20795e137bd5..91286fbe532d 100644
+--- a/tests/unittest/_torch/thop/parallel/test_cute_dsl_moe.py
++++ b/tests/unittest/_torch/thop/parallel/test_cute_dsl_moe.py
+@@ -24,6 +24,7 @@
+ from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
+ from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
+     SITU_BETA_DISABLED,
++    SWIGLU_LIMIT_SCALAR_DISABLED,
+     GroupedGemmInputsHelper,
+     _get_sm107_nvfp4_default_mma_config,
+ )
+@@ -45,7 +46,10 @@
+     _runner_tactics_match_tile_size,
+     cute_dsl_nvfp4_grouped_gemm_ref,
+ )
+-from tensorrt_llm._torch.moe.fused_moe.quantization import interleave_linear_and_gate
++from tensorrt_llm._torch.moe.fused_moe.quantization import (
++    interleave_gate_and_linear,
++    interleave_linear_and_gate,
++)
+ from tensorrt_llm._torch.utils import (
+     ActivationType,
+     Fp4QuantizedTensor,
+@@ -1276,8 +1280,13 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
+     permuted_idx_to_expanded_idx_list = permuted_idx_to_expanded_idx.cpu().tolist()
+     tile_idx_to_mn_limit_list = tile_idx_to_mn_limit.cpu().tolist()
+ 
+-    a_gathered = torch.empty(max_num_permuted_tokens, hidden_size // 2, dtype=a.dtype)
+-    a_sf_gathered = torch.empty(
++    # Zero-initialise: rows past a tile's mn_limit stay unwritten, and a stray
++    # NaN scale byte would poison the reference and ``global_sf``.
++    # ``torch.zeros`` has no CPU FP4 fill kernel, hence the uint8 view.
++    a_gathered = torch.zeros(max_num_permuted_tokens, hidden_size // 2, dtype=torch.uint8).view(
++        a.dtype
++    )
++    a_sf_gathered = torch.zeros(
+         max_num_permuted_tokens, hidden_size // sf_vec_size, dtype=a_sf.dtype
+     )
+     for i in range(num_valid_permuted_tokens):
+@@ -1385,6 +1394,7 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
+     [ActivationType.Swiglu, ActivationType.Relu2],
+     ids=["swiglu", "relu2"],
+ )
++@pytest.mark.parametrize("swiglu_limit", [float("inf"), 1.0], ids=["nolimit", "limit1"])
+ @pytest.mark.parametrize("tile_size", [128, 256])
+ @pytest.mark.parametrize("ep_size", [1, 8, 32])
+ @pytest.mark.parametrize("top_k", [1, 2, 8])
+@@ -1395,6 +1405,7 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_rubin(
+     ep_size: int,
+     tile_size: int,
+     activation_type: ActivationType,
++    swiglu_limit: float,
+ ):
+     """Test gather-based grouped GEMM with fused activation on Rubin (SM107).
+ 
+@@ -1404,6 +1415,8 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_rubin(
+     3. Applies the fused activation (SwiGLU for gated, Relu2 for non-gated)
+     4. Quantizes output to FP4 with scale factor generation
+     """
++    if swiglu_limit != float("inf") and activation_type != ActivationType.Swiglu:
++        pytest.skip("swiglu_limit applies to SwiGLU only")
+     is_gated = is_gated_activation(activation_type)
+     weight_n_multiplier = 2 if is_gated else 1
+     sf_vec_size = 16
+@@ -1467,13 +1480,13 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_rubin(
+     b_kernel = b
+     b_sf_kernel = b_sf
+     if is_gated:
+-        b_kernel = interleave_linear_and_gate(b.view(torch.uint8), group_size=64, dim=1).view(
++        b_kernel = interleave_gate_and_linear(b.view(torch.uint8), group_size=16, dim=1).view(
+             torch.float4_e2m1fn_x2
+         )
+         b_sf_unswizzled = unswizzle_sf(b_sf, weight_n, hidden_size).view(
+             num_local_experts, weight_n, hidden_size // sf_vec_size
+         )
+-        b_sf_unswizzled = interleave_linear_and_gate(b_sf_unswizzled, group_size=64, dim=1)
++        b_sf_unswizzled = interleave_gate_and_linear(b_sf_unswizzled, group_size=16, dim=1)
+         b_sf_kernel = swizzle_sf(b_sf_unswizzled, weight_n, hidden_size).view(
+             num_local_experts, weight_n, hidden_size // sf_vec_size
+         )
+@@ -1482,8 +1495,13 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_rubin(
+     permuted_idx_to_expanded_idx_list = permuted_idx_to_expanded_idx.cpu().tolist()
+     tile_idx_to_mn_limit_list = tile_idx_to_mn_limit.cpu().tolist()
+ 
+-    a_gathered = torch.empty(max_num_permuted_tokens, hidden_size // 2, dtype=a.dtype)
+-    a_sf_gathered = torch.empty(
++    # Zero-initialise: rows past a tile's mn_limit stay unwritten, and a stray
++    # NaN scale byte would poison the reference and ``global_sf``.
++    # ``torch.zeros`` has no CPU FP4 fill kernel, hence the uint8 view.
++    a_gathered = torch.zeros(max_num_permuted_tokens, hidden_size // 2, dtype=torch.uint8).view(
++        a.dtype
++    )
++    a_sf_gathered = torch.zeros(
+         max_num_permuted_tokens, hidden_size // sf_vec_size, dtype=a_sf.dtype
+     )
+     for i in range(num_valid_permuted_tokens):
+@@ -1514,7 +1532,7 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_rubin(
+         output_dtype=torch.bfloat16,
+         scaling_vector_size=sf_vec_size,
+     )
+-    c_ref = apply_activation_ref(c_ref, activation_type)
++    c_ref = apply_activation_ref(c_ref, activation_type, swiglu_limit)
+     global_sf = c_ref[:num_valid_permuted_tokens].abs().max().float() / (448 * 6)
+     c_ref, c_sf_ref = torch.ops.trtllm.fp4_quantize(c_ref, 1 / global_sf, sf_vec_size, False)
+ 
+@@ -1539,6 +1557,7 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_rubin(
+         output_sf_tensor=None,
+         scaling_vector_size=sf_vec_size,
+         activation_type=activation_type,
++        swiglu_limit_scalar=swiglu_limit,
+     )
+ 
+     # Verify output (only compare valid tokens, skip padding)
+@@ -1572,6 +1591,162 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_rubin(
+         check_accuracy(c_sf_valid, c_sf_ref_valid, atol=1e-4, rtol=1e-4, percent=0.95)
+ 
+ 
++@pytest.mark.skipif(
++    not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
++    reason="the installed CuTe DSL package has no Rubin (SM107) helpers",
++)
++@pytest.mark.parametrize(
++    "activation_type,situ_kwargs",
++    [
++        (ActivationType.Relu2, {}),
++        (ActivationType.SiTu, dict(situ_beta=SITU_BETA, situ_linear_beta=SITU_LINEAR_BETA)),
++    ],
++    ids=["relu2", "situ"],
++)
++def test_rubin_act_fusion_kernel_rejects_finite_swiglu_limit_for_non_swiglu(
++    activation_type, situ_kwargs
++):
++    # Host-only: the constructor validates its arguments before any DSL work,
++    # so this pins the guard without a GPU.
++    from tensorrt_llm._torch.cute_dsl_kernels.rubin.moe.rubin_contiguous_gather_grouped_blockscaled_gemm_act_fusion import (  # noqa: E501
++        Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel as Kernel,
++    )
++
++    kwargs = dict(
++        sf_vec_size=16,
++        mma_inst_shape=(128, 128, 128),
++        mma_tiler=(128, 128, 256),
++        cluster_shape_mn=(1, 1),
++        vectorized_f32=True,
++        topk=1,
++        activation_type=activation_type,
++        **situ_kwargs,
++    )
++    with pytest.raises(ValueError, match="swiglu_limit applies to ActivationType.Swiglu only"):
++        Kernel(swiglu_limit=1.0, **kwargs)
++    # No limit, and the op-level "disabled" sentinel, both construct.
++    assert not Kernel(**kwargs).has_swiglu_limit
++    assert not Kernel(swiglu_limit=-1.0, **kwargs).has_swiglu_limit
++
++
++@pytest.mark.skipif(
++    get_sm_version() != 107 or not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
++    reason="This test requires an SM 107 GPU and Rubin CuTe DSL helpers",
++)
++@pytest.mark.parametrize("swiglu_limit", [1.0, float("inf")], ids=["clamp", "no_clamp"])
++def test_nvfp4_gather_grouped_gemm_act_fusion_rubin_propagates_nan_through_clamp(swiglu_limit):
++    """A NaN accumulator must reach the output, clamp or not.
++
++    FP4 has no NaN encoding, so the NaN is injected through one E4M3 block
++    scale of one token's activation row. Every accumulator column of that row
++    becomes NaN; with the SwiGLU clamp enabled the gate and up clamps must
++    propagate it (``fmin.NaN`` / ``min.NaN.xorsign.abs``) rather than turn it
++    into ``+-limit``, so the row's output block scales are NaN while every
++    other row stays finite.
++    """
++    sf_vec_size = 16
++    tile_size = 128
++    num_tokens = 128
++    hidden_size = 512
++    interm_size = 512
++    weight_n = 2 * interm_size
++    nan_token = 37
++
++    torch.manual_seed(0)
++    token_selected_experts = torch.zeros(num_tokens, 1, dtype=torch.int32, device="cuda")
++    token_final_scales = torch.ones(num_tokens, 1, dtype=torch.float32, device="cuda")
++    (
++        tile_idx_to_group_idx,
++        tile_idx_to_mn_limit,
++        _expanded_idx_to_permuted_idx,
++        permuted_idx_to_expanded_idx,
++        total_num_padded_tokens,
++        num_non_exiting_tiles,
++    ) = torch.ops.trtllm.moe_sort(
++        token_selected_experts=token_selected_experts,
++        token_final_scales=token_final_scales,
++        num_experts=1,
++        top_k=1,
++        local_expert_offset=0,
++        local_num_experts=1,
++        tile_tokens_dim=tile_size,
++    )
++    max_num_permuted_tokens = permuted_idx_to_expanded_idx.size(0)
++    num_valid_permuted_tokens = total_num_padded_tokens.item()
++
++    a = torch.randint(-5, 5, (num_tokens, hidden_size), dtype=torch.int32, device="cuda").to(
++        torch.bfloat16
++    )
++    b = torch.randint(-5, 5, (1, weight_n, hidden_size), dtype=torch.int32, device="cuda").to(
++        torch.bfloat16
++    )
++    probe = a.float() @ b[0].float().T
++    probe_up, probe_gate = probe.chunk(2, dim=-1)
++    if swiglu_limit != float("inf"):
++        probe_gate = probe_gate.clamp(max=swiglu_limit)
++        probe_up = probe_up.clamp(min=-swiglu_limit, max=swiglu_limit)
++    global_sf = 2 * (probe_up * torch.nn.functional.silu(probe_gate)).abs().max() / (448 * 6)
++    global_sf_tensor = torch.tensor([1 / global_sf], dtype=torch.float32, device="cuda")
++
++    a_global_sf = a.abs().max().float() / (448 * 6)
++    b_global_sf = b.abs().amax(dim=(1, 2)).float() / (448 * 6)
++    a, a_sf = torch.ops.trtllm.fp4_quantize(a, 1 / a_global_sf, sf_vec_size, False)
++    a = a.view(torch.float4_e2m1fn_x2)
++    a_sf_unswizzled = unswizzle_sf(a_sf, num_tokens, hidden_size)[:num_tokens].contiguous()
++    # E4M3 NaN (0x7F) in the first K block of the chosen token's scale row.
++    a_sf_unswizzled.view(torch.uint8).view(num_tokens, -1)[nan_token, 0] = 0x7F
++    b, b_sf = torch.ops.trtllm.fp4_quantize(b, 1 / b_global_sf, sf_vec_size, False)
++    b_sf = b_sf.view(1, weight_n, hidden_size // sf_vec_size)
++    alpha = a_global_sf * b_global_sf
++    b_kernel = interleave_gate_and_linear(b, group_size=16, dim=1).view(torch.float4_e2m1fn_x2)
++    b_sf_kernel = swizzle_sf(
++        interleave_gate_and_linear(
++            unswizzle_sf(b_sf, weight_n, hidden_size).view(1, weight_n, hidden_size // sf_vec_size),
++            group_size=16,
++            dim=1,
++        ),
++        weight_n,
++        hidden_size,
++    ).view(1, weight_n, hidden_size // sf_vec_size)
++
++    _c, c_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin(
++        a,
++        b_kernel,
++        a_sf_unswizzled,
++        b_sf_kernel,
++        alpha,
++        tile_idx_to_group_idx,
++        tile_idx_to_mn_limit,
++        permuted_idx_to_expanded_idx,
++        num_non_exiting_tiles,
++        global_sf_tensor,
++        num_experts=1,
++        top_k=1,
++        num_local_experts=1,
++        local_expert_offset=0,
++        tile_size=tile_size,
++        output_tensor=None,
++        output_sf_tensor=None,
++        scaling_vector_size=sf_vec_size,
++        activation_type=int(ActivationType.Swiglu),
++        swiglu_limit_scalar=swiglu_limit,
++    )
++
++    c_sf_rows = (
++        unswizzle_sf(c_sf, max_num_permuted_tokens, interm_size, sf_vec_size)
++        .view(torch.uint8)
++        .view(max_num_permuted_tokens, -1)
++    )
++    # E4M3 NaN is exponent and mantissa all ones, either sign.
++    is_nan = (c_sf_rows & 0x7F) == 0x7F
++    permuted_idx = permuted_idx_to_expanded_idx[:num_valid_permuted_tokens]
++    nan_rows = (permuted_idx == nan_token).nonzero().flatten()
++    assert nan_rows.numel() == 1
++    assert is_nan[nan_rows].all(), "the NaN accumulator row did not reach the output scales"
++    other_rows = ((permuted_idx != nan_token) & (permuted_idx != -1)).nonzero().flatten()
++    assert not is_nan[other_rows].any(), "NaN leaked into rows without a NaN input"
++
++
+ @pytest.mark.skipif(
+     get_sm_version() != 107,
+     reason="This test is only supported on SM 107 (Rubin) GPUs",
+@@ -1639,13 +1814,13 @@ def test_nvfp4_gather_grouped_gemm_situ_rubin(tile_size: int):
+     b_sf = b_sf.view(num_local_experts, interm_size * 2, hidden_size // sf_vec_size)
+     alpha = a_global_sf * b_global_sf
+ 
+-    b_interleaved = interleave_linear_and_gate(b.view(torch.uint8), group_size=64, dim=1).view(
++    b_interleaved = interleave_gate_and_linear(b.view(torch.uint8), group_size=16, dim=1).view(
+         torch.float4_e2m1fn_x2
+     )
+     b_sf_unswizzled = unswizzle_sf(b_sf, interm_size * 2, hidden_size).view(
+         num_local_experts, interm_size * 2, hidden_size // sf_vec_size
+     )
+-    b_sf_unswizzled_interleaved = interleave_linear_and_gate(b_sf_unswizzled, group_size=64, dim=1)
++    b_sf_unswizzled_interleaved = interleave_gate_and_linear(b_sf_unswizzled, group_size=16, dim=1)
+     b_sf_interleaved = swizzle_sf(b_sf_unswizzled_interleaved, interm_size * 2, hidden_size).view(
+         num_local_experts, interm_size * 2, hidden_size // sf_vec_size
+     )
+@@ -1653,8 +1828,13 @@ def test_nvfp4_gather_grouped_gemm_situ_rubin(tile_size: int):
+     permuted_idx_to_expanded_idx_list = permuted_idx_to_expanded_idx.cpu().tolist()
+     tile_idx_to_mn_limit_list = tile_idx_to_mn_limit.cpu().tolist()
+ 
+-    a_gathered = torch.empty(max_num_permuted_tokens, hidden_size // 2, dtype=a.dtype)
+-    a_sf_gathered = torch.empty(
++    # Zero-initialise: rows past a tile's mn_limit stay unwritten, and a stray
++    # NaN scale byte would poison the reference and ``global_sf``.
++    # ``torch.zeros`` has no CPU FP4 fill kernel, hence the uint8 view.
++    a_gathered = torch.zeros(max_num_permuted_tokens, hidden_size // 2, dtype=torch.uint8).view(
++        a.dtype
++    )
++    a_sf_gathered = torch.zeros(
+         max_num_permuted_tokens, hidden_size // sf_vec_size, dtype=a_sf.dtype
+     )
+     for i in range(num_valid_permuted_tokens):
+@@ -1855,13 +2035,13 @@ def test_nvfp4_gather_grouped_gemm_swiglu_rubin_small_tokens(
+     b_sf = b_sf.view(num_local_experts, interm_size * 2, hidden_size // sf_vec_size)
+     alpha = a_global_sf * b_global_sf
+ 
+-    b_interleaved = interleave_linear_and_gate(b.view(torch.uint8), group_size=64, dim=1).view(
++    b_interleaved = interleave_gate_and_linear(b.view(torch.uint8), group_size=16, dim=1).view(
+         torch.float4_e2m1fn_x2
+     )
+     b_sf_unswizzled = unswizzle_sf(b_sf, interm_size * 2, hidden_size).view(
+         num_local_experts, interm_size * 2, hidden_size // sf_vec_size
+     )
+-    b_sf_unswizzled_interleaved = interleave_linear_and_gate(b_sf_unswizzled, group_size=64, dim=1)
++    b_sf_unswizzled_interleaved = interleave_gate_and_linear(b_sf_unswizzled, group_size=16, dim=1)
+     b_sf_interleaved = swizzle_sf(b_sf_unswizzled_interleaved, interm_size * 2, hidden_size).view(
+         num_local_experts, interm_size * 2, hidden_size // sf_vec_size
+     )
+@@ -2402,14 +2582,14 @@ def _create_quantized_locality_domain_weights(
+     weight_fp4 = weight_fp4.view(torch.float4_e2m1fn_x2)
+     weight_sf = weight_sf.view(num_local_experts, interm_size * 2, hidden_size // sf_vec_size)
+ 
+-    weight_interleaved = interleave_linear_and_gate(
+-        weight_fp4.view(torch.uint8), group_size=64, dim=1
++    weight_interleaved = interleave_gate_and_linear(
++        weight_fp4.view(torch.uint8), group_size=16, dim=1
+     ).view(torch.float4_e2m1fn_x2)
+     weight_sf_unswizzled = unswizzle_sf(weight_sf, interm_size * 2, hidden_size).view(
+         num_local_experts, interm_size * 2, hidden_size // sf_vec_size
+     )
+-    weight_sf_unswizzled_interleaved = interleave_linear_and_gate(
+-        weight_sf_unswizzled, group_size=64, dim=1
++    weight_sf_unswizzled_interleaved = interleave_gate_and_linear(
++        weight_sf_unswizzled, group_size=16, dim=1
+     )
+     weight_sf_interleaved = swizzle_sf(
+         weight_sf_unswizzled_interleaved, interm_size * 2, hidden_size
+@@ -2878,6 +3058,7 @@ def _assert_rubin_moe_op_schema(
+                 "activation_type",
+                 "situ_beta",
+                 "situ_linear_beta",
++                "swiglu_limit_scalar",
+                 "precomputed_tactic",
+             ),
+             {
+@@ -2886,6 +3067,7 @@ def _assert_rubin_moe_op_schema(
+                 "activation_type": int(ActivationType.Swiglu),
+                 "situ_beta": SITU_BETA_DISABLED,
+                 "situ_linear_beta": SITU_BETA_DISABLED,
++                "swiglu_limit_scalar": SWIGLU_LIMIT_SCALAR_DISABLED,
+                 "precomputed_tactic": None,
+             },
+             {"output_tensor", "output_sf_tensor"},
+@@ -3154,12 +3336,14 @@ def test_rubin_bf16_moe_precomputed_tactic_fake_signatures():
+                 "activation_type",
+                 "situ_beta",
+                 "situ_linear_beta",
++                "swiglu_limit_scalar",
+             ),
+             {
+                 "scaling_vector_size": 16,
+                 "activation_type": int(ActivationType.Swiglu),
+                 "situ_beta": SITU_BETA_DISABLED,
+                 "situ_linear_beta": SITU_BETA_DISABLED,
++                "swiglu_limit_scalar": SWIGLU_LIMIT_SCALAR_DISABLED,
+             },
+             {"output_tensor", "output_sf_tensor"},
+             id="nvfp4_fc1",
+@@ -3562,6 +3746,7 @@ def fake_moe_output_memset(*args, **kwargs):
+                     "output_sf_tensor": torch.empty((2,), dtype=torch.uint8),
+                     "scaling_vector_size": 16,
+                     "activation_type": int(ActivationType.Swiglu),
++                    "swiglu_limit_scalar": 1.0,
+                 }
+             )
+     else:
+@@ -3613,11 +3798,13 @@ def fake_moe_output_memset(*args, **kwargs):
+     runner_args, runner_kwargs = runner_instances[0].init_call
+     if quantized and is_fc1:
+         assert runner_args == (1, 1, 1, 0, 128, 16)
+-        # The disabled sentinel canonicalizes to None before the runner sees it.
++        # The disabled SiTu sentinels canonicalize to None before the runner
++        # sees them; a finite SwiGLU limit is forwarded unchanged.
+         assert runner_kwargs == {
+             "activation_type": ActivationType.Swiglu,
+             "situ_beta": None,
+             "situ_linear_beta": None,
++            "swiglu_limit_scalar": 1.0,
+         }
+     elif quantized:
+         assert runner_args == (1, 1, 1, 0, 128, torch.bfloat16, 16)
+@@ -3656,6 +3843,8 @@ def fake_moe_output_memset(*args, **kwargs):
+         assert all(
+             kwargs["output_tensor"] is call_kwargs["output_tensor"] for _, kwargs in leaf_calls
+         )
++        if quantized:
++            assert all(kwargs["swiglu_limit_scalar"] == 1.0 for _, kwargs in leaf_calls)
+         assert not memset_calls
+         assert execution_order == ["tune", "launch"]
+     else:
+@@ -3701,6 +3890,255 @@ def fake_moe_output_memset(*args, **kwargs):
+             )
+ 
+ 
++def _fc12_fused_rubin_tactic(tile_size: int, mma_n: int) -> str:
++    """The fused FC12 runner's tactic for a routing tile and an N tile.
++
++    Mirrors ``Sm107BlockScaledContiguousGroupedGemmFusedFc12Runner.get_valid_tactics``:
++    MMA M equals the routing tile, the cluster M is ``tile_size // 128`` and K
++    is fixed (tiler 256, instruction 128).
++    """
++    return repr(((tile_size, mma_n, 256), (tile_size, mma_n, 128), (tile_size // 128, 1)))
++
++
++@pytest.mark.skipif(
++    get_sm_version() != 107,
++    reason="This test is only supported on Rubin (SM 107) GPUs",
++)
++@pytest.mark.parametrize("mma_n", [256, 128], ids=["overlay", "no_overlay"])
++def test_nvfp4_fc12_fused_rubin_matches_two_op_path(mma_n: int):
++    """Fused FC1+FC2 against the standalone FC1 and FC2 ops at a fixed geometry.
++
++    ``mma_n=256`` with the 2-CTA 256-row tile is the configuration whose shared
++    memory aliases the FC2 C block-reduce buffer onto the drained FC1 operand
++    tail (``overlay_fc2_c_on_fc1_ab_tail``; see test_fc12_smem_contract.py), so
++    an aliasing or reuse-ordering bug shows up as wrong FC2 values here while
++    the stage/offset contracts still hold. ``mma_n=128`` keeps separate regions
++    and is the control. The problem is sized so every persistent CTA processes
++    several FC2 tiles. The standalone ops are checked against float references
++    in their own tests above; both paths quantize FC1 with the same scale, so
++    only the FC2 accumulation order may differ and the comparison is tight.
++    """
++    sf_vec_size = 16
++    tile_size = 256
++    num_tokens = 4096
++    num_experts = 8
++    top_k = 2
++    hidden_size = 2048
++    interm_size = 1536
++    fc1_n = 2 * interm_size
++
++    torch.manual_seed(0)
++    routing_logits = torch.randn(num_tokens, num_experts, device="cuda")
++    token_final_scales, token_selected_experts = routing_logits.topk(top_k, dim=-1)
++    token_selected_experts = token_selected_experts.to(torch.int32)
++    token_final_scales = token_final_scales.softmax(dim=-1).to(torch.float32)
++    (
++        tile_idx_to_group_idx,
++        tile_idx_to_mn_limit,
++        expanded_idx_to_permuted_idx,
++        permuted_idx_to_expanded_idx,
++        _total_num_padded_tokens,
++        num_non_exiting_tiles,
++    ) = torch.ops.trtllm.moe_sort(
++        token_selected_experts=token_selected_experts,
++        token_final_scales=token_final_scales,
++        num_experts=num_experts,
++        top_k=top_k,
++        local_expert_offset=0,
++        local_num_experts=num_experts,
++        tile_tokens_dim=tile_size,
++    )
++    # More FC2 tiles than 2-CTA clusters on the device, so every persistent
++    # CTA owns several FC2 tiles and reuses its C buffer.
++    num_clusters = torch.cuda.get_device_properties(0).multi_processor_count // 2
++    assert num_non_exiting_tiles.item() * (hidden_size // mma_n) > num_clusters
++
++    # Integer-valued activations and weights (FC1 rows are [up | gate]) so the
++    # FP4 quantization of the inputs is exact, as in the other NVFP4 op tests.
++    a = torch.randint(-5, 5, (num_tokens, hidden_size), dtype=torch.int32, device="cuda").to(
++        torch.bfloat16
++    )
++    b1 = torch.randint(
++        -5, 5, (num_experts, fc1_n, hidden_size), dtype=torch.int32, device="cuda"
++    ).to(torch.bfloat16)
++    b2 = torch.randint(
++        -5, 5, (num_experts, hidden_size, interm_size), dtype=torch.int32, device="cuda"
++    ).to(torch.bfloat16)
++    # FC1 output scale from a float probe of one expert; both kernel paths use
++    # the same value, so it only has to keep the FP4 output in range.
++    probe = a[:512].float() @ b1[0].float().T
++    probe_up, probe_gate = probe.chunk(2, dim=-1)
++    fc1_absmax = (probe_up * torch.nn.functional.silu(probe_gate)).abs().max()
++    global_sf = 2 * fc1_absmax / (448 * 6)
++    global_sf_tensor = torch.tensor([1 / global_sf], dtype=torch.float32, device="cuda")
++
++    a_global_sf = a.abs().max().float() / (448 * 6)
++    b1_global_sf = b1.abs().amax(dim=(1, 2)).float() / (448 * 6)
++    b2_global_sf = b2.abs().amax(dim=(1, 2)).float() / (448 * 6)
++    a, a_sf = torch.ops.trtllm.fp4_quantize(a, 1 / a_global_sf, sf_vec_size, False)
++    a = a.view(torch.float4_e2m1fn_x2)
++    a_sf_unswizzled = unswizzle_sf(a_sf, (num_tokens + 127) // 128 * 128, hidden_size)[:num_tokens]
++    b1, b1_sf = torch.ops.trtllm.fp4_quantize(b1, 1 / b1_global_sf, sf_vec_size, False)
++    b1_sf = b1_sf.view(num_experts, fc1_n, hidden_size // sf_vec_size)
++    b2, b2_sf = torch.ops.trtllm.fp4_quantize(b2, 1 / b2_global_sf, sf_vec_size, False)
++    b2 = b2.view(torch.float4_e2m1fn_x2)
++    b2_sf = b2_sf.view(num_experts, hidden_size, interm_size // sf_vec_size)
++    fc1_alpha = a_global_sf * b1_global_sf
++    fc2_alpha = global_sf * b2_global_sf
++
++    # FC1 weights in the interleaved layout both kernels read.
++    b1_kernel = interleave_gate_and_linear(b1, group_size=16, dim=1).view(torch.float4_e2m1fn_x2)
++    b1_sf_kernel = swizzle_sf(
++        interleave_gate_and_linear(
++            unswizzle_sf(b1_sf, fc1_n, hidden_size).view(
++                num_experts, fc1_n, hidden_size // sf_vec_size
++            ),
++            group_size=16,
++            dim=1,
++        ),
++        fc1_n,
++        hidden_size,
++    ).view(num_experts, fc1_n, hidden_size // sf_vec_size)
++
++    # Reference: the standalone FC1 act-fusion op followed by the standalone
++    # FC2 finalize op (the two-op CUTEDSL backend path).
++    fc1_c, fc1_c_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin(
++        a,
++        b1_kernel,
++        a_sf_unswizzled,
++        b1_sf_kernel,
++        fc1_alpha,
++        tile_idx_to_group_idx,
++        tile_idx_to_mn_limit,
++        permuted_idx_to_expanded_idx,
++        num_non_exiting_tiles,
++        global_sf_tensor,
++        num_experts=num_experts,
++        top_k=top_k,
++        num_local_experts=num_experts,
++        local_expert_offset=0,
++        tile_size=tile_size,
++        output_tensor=None,
++        output_sf_tensor=None,
++        scaling_vector_size=sf_vec_size,
++        activation_type=int(ActivationType.Swiglu),
++    )
++    out_two_op = torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_rubin(
++        fc1_c,
++        b2,
++        fc1_c_sf,
++        b2_sf,
++        fc2_alpha,
++        tile_idx_to_group_idx,
++        tile_idx_to_mn_limit,
++        permuted_idx_to_expanded_idx,
++        num_non_exiting_tiles,
++        token_final_scales,
++        num_experts=num_experts,
++        top_k=top_k,
++        num_local_experts=num_experts,
++        local_expert_offset=0,
++        tile_size=tile_size,
++        output_dtype=torch.bfloat16,
++        scaling_vector_size=sf_vec_size,
++    )
++
++    out_fused = torch.zeros(num_tokens, hidden_size, dtype=torch.bfloat16, device="cuda")
++    torch.ops.trtllm.cute_dsl_nvfp4_fc12_fused_rubin(
++        input=a,
++        fc1_weight=b1_kernel,
++        input_scale=a_sf_unswizzled.view(torch.uint8),
++        fc1_weight_scale=b1_sf_kernel.view(torch.uint8),
++        fc1_alpha=fc1_alpha,
++        tile_idx_to_group_idx=tile_idx_to_group_idx,
++        tile_idx_to_mn_limit=tile_idx_to_mn_limit,
++        permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
++        num_non_exiting_tiles=num_non_exiting_tiles,
++        global_sf=global_sf_tensor,
++        fc2_weight=b2,
++        fc2_weight_scale=b2_sf.view(torch.uint8),
++        fc2_alpha=fc2_alpha,
++        output=out_fused,
++        token_final_scales=token_final_scales,
++        expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
++        num_experts=num_experts,
++        top_k=top_k,
++        num_local_experts=num_experts,
++        local_expert_offset=0,
++        tile_size=tile_size,
++        swiglu_limit=float("inf"),
++        ep_size=1,
++        enable_alltoall=False,
++        scaling_vector_size=sf_vec_size,
++        precomputed_tactic=_fc12_fused_rubin_tactic(tile_size, mma_n),
++    )
++
++    assert torch.isfinite(out_fused).all()
++    # Guard against both paths degenerating to zeros, which would make the
++    # comparison below vacuous.
++    assert out_two_op.abs().mean() > 0
++    match = torch.isclose(out_fused, out_two_op, rtol=1.6e-2, atol=1e-5).float().mean()
++    assert match > 0.999, f"fused vs two-op match ratio {match:.5f}"
++
++
++@pytest.mark.parametrize("locality_domain", [False, True], ids=["leaf", "locality_domain"])
++def test_rubin_nvfp4_fc1_ops_reject_nan_swiglu_limit(locality_domain: bool):
++    # The Python implementation is exercised directly on CPU tensors: both ops
++    # canonicalize the clamp before constructing the runner, so no GPU work runs.
++    op_name = (
++        "cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_locality_domain_inplace_rubin"
++        if locality_domain
++        else "cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin"
++    )
++    op = getattr(cute_dsl_custom_ops, op_name, None)
++    if op is None:
++        pytest.skip("public Rubin CuTe DSL MoE op is not registered")
++
++    weight = torch.empty((1, 8, 4), dtype=torch.uint8)
++    weight_scale = torch.empty((1, 8, 1), dtype=torch.uint8)
++    call_kwargs = {
++        "input": torch.empty((2, 4), dtype=torch.uint8),
++        "input_scale": torch.empty((2,), dtype=torch.uint8),
++        "alpha": torch.empty((1,), dtype=torch.float32),
++        "tile_idx_to_group_idx": torch.empty((1,), dtype=torch.int32),
++        "tile_idx_to_mn_limit": torch.empty((1,), dtype=torch.int32),
++        "permuted_idx_to_expanded_idx": torch.empty((2,), dtype=torch.int32),
++        "num_non_exiting_tiles": torch.empty((1,), dtype=torch.int32),
++        "global_sf": torch.empty((1,), dtype=torch.float32),
++        "num_experts": 1,
++        "top_k": 1,
++        "num_local_experts": 1,
++        "local_expert_offset": 0,
++        "tile_size": 128,
++        "scaling_vector_size": 16,
++        "activation_type": int(ActivationType.Swiglu),
++        "swiglu_limit_scalar": float("nan"),
++    }
++    if locality_domain:
++        call_kwargs.update(
++            {
++                "weight_0": weight,
++                "weight_1": weight,
++                "weight_scale_0": weight_scale,
++                "weight_scale_1": weight_scale,
++                "output_tensor": torch.empty((2, 8), dtype=torch.uint8),
++                "output_sf_tensor": torch.empty((2,), dtype=torch.uint8),
++            }
++        )
++    else:
++        call_kwargs.update(
++            {
++                "weight": weight,
++                "weight_scale": weight_scale,
++                "output_tensor": None,
++                "output_sf_tensor": None,
++            }
++        )
++
++    with pytest.raises(ValueError, match="must not be NaN"):
++        op._init_fn(**call_kwargs)
++
++
+ @pytest.mark.skipif(
+     get_sm_version() != 107,
+     reason="This test is only supported on Rubin (SM 107) GPUs",
+diff --git a/tests/unittest/_torch/thop/parallel_hw_agnostic/test_fc12_smem_contract.py b/tests/unittest/_torch/thop/parallel_hw_agnostic/test_fc12_smem_contract.py
+new file mode 100644
+index 000000000000..ab732b82764c
+--- /dev/null
++++ b/tests/unittest/_torch/thop/parallel_hw_agnostic/test_fc12_smem_contract.py
+@@ -0,0 +1,524 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++"""Host-side contracts of the Rubin fused FC1+FC2 MoE kernel.
++
++Every check runs on the host: task-space derivation, shared-memory stage
++selection and byte layout, and the CuTe views the kernel builds from them.
++The last test traces the kernel's layout setup under ``cute.compile`` with an
++explicit ``sm_107a`` target, so no Rubin GPU is required.
++"""
++
++import inspect
++
++import pytest
++
++cutlass = pytest.importorskip("cutlass")
++cute = pytest.importorskip("cutlass.cute")
++
++from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE  # noqa: E402
++
++pytestmark = pytest.mark.skipif(
++    not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
++    reason="the installed CuTe DSL package has no Rubin (SM107) helpers",
++)
++
++if IS_CUTLASS_DSL_RUBIN_AVAILABLE:
++    from tensorrt_llm._torch.cute_dsl_kernels.rubin.moe import (
++        rubin_contiguous_grouped_blockscaled_gemm_fused_fc12 as fused_fc12,
++    )
++    from tensorrt_llm._torch.cute_dsl_kernels.rubin.moe.rubin_contiguous_grouped_blockscaled_gemm_fused_fc12 import (  # noqa: E501
++        END_PHASE,
++        FC1_PHASE,
++        FC2_PHASE,
++        Fc12Task,
++        FusedSmemStageBytes,
++        FusedSmemStageConfig,
++        SeparatePhaseSmemStageBytes,
++        SeparatePhaseSmemStageConfig,
++        Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel,
++        derive_fc12_cta_task_stream,
++        derive_fc12_task_shape,
++        derive_fused_ab_mbarrier_array_count,
++        select_fused_smem_stages,
++        select_separate_phase_smem_stages,
++    )
++
++SMEM_CAPACITY = 334_848
++
++# DS-V4-Pro FC1 (N = 2 * intermediate) and FC2 (N = hidden) problem sizes used
++# by every task-space check below.
++FC1_GEMM_N = 6_144
++FC2_N = 7_168
++
++
++def _supported_problem() -> dict:
++    return dict(
++        a_dtype=cutlass.Float4E2M1FN,
++        b_dtype=cutlass.Float4E2M1FN,
++        sf_dtype=cutlass.Float8E4M3FN,
++        sf_vec_size=16,
++        fc1_c_dtype=cutlass.Float4E2M1FN,
++        fc2_c_dtype=cutlass.BFloat16,
++        mma_inst_shape=(128, 128, 128),
++        mma_tiler=(128, 128, 256),
++        cluster_shape_mn=(1, 1),
++        fc1_gemm_shape=(1_536, FC1_GEMM_N, 7_168, 12),
++        fc2_gemm_shape=(1_536, FC2_N, 3_072, 12),
++        a_major="k",
++        b_major="k",
++        fc1_c_major="n",
++        fc2_c_major="n",
++    )
++
++
++def _common_kernel_args() -> dict:
++    return dict(
++        sf_vec_size=16,
++        mma_inst_shape=(128, 128, 128),
++        mma_tiler=(128, 128, 256),
++        cluster_shape_mn=(1, 1),
++        vectorized_f32=True,
++        topk=1,
++    )
++
++
++def test_constructor_and_scheduler_drop_legacy_parameters():
++    constructor_parameters = inspect.signature(
++        Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel.__init__
++    ).parameters
++    assert "a_path" not in constructor_parameters
++    assert "fc2_n" not in constructor_parameters
++    assert "raster_along_m" not in constructor_parameters
++
++    scheduler_parameters = inspect.signature(
++        Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel._compute_tile_sched_params
++    ).parameters
++    assert "raster_along_m" not in scheduler_parameters
++
++    kernel_1cta = Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel(**_common_kernel_args())
++    assert not hasattr(kernel_1cta, "raster_along_m")
++    with pytest.raises(TypeError, match="raster_along_m"):
++        Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel(
++            **_common_kernel_args(), raster_along_m=True
++        )
++
++
++def test_l2_atomic_descriptor_bounds():
++    coordinate_count_limit = 1 << 16
++    fused_fc12.validate_l2_atomic_descriptor_bounds(
++        phase="FC1",
++        gemm_shape=(
++            coordinate_count_limit * 128,
++            coordinate_count_limit * 128,
++            coordinate_count_limit,
++        ),
++        cta_tile_shape_mnk=(128, 128, 256),
++    )
++    for mode, out_of_bounds_shape in (
++        ("M", ((coordinate_count_limit + 1) * 128, 128, 1)),
++        ("N", (128, (coordinate_count_limit + 1) * 128, 1)),
++        ("L", (128, 128, coordinate_count_limit + 1)),
++    ):
++        # The message names the phase and the offending mode, e.g.
++        # "FC1 M tile count 65537 exceeds the L2 atomic descriptor limit 65536".
++        with pytest.raises(ValueError, match=rf"FC1 {mode} tile count \d+ exceeds"):
++            fused_fc12.validate_l2_atomic_descriptor_bounds(
++                phase="FC1",
++                gemm_shape=out_of_bounds_shape,
++                cta_tile_shape_mnk=(128, 128, 256),
++            )
++
++
++def test_can_implement_accepts_the_supported_problem_and_rejects_variants():
++    supported_problem = _supported_problem()
++    can_implement = Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel.can_implement
++    assert can_implement(**supported_problem)
++    # FC2 N not a multiple of the tile.
++    assert not can_implement(**(supported_problem | {"fc2_gemm_shape": (1_536, 7_040, 3_072, 12)}))
++    # Unsupported FC2 output dtype.
++    assert not can_implement(**(supported_problem | {"fc2_c_dtype": cutlass.Float16}))
++    # 2-CTA tile with a 1x1 cluster.
++    assert not can_implement(**(supported_problem | {"mma_tiler": (256, 128, 256)}))
++
++
++@pytest.mark.parametrize(
++    "mma_n,fc1_tiles_per_m,fc2_tiles_per_m",
++    [(128, 48, 56), (256, 24, 28)],
++    ids=["1cta", "2cta"],
++)
++def test_task_shape(mma_n, fc1_tiles_per_m, fc2_tiles_per_m):
++    task_shape = derive_fc12_task_shape(fc1_gemm_n=FC1_GEMM_N, fc2_n=FC2_N, mma_n=mma_n)
++    assert task_shape.fc1_tiles_per_m == fc1_tiles_per_m
++    assert task_shape.fc2_tiles_per_m == fc2_tiles_per_m
++
++
++def test_task_shape_rejects_non_divisible_fc1_n():
++    with pytest.raises(ValueError, match="FC1 GEMM N"):
++        derive_fc12_task_shape(fc1_gemm_n=FC1_GEMM_N + 6, fc2_n=FC2_N, mma_n=128)
++
++
++def test_cta_task_streams_cover_every_tile_once_and_finish_fc1_first():
++    task_shape = derive_fc12_task_shape(fc1_gemm_n=FC1_GEMM_N, fc2_n=FC2_N, mma_n=128)
++    num_m_tiles = 12
++    num_resident_ctas = 148
++    cta_streams = tuple(
++        derive_fc12_cta_task_stream(
++            num_m_tiles=num_m_tiles,
++            task_shape=task_shape,
++            num_resident_ctas=num_resident_ctas,
++            cta_idx=cta_idx,
++        )
++        for cta_idx in range(num_resident_ctas)
++    )
++
++    for stream in cta_streams:
++        assert stream[-1] == Fc12Task(phase=END_PHASE, m_tile=-1, n_tile=-1)
++        seen_fc2 = False
++        for task in stream[:-1]:
++            assert task.phase in (FC1_PHASE, FC2_PHASE)
++            if task.phase == FC2_PHASE:
++                seen_fc2 = True
++            else:
++                assert not seen_fc2, "FC1 task published after FC2 phase started"
++
++    fc1_task_list = [
++        (task.m_tile, task.n_tile)
++        for stream in cta_streams
++        for task in stream
++        if task.phase == FC1_PHASE
++    ]
++    fc2_task_list = [
++        (task.m_tile, task.n_tile)
++        for stream in cta_streams
++        for task in stream
++        if task.phase == FC2_PHASE
++    ]
++    expected_fc1 = {
++        (m_tile, n_tile)
++        for m_tile in range(num_m_tiles)
++        for n_tile in range(task_shape.fc1_tiles_per_m)
++    }
++    expected_fc2 = {
++        (m_tile, n_tile)
++        for m_tile in range(num_m_tiles)
++        for n_tile in range(task_shape.fc2_tiles_per_m)
++    }
++    assert len(fc1_task_list) == len(expected_fc1)
++    assert len(fc2_task_list) == len(expected_fc2)
++    assert set(fc1_task_list) == expected_fc1
++    assert set(fc2_task_list) == expected_fc2
++
++
++def test_2cta_readiness_and_mbarrier_array_counts():
++    kernel_2cta = Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel(
++        **(
++            _common_kernel_args()
++            | {
++                "mma_inst_shape": (256, 256, 128),
++                "mma_tiler": (256, 256, 256),
++                "cluster_shape_mn": (2, 1),
++            }
++        )
++    )
++    assert kernel_2cta.use_2cta_instrs
++
++    ready_expected = fused_fc12.derive_fc1_ready_expected
++    assert ready_expected(fc1_gemm_n=FC1_GEMM_N, mma_n=256, mma_cta_group_size=2) == 48
++    with pytest.raises(ValueError, match="must be 1 or 2"):
++        ready_expected(fc1_gemm_n=FC1_GEMM_N, mma_n=256, mma_cta_group_size=3)
++
++    assert derive_fused_ab_mbarrier_array_count(1) == 4
++    assert derive_fused_ab_mbarrier_array_count(2) == 5
++
++
++_COMMON_STAGE_BYTES = dict(
++    a_per_ab_stage=16_384,
++    sfa_per_ab_stage=2_048,
++    fc1_c_per_stage=4_096,
++    metadata=2_048,
++    header_fixed=156,
++    header_per_ab_stage=64,
++    alignment=1_024,
++)
++
++
++def test_common_smem_stage_selection():
++    stages_128x128 = FusedSmemStageBytes(
++        b_per_ab_stage=16_384,
++        sfb_per_ab_stage=2_048,
++        fc2_c=34_800,
++        **_COMMON_STAGE_BYTES,
++    )
++    assert stages_128x128.total(ab_stages=8, fc1_c_stages=9) == SMEM_CAPACITY
++    assert select_fused_smem_stages(
++        capacity=SMEM_CAPACITY,
++        preferred_ab=8,
++        preferred_fc1_c=9,
++        minimum_fc1_c=2,
++        stage_bytes=stages_128x128,
++    ) == FusedSmemStageConfig(ab=8, fc1_c=9)
++
++    stages_128x256 = FusedSmemStageBytes(
++        b_per_ab_stage=32_768,
++        sfb_per_ab_stage=4_096,
++        fc2_c=67_568,
++        **_COMMON_STAGE_BYTES,
++    )
++    assert stages_128x256.total(ab_stages=5, fc1_c_stages=14) == 347_136
++    assert stages_128x256.total(ab_stages=5, fc1_c_stages=2) == 347_136
++    assert stages_128x256.total(ab_stages=4, fc1_c_stages=14) == 291_840
++    assert select_fused_smem_stages(
++        capacity=SMEM_CAPACITY,
++        preferred_ab=5,
++        preferred_fc1_c=14,
++        minimum_fc1_c=2,
++        stage_bytes=stages_128x256,
++    ) == FusedSmemStageConfig(ab=4, fc1_c=14)
++
++    with pytest.raises(ValueError, match="no fused FC12"):
++        select_fused_smem_stages(
++            capacity=1_024,
++            preferred_ab=1,
++            preferred_fc1_c=2,
++            minimum_fc1_c=2,
++            stage_bytes=stages_128x256,
++        )
++
++
++def _separate_stage_bytes(**overrides):
++    values = dict(
++        a_per_stage=16_384,
++        b_per_stage=16_384,
++        sfa_per_stage=2_048,
++        sfb_per_stage=2_048,
++        fc1_c_per_stage=4_096,
++        fc2_c=34_800,
++        metadata=2_048,
++        header_fixed=156,
++        fc1_header_per_stage=32,
++        fc2_header_per_stage=32,
++        alignment=1_024,
++    )
++    values.update(overrides)
++    return SeparatePhaseSmemStageBytes(**values)
++
++
++def test_separate_phase_stages_256x256_overlay_fc2_c_on_the_fc1_operand_tail():
++    stage_bytes = _separate_stage_bytes(sfb_per_stage=4_096, fc2_c=67_568, fc1_header_per_stage=48)
++    selected = select_separate_phase_smem_stages(
++        capacity=SMEM_CAPACITY,
++        preferred_fc1_ab=8,
++        preferred_fc2_ab=6,
++        preferred_fc1_c=5,
++        minimum_fc1_c=2,
++        stage_bytes=stage_bytes,
++    )
++    assert selected == SeparatePhaseSmemStageConfig(fc1_ab=8, fc2_ab=6, fc1_c=5, overlay_fc2_c=True)
++    assert (
++        stage_bytes.overlay_bytes(fc1_ab_stages=selected.fc1_ab, fc2_ab_stages=selected.fc2_ab)
++        == 73_728
++    )
++    assert (
++        stage_bytes.total(
++            fc1_ab_stages=selected.fc1_ab,
++            fc2_ab_stages=selected.fc2_ab,
++            fc1_c_stages=selected.fc1_c,
++            overlay_fc2_c=selected.overlay_fc2_c,
++        )
++        == SMEM_CAPACITY
++    )
++
++    layout = fused_fc12.derive_separate_phase_smem_layout(
++        stage_config=selected, stage_bytes=stage_bytes
++    )
++    # A occupies one contiguous low-address allocation. B and SFB are paired
++    # per physical stage after A; FC2 skips the first two B/SFB slots because
++    # they are part of the contiguous 72 KiB FC2 C alias beginning at A6.
++    assert layout.a_smem_offset_bytes == 0
++    assert layout.a_smem_alloc_bytes == 131_072
++    assert layout.fc1_b_smem_offset_bytes == 131_072
++    assert layout.fc1_sfb_smem_offset_bytes == 147_456
++    assert layout.fc2_b_smem_offset_bytes == 172_032
++    assert layout.fc2_sfb_smem_offset_bytes == 188_416
++    assert layout.fc2_bsfb_stage_offset == 2
++    assert layout.fc2_c_smem_offset_bytes == 98_304
++    assert layout.fc2_c_overlay_bytes == 73_728
++    assert layout.mainloop_smem_alloc_bytes == 294_912
++    # The 8/6-stage path keeps its paired B/SFB strides.
++    assert layout.b_stage_stride_bytes == 20_480
++    assert layout.sfb_stage_stride_bytes == 20_480
++
++
++@pytest.mark.parametrize(
++    "stage_overrides,preferred,expected_stages,expected_layout",
++    [
++        pytest.param(
++            {},
++            dict(preferred_fc1_ab=8, preferred_fc2_ab=8, preferred_fc1_c=9),
++            SeparatePhaseSmemStageConfig(fc1_ab=8, fc2_ab=8, fc1_c=9, overlay_fc2_c=False),
++            dict(
++                expected_b_offset=131_072,
++                expected_sfb_offset=262_144,
++                expected_mainloop_bytes=278_528,
++            ),
++            id="128x128",
++        ),
++        pytest.param(
++            # One FC1-only tail stage holds 52 KiB, which cannot fit the
++            # 67,568-byte FC2 C tile, so the common four-stage depth and the
++            # standalone epilogue allocation are kept.
++            dict(b_per_stage=32_768, sfb_per_stage=4_096, fc2_c=67_568),
++            dict(preferred_fc1_ab=5, preferred_fc2_ab=4, preferred_fc1_c=14),
++            SeparatePhaseSmemStageConfig(fc1_ab=4, fc2_ab=4, fc1_c=14, overlay_fc2_c=False),
++            dict(
++                expected_b_offset=65_536,
++                expected_sfb_offset=196_608,
++                expected_mainloop_bytes=212_992,
++            ),
++            id="128x256",
++        ),
++        pytest.param(
++            dict(b_per_stage=8_192, header_fixed=220, fc1_header_per_stage=48),
++            dict(preferred_fc1_ab=11, preferred_fc2_ab=10, preferred_fc1_c=4),
++            SeparatePhaseSmemStageConfig(fc1_ab=10, fc2_ab=10, fc1_c=4, overlay_fc2_c=False),
++            dict(
++                expected_b_offset=163_840,
++                expected_sfb_offset=245_760,
++                expected_mainloop_bytes=266_240,
++            ),
++            id="256x128",
++        ),
++    ],
++)
++def test_separate_phase_stages_without_overlay(
++    stage_overrides, preferred, expected_stages, expected_layout
++):
++    stage_bytes = _separate_stage_bytes(**stage_overrides)
++    selected = select_separate_phase_smem_stages(
++        capacity=SMEM_CAPACITY, minimum_fc1_c=2, stage_bytes=stage_bytes, **preferred
++    )
++    assert selected == expected_stages
++    _check_non_overlay_smem_layout(
++        stage_bytes=stage_bytes, ab_stages=expected_stages.fc1_ab, **expected_layout
++    )
++
++
++def test_separate_phase_128x128_fills_the_smem_capacity_exactly():
++    assert (
++        _separate_stage_bytes().total(
++            fc1_ab_stages=8, fc2_ab_stages=8, fc1_c_stages=9, overlay_fc2_c=False
++        )
++        == SMEM_CAPACITY
++    )
++
++
++def test_separate_phase_layout_keeps_alignment_padding():
++    # Byte counts that are not multiples of the buffer alignment must still
++    # produce aligned, non-interleaved operand regions.
++    stage_bytes = _separate_stage_bytes(
++        a_per_stage=768,
++        b_per_stage=1_536,
++        sfa_per_stage=256,
++        sfb_per_stage=128,
++        fc1_c_per_stage=512,
++        fc2_c=1_024,
++        metadata=64,
++        header_fixed=96,
++    )
++    _check_non_overlay_smem_layout(
++        stage_bytes=stage_bytes,
++        ab_stages=3,
++        expected_b_offset=3_072,
++        expected_sfb_offset=8_192,
++        expected_mainloop_bytes=9_216,
++    )
++    assert (
++        stage_bytes.total(fc1_ab_stages=3, fc2_ab_stages=3, fc1_c_stages=2, overlay_fc2_c=False)
++        == 13_312
++    )
++
++
++def _check_non_overlay_smem_layout(
++    *,
++    stage_bytes,
++    ab_stages: int,
++    expected_b_offset: int,
++    expected_sfb_offset: int,
++    expected_mainloop_bytes: int,
++) -> None:
++    """Without FC2 C aliasing, SFB must follow all B stages, not interleave them."""
++    layout = fused_fc12.derive_separate_phase_smem_layout(
++        stage_config=SeparatePhaseSmemStageConfig(
++            fc1_ab=ab_stages, fc2_ab=ab_stages, fc1_c=2, overlay_fc2_c=False
++        ),
++        stage_bytes=stage_bytes,
++    )
++    assert layout.fc1_sfb_smem_offset_bytes == expected_sfb_offset
++    assert layout.a_smem_offset_bytes == 0
++    assert layout.fc1_b_smem_offset_bytes == expected_b_offset
++    assert layout.fc2_b_smem_offset_bytes == expected_b_offset
++    assert layout.fc2_sfb_smem_offset_bytes == expected_sfb_offset
++    assert layout.b_stage_stride_bytes == stage_bytes.b_per_stage
++    assert layout.sfb_stage_stride_bytes == stage_bytes.sfb_per_stage
++    assert layout.mainloop_smem_alloc_bytes == expected_mainloop_bytes
++    assert layout.fc2_bsfb_stage_offset == 0
++    assert layout.fc2_c_overlay_bytes == 0
++
++
++# (tile_m, tile_n) -> (B stride in FP4 elements, SFB stride in FP8 elements)
++_EXPECTED_STAGED_STRIDES = {
++    (128, 128): (32_768, 2_048),
++    (128, 256): (65_536, 4_096),
++    (256, 128): (16_384, 2_048),
++    (256, 256): (40_960, 20_480),
++}
++# Only the 2-CTA 256x256 geometry aliases the FC2 C buffer onto the FC1
++# operand tail; test_cute_dsl_moe.py::test_nvfp4_fc12_fused_rubin_matches_two_op_path
++# checks that path numerically on a Rubin device.
++_EXPECTED_OVERLAY = {
++    (128, 128): False,
++    (128, 256): False,
++    (256, 128): False,
++    (256, 256): True,
++}
++
++
++def _check_constructed_smem_views() -> None:
++    """The staged B/SFB CuTe views must carry the byte layout's strides."""
++    for (tile_m, tile_n), (b_stride, sfb_stride) in _EXPECTED_STAGED_STRIDES.items():
++        kernel = Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel(
++            sf_vec_size=16,
++            mma_inst_shape=(tile_m, tile_n, 128),
++            mma_tiler=(tile_m, tile_n, 256),
++            cluster_shape_mn=(tile_m // 128, 1),
++            vectorized_f32=True,
++            topk=6,
++            use_pdl=False,
++            scheduler="l2_atomic",
++        )
++        kernel.a_dtype = cutlass.Float4E2M1FN
++        kernel.b_dtype = cutlass.Float4E2M1FN
++        kernel.sf_dtype = cutlass.Float8E4M3FN
++        kernel.fc1_c_dtype = cutlass.Float4E2M1FN
++        kernel.fc2_c_dtype = cutlass.BFloat16
++        kernel.a_major_mode = cute.nvgpu.OperandMajorMode.K
++        kernel.b_major_mode = cute.nvgpu.OperandMajorMode.K
++        kernel.fc1_c_layout = cutlass.tensor_utils.LayoutEnum.ROW_MAJOR
++        kernel.fc2_c_layout = cutlass.tensor_utils.LayoutEnum.ROW_MAJOR
++        kernel._setup_attributes()
++        assert kernel.overlay_fc2_c_on_fc1_ab_tail == _EXPECTED_OVERLAY[(tile_m, tile_n)]
++        assert kernel.fc1_b_smem_layout_staged.outer.stride[-1] == b_stride
++        assert kernel.fc2_b_smem_layout_staged.outer.stride[-1] == b_stride
++        assert kernel.fc1_sfb_smem_layout_staged.stride[-1] == sfb_stride
++        assert kernel.fc2_sfb_smem_layout_staged.stride[-1] == sfb_stride
++
++
++@pytest.mark.timeout(600)
++def test_constructed_smem_views_in_dsl_context():
++    @cute.jit
++    def check_smem_views_in_dsl_context() -> None:
++        _check_constructed_smem_views()
++
++    # The layout target is pinned so this traces without a visible Rubin GPU;
++    # every assertion runs during tracing and no kernel is launched.
++    cute.compile(check_smem_views_in_dsl_context, options="--gpu-arch=sm_107a")

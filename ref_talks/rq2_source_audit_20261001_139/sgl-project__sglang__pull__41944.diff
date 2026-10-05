@@ -1,0 +1,86 @@
+diff --git a/python/sglang/multimodal_gen/runtime/layers/attention/backends/xpu_backend.py b/python/sglang/multimodal_gen/runtime/layers/attention/backends/xpu_backend.py
+index 229a7b17d58b..dc6106c32e00 100644
+--- a/python/sglang/multimodal_gen/runtime/layers/attention/backends/xpu_backend.py
++++ b/python/sglang/multimodal_gen/runtime/layers/attention/backends/xpu_backend.py
+@@ -61,6 +61,27 @@ def _get_cu_seqlens(device_index: int, bsz: int, seqlen: int) -> torch.Tensor:
+     )
+ 
+ 
++def _as_fa_input(t: torch.Tensor, rows: int, heads: int, head_dim: int) -> torch.Tensor:
++    """``t`` as the ``[rows, heads, head_dim]`` flash-attention input, copying only if needed.
++
++    The kernel reads rows through their stride, so a head-packed row-strided view
++    (e.g. q/k/v slices of a fused projection output) is used in place; measured
++    bit-identical to the contiguous input.
++    """
++    try:
++        view = t.view(rows, heads, head_dim)
++    except RuntimeError:
++        return t.contiguous().view(rows, heads, head_dim)
++    if (
++        view.stride(-1) == 1
++        and view.stride(-2) == head_dim
++        and view.stride(0) % 8 == 0
++        and view.data_ptr() % 16 == 0
++    ):
++        return view
++    return view.contiguous()
++
++
+ class XPUAttentionImpl(AttentionImpl):
+     def __init__(
+         self,
+@@ -93,9 +114,9 @@ def forward(
+         max_seqlen_q = seqlen_q
+         max_seqlen_k = seqlen_k
+ 
+-        q_ = query.contiguous().reshape(bsz * seqlen_q, nheads_q, d)
+-        k_ = key.contiguous().reshape(bsz * seqlen_k, nheads_k, d)
+-        v_ = value.contiguous().reshape(bsz * seqlen_k, nheads_k, d)
++        q_ = _as_fa_input(query, bsz * seqlen_q, nheads_q, d)
++        k_ = _as_fa_input(key, bsz * seqlen_k, nheads_k, d)
++        v_ = _as_fa_input(value, bsz * seqlen_k, nheads_k, d)
+         cu_q = _get_cu_seqlens(q_.device.index, bsz, seqlen_q)
+         cu_k = _get_cu_seqlens(q_.device.index, bsz, seqlen_k)
+ 
+diff --git a/test/registered/kernels/ops/diffusion/test_flux2_xpu_norm_fusions.py b/test/registered/kernels/ops/diffusion/test_flux2_xpu_norm_fusions.py
+index 7a4664ea7a0b..aa6aafab9e27 100644
+--- a/test/registered/kernels/ops/diffusion/test_flux2_xpu_norm_fusions.py
++++ b/test/registered/kernels/ops/diffusion/test_flux2_xpu_norm_fusions.py
+@@ -123,6 +123,36 @@ def test_swiglu_into_out_projection_input_matches_cat(self):
+         self.assertEqual(returned.data_ptr(), gemm_input[..., 1536:].data_ptr())
+         self.assertTrue(torch.equal(gemm_input, expected))
+ 
++    def test_attention_reads_fused_projection_slices_in_place(self):
++        # Single-block q/k/v are row-strided slices of the fused projection
++        # output; the XPU backend must feed them to flash attention without a
++        # copy and get the same result as contiguous inputs.
++        from sglang.multimodal_gen.runtime.layers.attention.backends import (
++            xpu_backend,
++        )
++
++        torch.manual_seed(5)
++        tokens, heads, head_dim = 256, 12, 128
++        proj = torch.randn(1, tokens, 13824, device="xpu", dtype=torch.bfloat16)
++        q, k, v = (
++            proj[..., i * heads * head_dim : (i + 1) * heads * head_dim].view(
++                1, tokens, heads, head_dim
++            )
++            for i in range(3)
++        )
++        self.assertEqual(
++            xpu_backend._as_fa_input(q, tokens, heads, head_dim).data_ptr(),
++            q.data_ptr(),
++        )
++        impl = xpu_backend.XPUAttentionImpl(
++            num_heads=heads,
++            head_size=head_dim,
++            causal=False,
++            softmax_scale=head_dim**-0.5,
++        )
++        expected = impl.forward(q.contiguous(), k.contiguous(), v.contiguous())
++        self.assertTrue(torch.equal(impl.forward(q, k, v), expected))
++
+     def test_flux2_imports_without_intel_triton(self):
+         # Regression: the kernel module imported `triton.language.extra.intel`
+         # at module scope. The package facade resolves `_EXPORTS` eagerly on
